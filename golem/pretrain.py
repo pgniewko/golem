@@ -35,6 +35,7 @@ from tqdm import tqdm
 from golem.config import PretrainConfig
 from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
 from golem.isoforms import enumerate_isoforms_batch
+from golem.report import generate_report
 from golem.utils import load_smiles, make_loader, seed_everything, split_data
 
 logger = logging.getLogger(__name__)
@@ -458,6 +459,14 @@ def pretrain(
 
         test_mse, test_rmse = _validate(model, test_loader, device)
         logger.info("Test RMSE (best model): %.4f", test_rmse)
+
+    # ------------------------------------------------------------------
+    # 13. Generate HTML report
+    # ------------------------------------------------------------------
+    try:
+        generate_report(output_dir)
+    except Exception:
+        logger.warning("Could not generate HTML report", exc_info=True)
 
     logger.info("Outputs saved to %s", output_dir)
     return best_ckpt_path

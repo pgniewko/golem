@@ -1,4 +1,4 @@
-"""Click CLI for Golem.  Only command: ``golem pretrain``."""
+"""Click CLI for Golem.  Commands: ``golem pretrain``, ``golem report``."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import click
 
 from golem.config import load_config
 from golem.pretrain import pretrain
+from golem.report import generate_report
 
 
 @click.group()
@@ -72,3 +73,15 @@ def pretrain_cmd(
         output_dir=output,
         subsample=subsample,
     )
+
+
+@main.command()
+@click.argument("output_dir", type=click.Path(exists=True))
+@click.option(
+    "--output", "html_path", default=None, type=click.Path(),
+    help="Path for the HTML report (default: <output_dir>/pretrain_report.html).",
+)
+def report(output_dir: str, html_path: str | None) -> None:
+    """Generate an HTML report from an existing experiment directory."""
+    path = generate_report(output_dir, html_path=html_path)
+    click.echo(f"Report written to {path}")
