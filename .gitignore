@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+.ipynb_checkpoints/
+
+# Checkpoint binaries (too large for git)
+*.pt
+
+# Temp files
+tmp*
+
+# Planning and audit docs (not part of the project)
+PLAN.md
+PLAN.html
+NOTES.md
+audit.html
