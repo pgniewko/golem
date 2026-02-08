@@ -1,0 +1,1275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Golem — Pretraining Review &amp; Implementation Plan</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 960px; margin: 2em auto; padding: 0 1em; line-height: 1.6; color: #1a1a1a; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: .3em; }
+  h2 { border-bottom: 1px solid #ccc; padding-bottom: .2em; margin-top: 2em; }
+  h3 { margin-top: 1.5em; }
+  h4 { margin-top: 1.2em; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 0.9em; }
+  th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; vertical-align: top; }
+  th { background: #f5f5f5; font-weight: 600; }
+  tr:nth-child(even) { background: #fafafa; }
+  pre { background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 4px; padding: 12px; overflow-x: auto; font-size: 0.85em; line-height: 1.45; }
+  code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 0.88em; }
+  pre code { background: none; padding: 0; }
+  blockquote { border-left: 4px solid #dfe2e5; margin: 1em 0; padding: .5em 1em; color: #555; background: #f9f9f9; }
+  hr { border: none; border-top: 1px solid #ccc; margin: 2em 0; }
+  li { margin: .3em 0; }
+  strong { color: #111; }
+  ol, ul { padding-left: 1.8em; }
+</style>
+</head>
+<body>
+<h1 id="golem-pretraining-review-comparison-with-chemeleon-errors-and-specifications-for-new-project">Golem Pretraining Review: Comparison with CheMeleon, Errors, and Specifications for New Project</h1>
+<h2 id="context">Context</h2>
+<p>The <code>golem</code> branch of gt-pyg implements a CheMeleon-inspired pretraining pipeline (MDAE — Masked Descriptor Autoencoding) that trains a Graph Transformer backbone to predict Mordred molecular descriptors. This review compares the implementation against the actual CheMeleon code (<code>JacksonBurns/chemeleon</code>), identifies errors and improvements, and provides specifications for a new clean-start project.</p>
+<p>The user's intent is to:</p>
+<ol>
+<li>Pretrain on a <strong>smaller</strong> dataset (not 1M molecules) but with <strong>isoform enumeration</strong> for data augmentation</li>
+<li>Eventually write specs/instructions for a new standalone project based on these notes</li>
+<li>Get the NaN/validity masking right — save as 0 but never train on those positions</li>
+<li>Use best-practice isoform enumeration</li>
+</ol>
+<p><strong>Key decisions made:</strong></p>
+<ul>
+<li><strong>New separate repository</strong> (gt-pyg stays a focused model library, new project depends on it)</li>
+<li><strong>Protonation</strong>: Dimorphite-DL as primary (pH-aware, chemically accurate), RDKit Uncharger as fallback for failures</li>
+<li><strong>NaN handling</strong>: Validity mask approach (Golem's, which is actually better than CheMeleon's)</li>
+</ul>
+<hr>
+<h2 id="file-reference-absolute-paths">File Reference — Absolute Paths</h2>
+<h3 id="golem-project-target">Golem project (target)</h3>
+<ul>
+<li><strong>Project root</strong>: <code>/Users/pawelgniewek/projects/golem/</code></li>
+<li><strong>This plan</strong>: <code>/Users/pawelgniewek/projects/golem/PLAN.md</code></li>
+</ul>
+<h3 id="gt-pyg-repository">gt-pyg repository</h3>
+<ul>
+<li><strong>Repo root</strong>: <code>/Users/pawelgniewek/projects/gt-pyg/</code></li>
+<li><strong>Main branch</strong>: current gt-pyg v1.5.7 code</li>
+<li><strong><code>golem</code> branch</strong>: original in-repo Golem implementation (reference only)</li>
+<li style="margin-left:1em">Pretrain code: <code>git show golem:gt_pyg/pretrain/{__init__.py,config.py,dataset.py,descriptors.py,model.py,trainer.py}</code></li>
+<li style="margin-left:1em">Tests: <code>git show golem:gt_pyg/pretrain/tests/</code></li>
+<li><strong><code>feature/multi-isoform-v2</code> branch</strong>: data files + notebooks</li>
+<li style="margin-left:1em">Training data: <code>git show feature/multi-isoform-v2:notebooks/v2.0.0/data/train-set/expansion_data_train.csv</code></li>
+<li style="margin-left:1em">Log-transformed training data: <code>git show feature/multi-isoform-v2:notebooks/v2.0.0/data/train-set/expansion_log_data_train.csv</code></li>
+<li style="margin-left:1em">Test data (blinded): <code>git show feature/multi-isoform-v2:notebooks/v2.0.0/data/test-set/expansion_data_test_blinded.csv</code></li>
+<li style="margin-left:1em">Test data (full): <code>git show feature/multi-isoform-v2:notebooks/v2.0.0/data/test-set/expansion_data_test_full.csv</code></li>
+<li style="margin-left:1em">Test data (with leaderboard flag): <code>git show feature/multi-isoform-v2:notebooks/v2.0.0/data/test-set/expansion_data_test_full_lb_flag.csv</code></li>
+<li style="margin-left:1em">All SMILES: <code>git show feature/multi-isoform-v2:notebooks/v2.0.0/data/all_openadmet_smiles.smi</code></li>
+<li style="margin-left:1em">Log transform functions: <code>git show feature/multi-isoform-v2:notebooks/v2.0.0/src/utils.py</code></li>
+<li style="margin-left:1em">Training notebooks (reference): <code>git show feature/multi-isoform-v2:notebooks/v2.0.0/train_without_isoforms.ipynb</code> (and others)</li>
+<li style="margin-left:1em">Comparison notebooks (reference): <code>git show feature/multi-isoform-v2:notebooks/v2.0.0/compare_isoform_single_ep.ipynb</code></li>
+</ul>
+<h3 id="external-reference-files">External reference files</h3>
+<ul>
+<li><strong>CALIBRATE notebook</strong>: <code>/Users/pawelgniewek/projects/expansionrx-openadmet/v33/CALIBRATE-MTME-0.ipynb</code></li>
+</ul>
+<h3 id="chemeleon-external-repo-for-reference-only">CheMeleon (external repo, for reference only)</h3>
+<ul>
+<li>GitHub: <code>JacksonBurns/chemeleon</code></li>
+</ul>
+<hr>
+<h2 id="part-a-side-by-side-comparison-golem-vs-chemeleon">Part A: Side-by-Side Comparison — Golem vs CheMeleon</h2>
+<table><thead><tr>
+<th>Aspect</th>
+<th>CheMeleon (actual code)</th>
+<th>Golem (golem branch)</th>
+<th>Assessment</th>
+</tr></thead><tbody>
+<tr>
+<td><strong>Backbone</strong></td>
+<td>D-MPNN (Chemprop), 6 layers, d=2048</td>
+<td>Graph Transformer (PyG), 4 layers, d=128</td>
+<td>Different architectures; GT is fine, but much smaller default capacity</td>
+</tr>
+<tr>
+<td><strong>Descriptor set</strong></td>
+<td>All Mordred 2D (~1613 raw, filtered to numeric)</td>
+<td>All Mordred 2D (filtered to numeric, no all-NaN cols)</td>
+<td>Equivalent</td>
+</tr>
+<tr>
+<td><strong>Descriptor NaN handling</strong></td>
+<td><code>fill_missing()</code> then <code>to_numpy(float32)</code> — NaN becomes 0.0 via fill_missing; <strong>no validity mask</strong></td>
+<td><code>fill_missing()</code> → <code>dropna(axis=1, how='all')</code> → NaN preserved → <code>descriptor_valid_mask</code> built → NaN filled with 0.0 for storage</td>
+<td><strong>Golem is better</strong> — tracks validity per element</td>
+</tr>
+<tr>
+<td><strong>Scaling</strong></td>
+<td>Feature means/vars computed via <strong>Welford online algorithm on train split only</strong>; NaN→0 via <code>nan_to_num</code> before stats</td>
+<td><code>StandardScaler</code> with <code>np.nanmean/nanstd</code> on <strong>entire dataset</strong> (before train/val split)</td>
+<td><strong>Golem has data leakage</strong> — scaler fit on val data too</td>
+</tr>
+<tr>
+<td><strong>Winsorization</strong></td>
+<td><code>torch.clamp(scaled, -6, 6)</code></td>
+<td><code>np.clip(scaled, -6, 6)</code></td>
+<td>Equivalent</td>
+</tr>
+<tr>
+<td><strong>Masking strategy</strong></td>
+<td><strong>Loss masking</strong>: <code>mask = (torch.rand_like(targets) < 0.15).bool()</code>, passed to <code>criterion(preds, targets, mask, ...)</code></td>
+<td><strong>Loss masking</strong>: <code>rand_mask & valid_mask</code>, then <code>F.mse_loss(preds[mask], targets[mask])</code></td>
+<td>Conceptually equivalent; Golem adds validity awareness</td>
+</tr>
+<tr>
+<td><strong>Masking ratio</strong></td>
+<td>0.15</td>
+<td>0.15</td>
+<td>Same</td>
+</tr>
+<tr>
+<td><strong>NaN in loss</strong></td>
+<td>Not explicitly handled — <code>fill_missing()</code> turns NaN→0, so model trains on 0.0 targets for failed descriptors</td>
+<td><code>descriptor_valid_mask</code> excludes NaN positions from loss</td>
+<td><strong>Golem is better</strong> — CheMeleon silently trains on imputed zeros</td>
+</tr>
+<tr>
+<td><strong>Validation loss</strong></td>
+<td>Full MSE (no masking) on all descriptors including imputed zeros</td>
+<td>MSE on valid positions only (no masking)</td>
+<td>Golem is more principled</td>
+</tr>
+<tr>
+<td><strong>Optimizer</strong></td>
+<td>Lightning default (Adam?)</td>
+<td>AdamW (lr=1e-4, wd=1e-5)</td>
+<td>Both reasonable</td>
+</tr>
+<tr>
+<td><strong>LR schedule</strong></td>
+<td>Not visible in code (Lightning default)</td>
+<td>Linear warmup (25 epochs) + cosine decay</td>
+<td>Golem is more explicit</td>
+</tr>
+<tr>
+<td><strong>Early stopping</strong></td>
+<td>patience=50, monitor val_loss</td>
+<td>patience=50, monitor val_loss</td>
+<td>Same</td>
+</tr>
+<tr>
+<td><strong>Batch size</strong></td>
+<td>128</td>
+<td>128</td>
+<td>Same</td>
+</tr>
+<tr>
+<td><strong>Max epochs</strong></td>
+<td>500</td>
+<td>500</td>
+<td>Same</td>
+</tr>
+<tr>
+<td><strong>Prediction head</strong></td>
+<td><code>RegressionFFN(n_tasks=n_features, input_dim=2048, hidden_dim=1024)</code> (3-layer FFN)</td>
+<td><code>Linear(head_in_dim, 512) → GELU → Linear(512, D)</code> (2-layer)</td>
+<td>CheMeleon head is larger (matches backbone); Golem head is modest</td>
+</tr>
+<tr>
+<td><strong>Train/val/test split</strong></td>
+<td>70/20/10</td>
+<td>80/20/0</td>
+<td>CheMeleon holds out a test set</td>
+</tr>
+<tr>
+<td><strong>Pretraining data</strong></td>
+<td>~1M molecules from PubChem</td>
+<td>User-provided SMILES (smaller), with isoform expansion</td>
+<td>Different strategy; Golem uses isoforms as augmentation</td>
+</tr>
+<tr>
+<td><strong>Checkpoint</strong></td>
+<td><code>torch.save(model, 'best.pt')</code> (full model)</td>
+<td>Saves backbone only + scaler + descriptor names + head state in extras</td>
+<td>Golem is more structured</td>
+</tr>
+<tr>
+<td><strong>Isoform support</strong></td>
+<td>None</td>
+<td>Tautomers, protonation states (Dimorphite-DL), neutralization</td>
+<td>Golem's unique addition</td>
+</tr>
+</tbody></table>
+<h3 id="a-2-chemeleon-deep-dive-architecture-and-training-details">A.2 — CheMeleon Deep Dive: Architecture and Training Details</h3>
+<p><strong>D-MPNN (the "CheMeleon" model):</strong></p>
+<ul>
+<li>Chemprop's <code>BondMessagePassing</code> with <code>d_h=2048</code>, <code>depth=6</code> (6 message-passing layers)</li>
+<li><code>MeanAggregation</code> for graph-level pooling</li>
+<li>Predictor: <code>RegressionFFN(n_tasks=n_features, input_dim=2048, hidden_dim=1024)</code> — 3-layer FFN</li>
+<li>Total parameters: ~9.3M</li>
+<li>Loss: <code>BoundedMSELoss</code> with masking — loss only computed on randomly masked 15% of descriptor positions</li>
+<li>Optimizer: AdamW (via Lightning), specific lr not explicit in config (Lightning default or <code>1e-3</code>)</li>
+<li>Split: 70/20/10 using Chemprop's <code>make_split_indices()</code></li>
+<li>Data: ~1M PubChem molecules, Mordred 2D descriptors stored in Zarr format</li>
+</ul>
+<p><strong>MLP-PLR (descriptor autoencoder — separate model, not the GNN):</strong></p>
+<ul>
+<li>Input: raw Mordred descriptors → <code>PeriodicEmbeddings</code> (learned Fourier features, 48 frequencies per descriptor)</li>
+<li>Architecture: 4-layer MLP autoencoder <code>[n_features*48 → 2048 → 2048 → 2048 → 2048 → n_features]</code></li>
+<li>Key difference from D-MPNN: <strong>input descriptors are zeroed at masked positions</strong> (input masking) AND loss only on masked positions (loss masking). The D-MPNN version does NOT zero inputs.</li>
+<li>Welford online algorithm computes feature means/vars on train split only, NaN-aware (ignores NaN during accumulation, per-feature non-NaN count tracking)</li>
+<li><code>torch.nan_to_num(w.mean, posinf=0.0, neginf=0.0)</code> handles all-NaN columns by setting mean to 0</li>
+<li>AdamW lr=1e-5, batch_size=1024, max_epochs=500, patience=50</li>
+</ul>
+<p><strong>CheMeleon fine-tuning protocol:</strong></p>
+<ul>
+<li><strong>No frozen layers</strong> — full fine-tuning of all 9.3M D-MPNN parameters</li>
+<li>Pretrained weights loaded via <code>model.load_state_dict()</code> (full model, not backbone-only)</li>
+<li>Task-specific heads are randomly initialized (part of Chemprop's <code>RegressionFFN</code>)</li>
+<li>This is important: CheMeleon does NOT freeze the backbone during downstream task training</li>
+</ul>
+<p><strong>CheMeleon fingerprint extraction:</strong></p>
+<ul>
+<li>2048-dimensional embeddings extracted from the pretrained D-MPNN's message-passing output</li>
+<li>Checkpoint downloaded from Zenodo (public release)</li>
+<li>Uses <code>MeanAggregation</code> on node features → 2048D vector per molecule</li>
+</ul>
+<hr>
+<h2 id="part-b-errors-and-issues-in-the-golem-implementation">Part B: Errors and Issues in the Golem Implementation</h2>
+<h3 id="b-1-critical-issues">B.1 — Critical Issues</h3>
+<p><strong>B.1.1 Scaler Data Leakage</strong> (High)</p>
+<ul>
+<li><code>build_pretrain_dataset()</code> fits the <code>StandardScaler</code> on ALL molecules (line 122 of dataset.py), then the CLI splits into train/val afterward (golem.py lines 107-113).</li>
+<li>Fix: Split first, fit scaler on train only, transform val separately. CheMeleon does this correctly — Welford stats are computed on <code>train_dset</code> only.</li>
+</ul>
+<p><strong>B.1.2 CheMeleon does NOT mask NaN positions — it trains on imputed zeros</strong> (Design divergence)</p>
+<ul>
+<li>CheMeleon's <code>fill_missing()</code> replaces NaN with 0.0, and there is <strong>no validity mask</strong>. The model trains on these zero-valued targets.</li>
+<li>Golem's approach (validity mask excluding NaN from loss) is actually <strong>more principled</strong> than CheMeleon's.</li>
+<li>However, this means Golem's results won't directly reproduce CheMeleon's. This is fine — it's an improvement.</li>
+</ul>
+<p><strong>B.1.3 <code>descriptor_head_hidden</code> config key is ignored</strong> (Medium)</p>
+<ul>
+<li><code>config.py</code> defines <code>descriptor_head_hidden: 512</code>, but <code>golem.py</code> passes it correctly as <code>hidden_dim=config["pretrain"]["descriptor_head_hidden"]</code> (line 141).</li>
+<li>Wait — actually checking the code again, the CLI does thread it. This was flagged in ANALYSIS.md but appears to have been fixed.</li>
+</ul>
+<h3 id="b-2-medium-issues">B.2 — Medium Issues</h3>
+<p><strong>B.2.1 No test split</strong> (Medium)</p>
+<ul>
+<li>CheMeleon uses 70/20/10 (train/val/test). Golem uses 80/20 with no held-out test set.</li>
+<li>A test set is important for reporting final pretrain RMSE (CheMeleon reports 0.14 RMSE).</li>
+</ul>
+<p><strong>B.2.2 Welford vs np.nanmean for statistics</strong> (Low-Medium)</p>
+<ul>
+<li>CheMeleon uses <code>nan_to_num(mean, posinf=0, neginf=0)</code> which turns NaN means to 0.</li>
+<li>Golem uses <code>np.nanmean/nanstd</code> which skips NaN — more principled.</li>
+<li>But: the <code>nan_to_num</code> on means suggests CheMeleon has columns where ALL values are NaN (should have been filtered). Golem drops all-NaN columns before scaling, which is cleaner.</li>
+</ul>
+<p><strong>B.2.3 No <code>num_workers</code> in DataLoader</strong> (Medium for performance)</p>
+<ul>
+<li><code>trainer.py</code> creates DataLoaders with no <code>num_workers</code>. CheMeleon uses <code>num_workers=4, persistent_workers=True</code>.</li>
+</ul>
+<p><strong>B.2.4 Prediction head is undersized relative to backbone</strong> (Design note)</p>
+<ul>
+<li>CheMeleon: backbone=2048 → FFN hidden=1024 → n_features output</li>
+<li>Golem: backbone pool output=128 → head hidden=512 → n_features output</li>
+<li>The 4:1 expansion from 128→512 is reasonable, but the absolute capacity is much lower.</li>
+</ul>
+<h3 id="b-3-low-issues">B.3 — Low Issues</h3>
+<p><strong>B.3.1 <code>_TAUTOMER_ENUMERATOR</code> module-level singleton with mutable state</strong> (Low)</p>
+<ul>
+<li><code>isoforms.py</code>: <code>SetMaxTautomers()</code> mutates global state. Thread-unsafe.</li>
+</ul>
+<p><strong>B.3.2 Masking guarantee is batch-global, not per-sample</strong> (Negligible)</p>
+<ul>
+<li>Statistically impossible to matter at 15% masking on ~500+ descriptors.</li>
+</ul>
+<h3 id="b-4-training-notebook-issues-golem-branch">B.4 — Training Notebook Issues (golem branch)</h3>
+<p>The <code>notebooks/v2.0.0/</code> directory contains 4 training notebooks that reveal additional issues:</p>
+<p><strong>B.4.1 Massive code duplication</strong> (Medium)</p>
+<ul>
+<li>70%+ code overlap across <code>train_with_k_isoforms.ipynb</code>, <code>train_without_isoforms.ipynb</code>, <code>train_logd_golem.ipynb</code>, <code>train_logd_single.ipynb</code></li>
+<li>Shared boilerplate: data loading, model construction, training loop, evaluation</li>
+<li>A shared <code>src/utils.py</code> exists but is a stale copy from another project (<code>expansionrx-openadmet</code>)</li>
+<li>New project should factor shared logic into importable modules</li>
+</ul>
+<p><strong>B.4.2 Sophisticated custom loss function</strong> (Design note)</p>
+<ul>
+<li>Notebooks use a 5-component loss: RAE (relative absolute error) + Huber + Correlation + Kendall Rank + R²</li>
+<li>This is <strong>not used in pretraining</strong> (pretraining uses simple MSE), only in fine-tuning</li>
+<li>Worth noting for the new project's fine-tuning capabilities</li>
+<li>The 5-component loss with per-component weighting is more advanced than CheMeleon's simple MSE fine-tuning</li>
+</ul>
+<p><strong>B.4.3 Non-functional curriculum learning</strong> (Medium)</p>
+<ul>
+<li><code>train_without_isoforms.ipynb</code> accepts a <code>curriculum_learning</code> parameter but it is never used in the training loop</li>
+<li>The parameter is accepted, stored, but has no effect on batch construction or loss weighting</li>
+<li>Dead code — remove or implement properly in new project</li>
+</ul>
+<p><strong>B.4.4 Silent NaN handling in evaluation</strong> (Low-Medium)</p>
+<ul>
+<li>Evaluation code silently skips batches that produce NaN predictions</li>
+<li>Should log warnings when this occurs</li>
+</ul>
+<p><strong>B.4.5 Pretrained weight loading strategy</strong> (Design note)</p>
+<ul>
+<li>Notebooks load Golem pretrained weights with <code>strict=False</code></li>
+<li>Task-head keys (<code>mu_mlp.<em></code>, <code>log_var_mlp.</em></code>) from checkpoint are filtered out</li>
+<li>Only backbone weights (embeddings, GT layers, norms) are loaded</li>
+<li>This is correct and should be preserved in the new project</li>
+</ul>
+<hr>
+<h2 id="part-c-isoform-enumeration-best-practices-and-recommendations">Part C: Isoform Enumeration — Best Practices and Recommendations</h2>
+<h3 id="c-1-recommended-isoform-enumeration-techniques">C.1 — Recommended Isoform Enumeration Techniques</h3>
+<p><strong>Tier 1 (most reliable, always include):</strong></p>
+<ol>
+<li><strong>Tautomers</strong> — RDKit <code>TautomerEnumerator</code></li>
+</ol>
+<ul>
+<li style="margin-left:1em">Well-tested, deterministic</li>
+<li style="margin-left:1em">Set <code>max_tautomers</code> conservatively (e.g., 25)</li>
+<li style="margin-left:1em">Always include the canonical tautomer as isoform 0</li>
+</ul>
+<ol>
+<li><strong>Neutralized forms</strong> — RDKit <code>Uncharger</code> or SMARTS-based neutralization</li>
+</ol>
+<ul>
+<li style="margin-left:1em">Deterministic, fast</li>
+<li style="margin-left:1em">Generates the uncharged form of ionizable molecules</li>
+</ul>
+<p><strong>Tier 2 (valuable but requires care):</strong></p>
+<ol>
+<li><strong>Protonation states</strong> — Dimorphite-DL (pH-dependent)</li>
+</ol>
+<ul>
+<li style="margin-left:1em">Generates physiologically relevant forms at target pH (e.g., 7.4)</li>
+<li style="margin-left:1em"><strong>Caveat</strong>: Dimorphite-DL is an external dependency, can be slow, and occasionally crashes on unusual molecules. Needs robust error handling.</li>
+<li style="margin-left:1em">Alternative: <code>chembl_structure_pipeline</code> or <code>MolStandardize</code> protonation</li>
+</ul>
+<p><strong>Tier 3 (optional, for specific use cases):</strong></p>
+<ol>
+<li><strong>Stereoisomers</strong> — enumerate undefined stereocenters</li>
+</ol>
+<ul>
+<li style="margin-left:1em">Only when stereochemistry is unspecified in input</li>
+<li style="margin-left:1em">Can cause combinatorial explosion</li>
+</ul>
+<h3 id="c-2-where-should-isoform-enumeration-code-live">C.2 — Where Should Isoform Enumeration Code Live?</h3>
+<p><strong>Decision: In the NEW separate repository, not gt-pyg.</strong></p>
+<p>Rationale:</p>
+<ul>
+<li>gt-pyg is a focused Graph Transformer library (architecture + featurization)</li>
+<li>Isoform enumeration is a <strong>data preparation</strong> concern, not a model concern</li>
+<li>The new project will own the pretraining pipeline end-to-end</li>
+<li>Isoform code adds dependencies (Dimorphite-DL) that gt-pyg users don't need</li>
+<li>The new project imports gt-pyg's <code>GraphTransformerNet</code> as a backbone dependency</li>
+</ul>
+<p>The <strong>featurization functions</strong> (<code>get_atom_features</code>, <code>get_bond_features</code>, <code>get_tensor_data</code>) stay in gt-pyg since they're tied to the model's expected input format.</p>
+<h3 id="c-4-protonation-tool-recommendation">C.4 — Protonation Tool Recommendation</h3>
+<p><strong>Primary: Dimorphite-DL</strong> (pH-aware, empirically-derived pKa rules, handles common drug-like functional groups at physiological pH 7.4)</p>
+<p><strong>Fallback: RDKit Uncharger</strong> (for when Dimorphite-DL fails on unusual molecules)</p>
+<p>RDKit's Uncharger alone only produces the neutralized form — it can't enumerate protonation states (e.g., histidine ~50% protonated at pH 7.4). Dimorphite-DL is the gold standard for this. The golem branch already has this pattern working with robust error handling.</p>
+<h3 id="c-3-isoform-deduplication-strategy">C.3 — Isoform Deduplication Strategy</h3>
+<ul>
+<li>Canonicalize all isoform SMILES → deduplicate by string equality</li>
+<li>Track parent-to-isoform mapping for analysis</li>
+<li>Always keep the original molecule as isoform index 0</li>
+</ul>
+<hr>
+<h2 id="part-d-issues-inherited-from-gt-pyg-main-branch">Part D: Issues Inherited from gt-pyg Main Branch</h2>
+<p>These apply to the backbone code used by the pretrain pipeline (from the audit):</p>
+<ol>
+<li><strong><code>_eij</code> thread-safety</strong> (#1) — affects DataParallel pretraining</li>
+<li><strong>Shape mismatch model output vs labels</strong> (#3) — doesn't affect pretrain (uses <code>encode()</code> not <code>forward()</code>)</li>
+<li><strong>Silent data truncation in <code>get_tensor_data</code></strong> (#29) — affects isoform dataset building</li>
+<li><strong>No <code>edge_attr</code> validation in GTConv</strong> (#38) — could silently degrade pretrained backbone</li>
+<li><strong><code>pandas</code> phantom dependency</strong> (#39) — unnecessary at install time</li>
+</ol>
+<hr>
+<h2 id="part-e-implementation-specification-for-the-golem-project">Part E: Implementation Specification for the Golem Project</h2>
+<blockquote><strong>Audience</strong>: This specification is written for a Claude Code agent to implement from scratch.</blockquote>
+<blockquote>All code from the golem branch, CALIBRATE notebook, and comparison notebooks is <strong>reference only</strong> — none of it is correct or complete. The implementing agent must synthesize clean, self-contained code.</blockquote>
+<h3 id="e-0-project-location-setup-and-git-workflow">E.0 — Project Location, Setup, and Git Workflow</h3>
+<p><strong>Location</strong>: <code>/Users/pawelgniewek/projects/golem</code></p>
+<p><strong>Environment</strong>: uv venv, gt-pyg installed from <code>/Users/pawelgniewek/projects/gt-pyg</code> (editable)</p>
+<p><strong>CLI</strong>: All commands must be callable from the command line</p>
+<pre><code class="language-bash">
+# Setup sequence
+cd /Users/pawelgniewek/projects/golem
+uv venv
+source .venv/bin/activate
+uv pip install -e .                            # install golem
+uv pip install -e /Users/pawelgniewek/projects/gt-pyg  # install gt-pyg
+</code></pre>
+<p><strong>Git workflow:</strong></p>
+<ul>
+<li><strong>Golem repo</strong> (<code>/Users/pawelgniewek/projects/golem</code>): New project, full autonomy. Work directly on main.</li>
+<li><strong>gt-pyg repo</strong> (<code>/Users/pawelgniewek/projects/gt-pyg</code>): Create a <strong>feature branch</strong> for any modifications (e.g., <code>feature/golem-support</code>). Do NOT modify gt-pyg main directly. Changes to gt-pyg require user approval.</li>
+<li>If gt-pyg changes are needed (e.g., adding <code>encode()</code> or fixing APIs), branch off main, make changes, test, then note for user review.</li>
+</ul>
+<h3 id="e-1-critical-gt-pyg-api-facts-must-follow-these-exactly">E.1 — Critical gt-pyg API Facts (MUST follow these exactly)</h3>
+<p><strong>The CALIBRATE-MTME-0.ipynb notebook was written for gt-pyg v1.3.0. We are now on v1.5.7.</strong> The following changes happened between those versions and BREAK the notebook code:</p>
+<table><thead><tr>
+<th>PR</th>
+<th>Change</th>
+<th>Impact on CALIBRATE notebook</th>
+</tr></thead><tbody>
+<tr>
+<td>#22</td>
+<td><strong>Removed positional encoding code</strong></td>
+<td><code>pe_in_dim=None</code> constructor arg REMOVED; <code>pe=None</code> forward() arg REMOVED</td>
+</tr>
+<tr>
+<td>#18</td>
+<td><strong>Refactored data utils</strong></td>
+<td><code>gnn=True, pe=False, pe_dim=0</code> → now just <code>gnm=True</code></td>
+</tr>
+<tr>
+<td>#30</td>
+<td><strong>Fixed node feature dimension</strong></td>
+<td>Feature dim may differ from hardcoded 139</td>
+</tr>
+<tr>
+<td>#39</td>
+<td><strong>Fixed pharmacophore SMARTS</strong></td>
+<td>Feature values may differ</td>
+</tr>
+<tr>
+<td>#35</td>
+<td><strong>Renamed use_chirality</strong></td>
+<td>Now <code>use_stereochemistry</code></td>
+</tr>
+<tr>
+<td>#25</td>
+<td><strong>Added checkpointing</strong></td>
+<td>New save/load_checkpoint methods available</td>
+</tr>
+</tbody></table>
+<p>The implementing agent MUST use the gt-pyg v1.5.7 API, NOT the notebook code:</p>
+<table><thead><tr>
+<th>What</th>
+<th>gt-pyg v1.5.7 (CORRECT)</th>
+<th>CALIBRATE notebook v1.3.0 (BROKEN)</th>
+</tr></thead><tbody>
+<tr>
+<td><code>get_tensor_data</code></td>
+<td><code>get_tensor_data(x_smiles, y, gnm=True)</code></td>
+<td><code>get_tensor_data(smiles, y, gnn=True, pe=False, pe_dim=0)</code></td>
+</tr>
+<tr>
+<td><code>model.forward()</code></td>
+<td><code>model(x, edge_index, edge_attr, batch=batch, zero_var=False)</code></td>
+<td><code>model(x, edge_index, edge_attr, pe=None, batch=batch)</code></td>
+</tr>
+<tr>
+<td>Constructor</td>
+<td>No <code>pe_in_dim</code> parameter</td>
+<td><code>pe_in_dim=None</code></td>
+</tr>
+<tr>
+<td>Feature dims</td>
+<td><code>get_atom_feature_dim()</code> and <code>get_bond_feature_dim()</code> (dynamic)</td>
+<td>Hardcoded 139 and 39</td>
+</tr>
+</tbody></table>
+<p><strong>Available gt-pyg imports:</strong></p>
+<pre><code class="language-python">
+from gt_pyg import GraphTransformerNet, get_tensor_data
+from gt_pyg.data import get_atom_feature_dim, get_bond_feature_dim, canonicalize_smiles
+from gt_pyg.nn import save_checkpoint, load_checkpoint
+</code></pre>
+<p><strong>GraphTransformerNet forward() signature on main:</strong></p>
+<pre><code class="language-python">
+def forward(self, x, edge_index, edge_attr, batch, zero_var=False) -&gt; Tuple[Tensor, Tensor]:
+    # Returns (pred, log_var) where pred = mu (or reparameterized sample if training and not zero_var)
+</code></pre>
+<p><strong>get_tensor_data() on main returns Data objects with:</strong></p>
+<ul>
+<li><code>data.x</code> — node features <code>[N, F]</code></li>
+<li><code>data.edge_index</code> — edge indices <code>[2, E]</code></li>
+<li><code>data.edge_attr</code> — edge features <code>[E, D]</code></li>
+<li><code>data.y</code> — targets <code>[T]</code> (NaN for missing)</li>
+<li><code>data.y_mask</code> — mask <code>[T]</code> (1.0=present, 0.0=missing)</li>
+</ul>
+<h3 id="e-2-no-changes-needed-to-gt-pyg">E.2 — NO Changes Needed to gt-pyg</h3>
+<p><strong>Simplification: We do NOT need an <code>encode()</code> method.</strong> Instead, for pretraining, we use <code>GraphTransformerNet(num_tasks=num_descriptors)</code> directly. The built-in <code>mu_mlp</code> serves as the descriptor prediction head. No wrapper model, no gt-pyg modifications.</p>
+<p><strong>How this works:</strong></p>
+<ul>
+<li>Pretraining: <code>GraphTransformerNet(num_tasks=D)</code> where D = number of valid Mordred descriptors (~500-600)</li>
+<li>Forward returns <code>(pred, log_var)</code> — use <code>pred</code> for masked MSE against descriptor targets</li>
+<li>Save full model checkpoint via <code>model.save_checkpoint()</code></li>
+<li>Fine-tuning: <code>GraphTransformerNet(num_tasks=1 or 9)</code> — different <code>num_tasks</code> → head weights have different shapes</li>
+<li>Load pretrained weights with <strong>shape-filtering</strong> (see E.14)</li>
+</ul>
+<p><strong>Why this is better than the encode() approach:</strong></p>
+<ul>
+<li>No changes to gt-pyg</li>
+<li>The first hidden layer of mu_mlp (<code>Linear(512, 128)</code>) is shape-compatible and TRANSFERS as a bonus — more pretrained parameters than encode() would give</li>
+<li>Only the output layers of mu_mlp/log_var_mlp are re-initialized (different num_tasks)</li>
+</ul>
+<h3 id="e-3-file-structure">E.3 — File Structure</h3>
+<pre><code>
+/Users/pawelgniewek/projects/golem/
+├── pyproject.toml
+├── golem/
+│   ├── __init__.py
+│   ├── cli.py                 # Click CLI: golem pretrain, golem finetune, golem compare
+│   ├── config.py              # Dataclasses + optional YAML loading/merging
+│   ├── isoforms.py            # Tautomer/protonation/neutralization enumeration
+│   ├── descriptors.py         # Mordred computation + NaN-aware StandardScaler
+│   ├── pretrain.py            # Pretraining loop (uses GraphTransformerNet directly, no wrapper)
+│   ├── finetune.py            # Fine-tuning loop + prediction at end (all 4 models)
+│   ├── predict.py             # Utility: generate_predictions(), fit_calibration()
+│   ├── loss.py                # MSE for pretrain; 5-component for fine-tune
+│   ├── metrics.py             # Official OpenADMET metrics (MAE, RAE, R², Spearman, Kendall)
+│   ├── transforms.py          # Log transform / inverse log transform (from OpenADMET)
+│   └── utils.py               # Seeding, data splitting, DataLoader creation
+├── tests/
+│   ├── test_isoforms.py
+│   ├── test_pretrain.py
+│   ├── test_finetune.py
+│   └── test_e2e.py
+├── data/                      # Copied from gt-pyg feature/multi-isoform-v2 branch
+│   ├── train-set/
+│   │   ├── expansion_data_train.csv
+│   │   └── expansion_log_data_train.csv
+│   ├── test-set/
+│   │   ├── expansion_data_test_blinded.csv
+│   │   ├── expansion_data_test_full.csv
+│   │   └── expansion_data_test_full_lb_flag.csv
+│   └── all_openadmet_smiles.smi
+├── notebooks/
+│   └── compare_predictions.ipynb   # Optional interactive comparison
+├── configs/
+│   ├── pretrain_openadmet.yaml
+│   └── finetune_openadmet.yaml
+└── experiments/               # Output directory for experiment results
+    └── .gitkeep
+</code></pre>
+<p><strong>Eliminated vs previous plan:</strong> <code>pretrain_model.py</code> (no wrapper needed). <code>predict.py</code> is a utility module (not a CLI command). <code>compare</code> is a CLI command that outputs tables + optional plots.</p>
+<h3 id="e-4-data-files-copy-from-gt-pyg-branch">E.4 — Data Files (copy from gt-pyg branch)</h3>
+<p>Copy from the <code>feature/multi-isoform-v2</code> branch of gt-pyg:</p>
+<pre><code class="language-bash">
+cd /Users/pawelgniewek/projects/gt-pyg
+git show feature/multi-isoform-v2:notebooks/v2.0.0/data/train-set/expansion_data_train.csv &gt; /tmp/expansion_data_train.csv
+git show feature/multi-isoform-v2:notebooks/v2.0.0/data/train-set/expansion_log_data_train.csv &gt; /tmp/expansion_log_data_train.csv
+git show feature/multi-isoform-v2:notebooks/v2.0.0/data/test-set/expansion_data_test_blinded.csv &gt; /tmp/expansion_data_test_blinded.csv
+git show feature/multi-isoform-v2:notebooks/v2.0.0/data/test-set/expansion_data_test_full.csv &gt; /tmp/expansion_data_test_full.csv
+git show feature/multi-isoform-v2:notebooks/v2.0.0/data/test-set/expansion_data_test_full_lb_flag.csv &gt; /tmp/expansion_data_test_full_lb_flag.csv
+git show feature/multi-isoform-v2:notebooks/v2.0.0/data/all_openadmet_smiles.smi &gt; /tmp/all_openadmet_smiles.smi
+</code></pre>
+<p>Also copy the reference notebook from the other repo:</p>
+<pre><code class="language-bash">
+cp /Users/pawelgniewek/projects/expansionrx-openadmet/v33/CALIBRATE-MTME-0.ipynb /Users/pawelgniewek/projects/golem/notebooks/CALIBRATE-MTME-0-reference.ipynb
+</code></pre>
+<p><strong>Training data format</strong> (<code>expansion_log_data_train.csv</code>):</p>
+<pre><code>
+SMILES,Molecule Name,LogD,LogS,Log_HLM_CLint,Log_MLM_CLint,Log_Caco_Papp_AB,Log_Caco_ER,Log_Mouse_PPB,Log_Mouse_BPB,Log_Mouse_MPB
+</code></pre>
+<ul>
+<li>Already log-transformed. NaN = missing endpoint.</li>
+<li>~5326 molecules, 9 endpoints.</li>
+</ul>
+<p><strong>Test data format</strong> (<code>expansion_data_test_full_lb_flag.csv</code>):</p>
+<pre><code>
+Molecule Name,SMILES,LogD,KSOL,HLM CLint,MLM CLint,Caco-2 Permeability Papp A&gt;B,Caco-2 Permeability Efflux,MPPB,MBPB,MGMB,is_leaderboard
+</code></pre>
+<ul>
+<li>ORIGINAL scale (not log-transformed). Must log-transform for evaluation.</li>
+<li><code>is_leaderboard=1</code> marks the leaderboard subset (~2282 molecules).</li>
+</ul>
+<p><strong>Endpoint mapping</strong> (original name → log name → multiplier):</p>
+<table><thead><tr>
+<th>Original</th>
+<th>Log Name</th>
+<th>Multiplier</th>
+<th>Transform</th>
+</tr></thead><tbody>
+<tr>
+<td>LogD</td>
+<td>LogD</td>
+<td>1</td>
+<td>None (already log-scale)</td>
+</tr>
+<tr>
+<td>KSOL</td>
+<td>LogS</td>
+<td>1e-6</td>
+<td>log10((val+1) * mult)</td>
+</tr>
+<tr>
+<td>HLM CLint</td>
+<td>Log_HLM_CLint</td>
+<td>1</td>
+<td>log10((val+1) * mult)</td>
+</tr>
+<tr>
+<td>MLM CLint</td>
+<td>Log_MLM_CLint</td>
+<td>1</td>
+<td>log10((val+1) * mult)</td>
+</tr>
+<tr>
+<td>Caco-2 Perm Papp A>B</td>
+<td>Log_Caco_Papp_AB</td>
+<td>1e-6</td>
+<td>log10((val+1) * mult)</td>
+</tr>
+<tr>
+<td>Caco-2 Perm Efflux</td>
+<td>Log_Caco_ER</td>
+<td>1</td>
+<td>log10((val+1) * mult)</td>
+</tr>
+<tr>
+<td>MPPB</td>
+<td>Log_Mouse_PPB</td>
+<td>1</td>
+<td>log10((val+1) * mult)</td>
+</tr>
+<tr>
+<td>MBPB</td>
+<td>Log_Mouse_BPB</td>
+<td>1</td>
+<td>log10((val+1) * mult)</td>
+</tr>
+<tr>
+<td>MGMB</td>
+<td>Log_Mouse_MPB</td>
+<td>1</td>
+<td>log10((val+1) * mult)</td>
+</tr>
+</tbody></table>
+<h3 id="e-5-model-architecture-shared-by-all-4-experiments">E.5 — Model Architecture (shared by all 4 experiments)</h3>
+<p>All models use IDENTICAL architecture from the CALIBRATE notebook, adapted for gt-pyg main:</p>
+<pre><code class="language-python">
+from gt_pyg import GraphTransformerNet
+from gt_pyg.data import get_atom_feature_dim, get_bond_feature_dim
+
+model = GraphTransformerNet(
+    node_dim_in=get_atom_feature_dim(),   # dynamically computed
+    edge_dim_in=get_bond_feature_dim(),   # dynamically computed
+    num_gt_layers=4,
+    hidden_dim=128,
+    num_heads=8,
+    norm=&quot;bn&quot;,                            # BatchNorm (not LayerNorm)
+    gt_aggregators=[&quot;sum&quot;, &quot;mean&quot;],       # dual aggregation in GT layers
+    aggregators=[&quot;sum&quot;, &quot;mean&quot;, &quot;max&quot;, &quot;std&quot;],  # 4 global aggregators → pool dim = 4*128 = 512
+    dropout=0.3,
+    act=&quot;gelu&quot;,
+    gate=True,                            # gated attention
+    qkv_bias=False,
+    num_tasks=num_tasks,                  # 1 for ST-LogD, 9 for MT
+)
+</code></pre>
+<h3 id="e-6-the-four-model-experiment">E.6 — The Four-Model Experiment</h3>
+<p><strong>Goal</strong>: Train 4 models to test whether Golem pretraining helps. All settings IDENTICAL except:</p>
+<ol>
+<li><strong>num_tasks</strong>: 1 (ST-LogD) or 9 (MT-all-endpoints)</li>
+<li><strong>Initialization</strong>: random or from Golem pretrained checkpoint</li>
+</ol>
+<table><thead><tr>
+<th>Model</th>
+<th>num_tasks</th>
+<th>Init</th>
+<th>Config suffix</th>
+</tr></thead><tbody>
+<tr>
+<td>ST-LogD-Random</td>
+<td>1</td>
+<td>random</td>
+<td><code>st_random</code></td>
+</tr>
+<tr>
+<td>ST-LogD-Pretrained</td>
+<td>1</td>
+<td>golem checkpoint</td>
+<td><code>st_pretrained</code></td>
+</tr>
+<tr>
+<td>MT-Random</td>
+<td>9</td>
+<td>random</td>
+<td><code>mt_random</code></td>
+</tr>
+<tr>
+<td>MT-Pretrained</td>
+<td>9</td>
+<td>golem checkpoint</td>
+<td><code>mt_pretrained</code></td>
+</tr>
+</tbody></table>
+<p><strong>Configurable data split:</strong></p>
+<p>The split is configurable as a list of fractions:</p>
+<ul>
+<li><strong>Experiment (4-model comparison)</strong>: <code>[0.7, 0.2, 0.1]</code> — 70/20/10 train/val/test, random split</li>
+<li><strong>Production</strong>: <code>[0.8, 0.2]</code> — 80/20 train/val with early stopping, no held-out test</li>
+<li>The CLI accepts <code>--split 0.7 0.2 0.1</code> or <code>--split 0.8 0.2</code></li>
+<li>When 3 fractions given: train/val/test. When 2 fractions: train/val only.</li>
+<li><strong>Scaler is ALWAYS fit on train split only</strong>, regardless of split configuration.</li>
+</ul>
+<pre><code class="language-python">
+def split_data(n: int, fractions: List[float], seed: int = 42) -&gt; Tuple[np.ndarray, ...]:
+    &quot;&quot;&quot;Random split into len(fractions) subsets. Returns index arrays.
+    fractions must sum to 1.0. Supports 2 or 3 splits.&quot;&quot;&quot;
+</code></pre>
+<p><strong>Shared training settings (all 4 models):</strong></p>
+<pre><code class="language-python">
+BATCH_TRAIN = 256
+BATCH_EVAL = 1024
+EPOCHS = 2000            # production (10 for test run)
+BASE_LR = 1e-3
+MIN_LR = 1e-5            # base_lr / 100
+WEIGHT_DECAY = 1e-5
+WARMUP_EPOCHS = 25
+GRAD_CLIP_NORM = 5.0
+SEED = 1928374650
+
+# Loss weights
+W_RAE = 1.0
+W_HUBER = 0.25
+W_CORR = 0.25
+W_TAU = 0.1
+W_R2 = 0.1
+HUBER_DELTA = 0.5
+TAU_TEMP = 2.0
+RANK_PAIRS = 512
+
+# Data split (configurable)
+SPLIT_FRACTIONS = [0.7, 0.2, 0.1]  # experiment: 70/20/10
+# SPLIT_FRACTIONS = [0.8, 0.2]     # production: 80/20
+
+# Scheduler
+T_MAX = min(500, EPOCHS)  # cosine cycle length
+</code></pre>
+<p><strong>Loading pretrained weights (CRITICAL — shape-filter pattern):</strong></p>
+<blockquote><strong>BUG FIX</strong>: PyTorch <code>strict=False</code> does NOT handle shape mismatches — it only</blockquote>
+<blockquote>handles missing/extra keys. Passing shape-mismatched tensors raises <code>RuntimeError</code>.</blockquote>
+<blockquote>The implementing agent MUST use the shape-filter pattern below.</blockquote>
+<pre><code class="language-python">
+# For pretrained variants:
+model = GraphTransformerNet(...)  # create with correct num_tasks
+checkpoint = torch.load(&quot;golem_pretrained.pt&quot;, map_location=device)
+pretrain_sd = checkpoint[&quot;model_state_dict&quot;]
+finetune_sd = model.state_dict()
+
+# Filter to shape-compatible keys only
+compatible_sd = {k: v for k, v in pretrain_sd.items()
+                 if k in finetune_sd and v.shape == finetune_sd[k].shape}
+
+# Load compatible weights, skip the rest
+missing, unexpected = model.load_state_dict(compatible_sd, strict=False)
+print(f&quot;Loaded {len(compatible_sd)}/{len(pretrain_sd)} pretrained keys&quot;)
+print(f&quot;Re-initialized: {missing}&quot;)  # should be only output-layer keys
+</code></pre>
+<p><strong>What transfers and what doesn't</strong> (with CALIBRATE architecture):</p>
+<ul>
+<li><code>node_emb</code>, <code>edge_emb</code>, <code>input_norm</code>, <code>gt_layers.*</code>, <code>readout_norm</code>, <code>global_pool</code> → ALL transfer ✓</li>
+<li><code>mu_mlp.mlp.0.*</code> (Linear 512→128) → transfers ✓ (same shape regardless of num_tasks)</li>
+<li><code>mu_mlp.mlp.3.*</code> (Linear 128→num_tasks) → SKIPPED (different output dim) ✓</li>
+<li>Same pattern for <code>log_var_mlp</code></li>
+<li>~204 of ~208 keys transfer; only 4 output-layer keys are re-initialized</li>
+</ul>
+<p><strong>For random variants:</strong> just create model with default initialization (no weight loading).</p>
+<h3 id="e-7-cli-commands">E.7 — CLI Commands</h3>
+<pre><code class="language-bash">
+# 1. Pretrain on OpenADMET training SMILES with isoform enumeration
+golem pretrain \
+  --smiles data/all_openadmet_smiles.smi \
+  --config configs/pretrain_openadmet.yaml \
+  --output experiments/pretrain
+
+# 2. Fine-tune (runs all 4 models)
+golem finetune \
+  --train-csv data/train-set/expansion_log_data_train.csv \
+  --test-csv data/test-set/expansion_data_test_full_lb_flag.csv \
+  --pretrained-checkpoint experiments/pretrain/best_checkpoint.pt \
+  --output experiments/finetune \
+  --split 0.7 0.2 0.1 \      # 70/20/10 for experiment (configurable)
+  --epochs 10 \               # 10 for test run
+  --subsample 0.1             # 10% for test run (omit for production)
+
+# 3. Compare predictions
+golem compare \
+  --predictions-dir experiments/finetune \
+  --ground-truth data/test-set/expansion_data_test_full_lb_flag.csv \
+  --output experiments/comparison
+</code></pre>
+<h3 id="e-8-module-specifications">E.8 — Module Specifications</h3>
+<h4 id="e-8-1-golem-transforms-py-self-contained-from-openadmet">E.8.1 — <code>golem/transforms.py</code> (Self-contained, from OpenADMET)</h4>
+<p>Bring the log transform functions from <code>notebooks/v2.0.0/src/utils.py</code> on the feature branch. Must be self-contained (no external imports beyond pandas/numpy).</p>
+<p>Functions needed:</p>
+<ul>
+<li><code>get_conversion_config() → dict</code> — maps original assay name → (log_name, multiplier, zero_handling)</li>
+<li><code>log_transform_assay_data(df) → (df_log, conversion_dict)</code> — forward transform</li>
+<li><code>inverse_log_transform_assay_data(df) → (df_orig, reverse_dict)</code> — inverse transform</li>
+<li><code>log_transform_test_data(df) → df_log</code> — transform test data (same rules, applied to test)</li>
+</ul>
+<p>The key transform logic:</p>
+<pre><code class="language-python">
+# For endpoints with log_scale=True:
+#   forward: log10((val + 1) * multiplier)  — note the +1 BEFORE multiplier
+#   inverse: (10^val / multiplier) - 1, clipped to &gt;= 0
+# For LogD: no transform (passthrough)
+</code></pre>
+<p><strong>IMPORTANT</strong>: The training CSV is already log-transformed. The test CSV is in original scale. The comparison needs both in the same space.</p>
+<h4 id="e-8-2-golem-metrics-py-self-contained-from-openadmet">E.8.2 — <code>golem/metrics.py</code> (Self-contained, from OpenADMET)</h4>
+<p>Official OpenADMET evaluation metrics. Must be self-contained.</p>
+<pre><code class="language-python">
+def official_metrics(y_true, y_pred) -&gt; dict:
+    &quot;&quot;&quot;Compute MAE, RAE, R², Spearman R, Kendall Tau for one endpoint.&quot;&quot;&quot;
+
+def per_task_metrics(y_true_2d, y_pred_2d, mask_2d, endpoint_names) -&gt; dict:
+    &quot;&quot;&quot;Compute metrics per task with NaN masking.&quot;&quot;&quot;
+
+def macro_average(metrics_dict) -&gt; dict:
+    &quot;&quot;&quot;Average metrics across endpoints (NaN-safe).&quot;&quot;&quot;
+
+def bootstrap_metrics(y_true, y_pred, n_bootstrap=1000, seed=42) -&gt; dict:
+    &quot;&quot;&quot;Bootstrap confidence intervals for each metric.&quot;&quot;&quot;
+</code></pre>
+<h4 id="e-8-3-golem-loss-py-5-component-custom-loss">E.8.3 — <code>golem/loss.py</code> (5-component custom loss)</h4>
+<p>Adapted from the CALIBRATE notebook. All 5 components:</p>
+<ol>
+<li><strong>RAE loss</strong> — absolute error normalized by per-task MAD</li>
+<li><strong>Huber loss</strong> — robust L2, delta=0.5, optionally normalized by MAD</li>
+<li><strong>Correlation loss</strong> — 1 - Pearson correlation per task</li>
+<li><strong>Kendall rank loss</strong> — soft pairwise ranking with 512 pairs/task</li>
+<li><strong>R²-style loss</strong> — SSE / total variance per task</li>
+</ol>
+<p>All losses must handle:</p>
+<ul>
+<li><code>mask</code> tensor (1.0=present, 0.0=missing) for multi-task sparse labels</li>
+<li>NaN/Inf guards</li>
+<li>Minimum 3 valid samples per task (skip task otherwise)</li>
+<li>Macro-average across valid tasks</li>
+</ul>
+<pre><code class="language-python">
+def compute_task_scales(train_loader, num_tasks) -&gt; Tensor:
+    &quot;&quot;&quot;MAD per task from training data (for RAE normalization).&quot;&quot;&quot;
+
+def custom_loss(pred, y, mask, *, w_rae, w_huber, w_corr, w_tau, w_r2,
+                task_scale, huber_delta, tau_temp, rank_pairs, rng) -&gt; Tensor:
+    &quot;&quot;&quot;Combined 5-component loss.&quot;&quot;&quot;
+</code></pre>
+<p>For pretraining: use simple masked MSE instead (not the 5-component loss).</p>
+<h4 id="e-8-4-golem-isoforms-py-isoform-enumeration">E.8.4 — <code>golem/isoforms.py</code> (Isoform enumeration)</h4>
+<pre><code class="language-python">
+def enumerate_isoforms(smiles: str, max_isoforms: int = 25,
+                       enable_tautomers: bool = True,
+                       enable_protonation: bool = True,
+                       enable_neutralization: bool = True) -&gt; List[str]:
+    &quot;&quot;&quot;Enumerate isoforms for a single SMILES. Returns deduplicated canonical SMILES.
+    Always includes the original as index 0.&quot;&quot;&quot;
+
+def enumerate_isoforms_batch(smiles_list: List[str], max_isoforms: int = 25,
+                             **kwargs) -&gt; Dict[str, List[str]]:
+    &quot;&quot;&quot;Batch enumeration. Returns {parent_smiles: [isoform_smiles]}.&quot;&quot;&quot;
+</code></pre>
+<p>Key implementation details:</p>
+<ul>
+<li>Tautomers: <code>RDKit.Chem.MolStandardize.rdMolStandardize.TautomerEnumerator</code> — create LOCAL instance per call (NOT global singleton)</li>
+<li>Protonation: <code>dimorphite_dl.DimorphiteDL(min_ph=6.4, max_ph=8.4)</code> as primary, <code>Chem.MolStandardize.Uncharger</code> as fallback</li>
+<li>All isoforms canonicalized with <code>Chem.MolToSmiles(mol, canonical=True)</code></li>
+<li>Deduplicated by string equality</li>
+<li>Robust error handling: log warnings for failures, never crash</li>
+</ul>
+<h4 id="e-8-5-golem-descriptors-py-mordred-scaler">E.8.5 — <code>golem/descriptors.py</code> (Mordred + scaler)</h4>
+<pre><code class="language-python">
+def compute_mordred_descriptors(smiles_list: List[str]) -&gt; Tuple[np.ndarray, np.ndarray, List[str]]:
+    &quot;&quot;&quot;Compute Mordred 2D descriptors. Returns (values, validity_mask, descriptor_names).
+    validity_mask is True where descriptor computed successfully, False where NaN.&quot;&quot;&quot;
+
+class NaNAwareStandardScaler:
+    &quot;&quot;&quot;Scaler that uses nanmean/nanstd, fits on train only, serializable.&quot;&quot;&quot;
+    def fit(self, X, validity_mask) -&gt; &#x27;NaNAwareStandardScaler&#x27;: ...
+    def transform(self, X) -&gt; np.ndarray: ...
+    def state_dict(self) -&gt; dict: ...
+    @classmethod
+    def from_state_dict(cls, d) -&gt; &#x27;NaNAwareStandardScaler&#x27;: ...
+</code></pre>
+<h4 id="e-8-6-golem-pretrain-py-pretraining-loop-uses-graphtransformernet-directly">E.8.6 — <code>golem/pretrain.py</code> (Pretraining loop — uses GraphTransformerNet directly)</h4>
+<pre><code class="language-python">
+def pretrain(smiles_path, config, output_dir):
+    &quot;&quot;&quot;Full MDAE pretraining pipeline.
+    Model: GraphTransformerNet(num_tasks=num_descriptors) — no wrapper needed.
+    &quot;&quot;&quot;
+    # 1. Load SMILES
+    # 2. Enumerate isoforms (max 25 per molecule)
+    # 3. Compute Mordred descriptors + validity masks
+    # 4. Split (configurable: [0.7, 0.2, 0.1] or [0.8, 0.2]) — BEFORE fitting scaler
+    # 5. Fit scaler on TRAIN ONLY
+    # 6. Transform + winsorize [-6, 6]
+    # 7. Build PyG datasets:
+    #    - Graph features: get_tensor_data(smiles, dummy_y, gnm=True)
+    #    - Descriptor targets: stored as data.descriptor_targets tensor [D]
+    #    - Validity mask: stored as data.descriptor_valid_mask tensor [D]
+    # 8. Create model: GraphTransformerNet(num_tasks=num_descriptors, ...)
+    # 9. Train with masked MSE loss (zero_var=True for deterministic predictions)
+    # 10. Early stopping on val loss (patience=50)
+    # 11. Report test RMSE (if test split exists)
+    # 12. Save checkpoint via model.save_checkpoint() — full model, scaler in extras
+</code></pre>
+<p><strong>Pretraining forward call:</strong></p>
+<pre><code class="language-python">
+# Use zero_var=True for deterministic predictions during pretraining
+pred, log_var = model(batch.x, batch.edge_index, batch.edge_attr,
+                      batch=batch.batch, zero_var=True)
+# pred shape: [B, num_descriptors] — these ARE the descriptor predictions
+# log_var is ignored for pretraining loss
+</code></pre>
+<p><strong>Pretraining loss (masked MSE):</strong></p>
+<pre><code class="language-python">
+rand_mask = (torch.rand_like(targets) &lt; masking_ratio).bool()  # random 15% mask
+valid_mask = descriptor_valid_mask.bool()                       # NaN positions excluded
+final_mask = rand_mask &amp; valid_mask                             # only masked+valid
+if final_mask.sum() == 0:
+    # Fallback: use all valid positions (extremely rare)
+    final_mask = valid_mask
+loss = F.mse_loss(pred[final_mask], targets[final_mask])
+</code></pre>
+<p><strong>Note on data.y vs descriptor targets:</strong> <code>get_tensor_data</code> creates <code>data.y</code> and <code>data.y_mask</code> for the normal training pipeline. For pretraining, we need separate descriptor tensors. Options:</p>
+<ul>
+<li>Store descriptors in <code>data.y</code> (set <code>y=descriptor_values</code> when calling get_tensor_data) — simplest, but conflates task labels with descriptor targets.</li>
+<li>Store descriptors as a separate attribute: after building Data objects with get_tensor_data, add <code>data.descriptor_targets</code> and <code>data.descriptor_valid_mask</code> as extra tensors. This is cleaner.</li>
+</ul>
+<p><strong>Recommended approach:</strong> Use <code>get_tensor_data(smiles, dummy_y, gnm=True)</code> where <code>dummy_y = [[0.0]<em>num_descriptors] </em> N</code> (or the actual descriptor values). Then for pretraining, the model's forward() predicts <code>num_descriptors</code> outputs and the loss uses the descriptor values. The <code>y_mask</code> from get_tensor_data would be all 1.0 (since we pass finite values), but we use <code>descriptor_valid_mask</code> for the actual masking. <strong>Or simpler</strong>: pass the actual descriptors as <code>y</code> to get_tensor_data, and the validity mask becomes the y_mask. This works because <code>y_mask = isfinite(y)</code> and we've already replaced NaN with 0.0 in descriptors — but then y_mask would be all 1.0. So we need the separate valid_mask.</p>
+<p><strong>Simplest approach:</strong> Build Data objects manually in the pretrain dataset builder instead of using get_tensor_data for the descriptor part. Use get_tensor_data only for graph features.</p>
+<h4 id="e-8-7-golem-finetune-py-fine-tuning-loop">E.8.7 — <code>golem/finetune.py</code> (Fine-tuning loop)</h4>
+<pre><code class="language-python">
+def finetune(train_csv, test_csv, pretrained_checkpoint, output_dir,
+             split=[0.7, 0.2, 0.1], epochs=2000, subsample=None,
+             calibrate=False, seed=1928374650):
+    &quot;&quot;&quot;Run all 4 model variants with identical settings.
+
+    The split, seed, architecture, optimizer, loss, and all hyperparameters
+    are IDENTICAL across variants. Only num_tasks and initialization differ.
+    &quot;&quot;&quot;
+    # 1. Load log-transformed training CSV
+    # 2. Optionally subsample (for test runs — subsamples training data only)
+    # 3. Split train/val(/test) using configurable fractions (same seed for ALL 4)
+    # 4. Build PyG datasets via get_tensor_data(smiles, y_matrix, gnm=True)
+    #    - For ST-LogD: y = [logd_value] (single column, num_tasks=1)
+    #    - For MT: y = [logd, logs, ...all 9] (num_tasks=9)
+    #    Note: get_tensor_data handles NaN→y_mask automatically
+    # 5. Compute task_scales (MAD per task from TRAIN split only)
+    # 6. For each of the 4 variants:
+    #    a. Create model (same architecture, different num_tasks)
+    #    b. Optionally load pretrained weights (shape-filter pattern, see E.6)
+    #    c. Train with 5-component custom loss (zero_var=False for fine-tuning)
+    #    d. Track GLOBAL best checkpoint by macro RAE on validation set
+    #    e. After training: load best checkpoint
+    #    f. Predict on test set
+    #    g. Clip predictions to [train_min - δ*range, train_max + δ*range] (δ=0.2)
+    #    h. Optionally calibrate: fit affine (a, b) on validation set, apply to test
+    #    i. Inverse log-transform predictions back to original scale
+    #    j. Save predictions CSV
+</code></pre>
+<p><strong>Simplification: Global best checkpoint only.</strong> No per-endpoint best tracking. One model per variant, selected by lowest macro RAE on validation set. This eliminates the complexity of loading 9 different checkpoints per MT model.</p>
+<p><strong>Calibration is optional</strong> (default off). Enable with <code>--calibrate</code>. For the 4-model comparison, keeping calibration off ensures we're comparing raw model quality. Add calibration for production submissions.</p>
+<p><strong>Prediction CSV format</strong> (saved per variant):</p>
+<pre><code>
+# File: experiments/finetune/predictions_st_random.csv
+# File: experiments/finetune/predictions_st_pretrained.csv
+# File: experiments/finetune/predictions_mt_random.csv
+# File: experiments/finetune/predictions_mt_pretrained.csv
+Molecule Name,SMILES,LogD,KSOL,HLM CLint,...  (original scale, inverse-transformed)
+</code></pre>
+<p>For ST models, only the LogD column has predictions; other columns are NaN.</p>
+<p><strong>Evaluation space</strong>: All metrics are computed in ORIGINAL scale (inverse-transformed). This matches what OpenADMET reports.</p>
+<h4 id="e-8-9-golem-predict-py-prediction-calibration">E.8.9 — <code>golem/predict.py</code> (Prediction + calibration)</h4>
+<pre><code class="language-python">
+def predict_and_save(model, test_smiles, test_mol_names, endpoints,
+                     train_ranges, calibration_params, output_path):
+    &quot;&quot;&quot;Generate predictions, clip, calibrate, inverse-transform, save CSV.&quot;&quot;&quot;
+
+def fit_calibration(y_true, y_pred, min_points=10) -&gt; Tuple[float, float]:
+    &quot;&quot;&quot;Fit y_true ≈ a * y_pred + b via least squares. Returns (a, b).&quot;&quot;&quot;
+</code></pre>
+<h4 id="e-8-10-golem-compare-cli-command-optional-notebook">E.8.10 — <code>golem compare</code> CLI command + optional notebook</h4>
+<p>The <code>golem compare</code> command replaces the notebook as the primary comparison tool. It is testable, scriptable, and self-contained. An optional notebook in <code>notebooks/</code> can import the same functions for interactive analysis.</p>
+<pre><code class="language-python">
+def compare(predictions_dir, ground_truth_csv, output_dir, leaderboard_only=False):
+    &quot;&quot;&quot;Compare 4 model variants against ground truth.
+    All comparisons in ORIGINAL scale (predictions already inverse-transformed).
+    &quot;&quot;&quot;
+    # 1. Load 4 prediction CSVs from predictions_dir
+    # 2. Load ground truth from ground_truth_csv
+    # 3. Optionally filter by is_leaderboard=1
+    # 4. Merge predictions with ground truth on Molecule Name
+    # 5. Compute metrics per endpoint per model: MAE, RAE, R², Spearman R, Kendall Tau
+    # 6. Bootstrap CIs (1000 samples) per metric per endpoint per model
+    # 7. Print formatted comparison table to stdout
+    # 8. Save summary.csv, bar_chart.png, scatter_plots.png to output_dir
+</code></pre>
+<p><strong>Output table format:</strong></p>
+<pre><code>
+Endpoint       | Metric | ST-Random      | ST-Pretrained  | MT-Random      | MT-Pretrained
+LogD           | MAE    | 0.432 ± 0.023  | 0.389 ± 0.021  | 0.401 ± 0.020  | 0.367 ± 0.019
+LogD           | RAE    | 0.612 ± 0.031  | 0.551 ± 0.029  | 0.568 ± 0.028  | 0.520 ± 0.027
+...
+Macro Average  | RAE    | 0.612          | 0.551          | 0.623          | 0.534
+</code></pre>
+<h3 id="e-9-dependencies">E.9 — Dependencies</h3>
+<pre><code class="language-toml">
+[project]
+name = &quot;golem&quot;
+version = &quot;0.1.0&quot;
+requires-python = &quot;&gt;=3.10&quot;
+dependencies = [
+    &quot;torch&gt;=1.13.0&quot;,
+    &quot;torch_geometric&quot;,
+    &quot;mordredcommunity&quot;,
+    &quot;rdkit&quot;,
+    &quot;dimorphite_dl&quot;,
+    &quot;numpy&quot;,
+    &quot;pandas&quot;,
+    &quot;pyyaml&quot;,
+    &quot;tqdm&quot;,
+    &quot;click&quot;,
+    &quot;scipy&quot;,                 # for spearmanr, kendalltau
+    &quot;scikit-learn&quot;,          # for r2_score
+    &quot;matplotlib&quot;,            # for comparison plots
+]
+
+[project.optional-dependencies]
+dev = [&quot;pytest&gt;=7.0&quot;, &quot;pytest-cov&quot;, &quot;jupyter&quot;]
+
+[project.scripts]
+golem = &quot;golem.cli:main&quot;
+</code></pre>
+<h3 id="e-10-test-run-protocol">E.10 — Test Run Protocol</h3>
+<p>For initial testing (10 epochs, subsampled):</p>
+<pre><code class="language-bash">
+# Step 1: Pretrain (can be quick — small data, few epochs)
+golem pretrain \
+  --smiles data/all_openadmet_smiles.smi \
+  --config configs/pretrain_openadmet.yaml \
+  --output experiments/test_pretrain \
+  --max-epochs 10 \
+  --subsample 0.1
+
+# Step 2: Fine-tune all 4 models (10 epochs, 10% data)
+golem finetune \
+  --train-csv data/train-set/expansion_log_data_train.csv \
+  --test-csv data/test-set/expansion_data_test_full_lb_flag.csv \
+  --pretrained-checkpoint experiments/test_pretrain/best_checkpoint.pt \
+  --output experiments/test_finetune \
+  --epochs 10 \
+  --subsample 0.1
+
+# Step 3: Compare
+golem compare \
+  --predictions-dir experiments/test_finetune \
+  --ground-truth data/test-set/expansion_data_test_full_lb_flag.csv \
+  --output experiments/test_comparison
+</code></pre>
+<h3 id="e-11-production-run-protocol">E.11 — Production Run Protocol</h3>
+<pre><code class="language-bash">
+# Step 1: Full pretraining with isoform enumeration (max 25 isoforms per molecule)
+golem pretrain \
+  --smiles data/train-set/expansion_log_data_train.csv \  # uses SMILES column
+  --config configs/pretrain_openadmet.yaml \
+  --output experiments/pretrain \
+  --max-isoforms 25
+
+# Step 2: Full fine-tuning (2000 epochs, all data, 80/20 for production)
+golem finetune \
+  --train-csv data/train-set/expansion_log_data_train.csv \
+  --test-csv data/test-set/expansion_data_test_full_lb_flag.csv \
+  --pretrained-checkpoint experiments/pretrain/best_checkpoint.pt \
+  --output experiments/finetune \
+  --split 0.8 0.2 \           # production: 80/20 train/val (early stopping on val)
+  --epochs 2000
+
+# Step 3: Compare
+golem compare \
+  --predictions-dir experiments/finetune \
+  --ground-truth data/test-set/expansion_data_test_full_lb_flag.csv \
+  --output experiments/comparison
+</code></pre>
+<h3 id="e-14-resolved-design-decisions-must-follow-do-not-propagate-errors">E.14 — Resolved Design Decisions (MUST follow — do not propagate errors)</h3>
+<p>These decisions have been explicitly resolved. The implementing agent should NOT make different choices without asking the user.</p>
+<p><strong>D1. Pretraining uses zero_var=True, fine-tuning uses zero_var=False</strong></p>
+<ul>
+<li>Pretraining: <code>model(... zero_var=True)</code> → deterministic mu predictions for clean descriptor MSE</li>
+<li>Fine-tuning: <code>model(... zero_var=False)</code> → variational noise during training (acts as regularization, matches CALIBRATE notebook behavior)</li>
+<li>Evaluation (both): <code>model.eval()</code> mode automatically disables noise regardless of zero_var</li>
+</ul>
+<p><strong>D2. Weight loading uses shape-filter, NOT strict=False alone</strong></p>
+<ul>
+<li><code>strict=False</code> in PyTorch does NOT handle shape mismatches — it raises RuntimeError</li>
+<li>Must filter state_dict to shape-compatible keys before loading (see E.6 for exact code)</li>
+<li>This is a real bug in the original plan and CALIBRATE notebook code</li>
+</ul>
+<p><strong>D3. Log transforms: use v1 functions (matching the existing training CSV)</strong></p>
+<ul>
+<li>The file <code>expansion_log_data_train.csv</code> was created with <code>log_transform_assay_data()</code> (v1)</li>
+<li>The v1 transform: <code>log10((val + 1) * multiplier)</code> with no special zero handling</li>
+<li>For consistency, use v1 transforms everywhere. Bring v2 functions too but don't use by default.</li>
+<li>Inverse transform: <code>(10^val / multiplier) - 1</code>, clipped to >= 0</li>
+</ul>
+<p><strong>D4. Comparison is in ORIGINAL scale</strong></p>
+<ul>
+<li>Model predictions are in log scale (matching training labels)</li>
+<li>Inverse-transform predictions before computing metrics</li>
+<li>Test ground truth is already in original scale (<code>expansion_data_test_full_lb_flag.csv</code>)</li>
+<li>Metrics (MAE, RAE, R², Spearman, Kendall) computed on original-scale values</li>
+</ul>
+<p><strong>D5. Single-task model predicts ONLY LogD</strong></p>
+<ul>
+<li>ST models: <code>num_tasks=1</code>, trained on the LogD column only</li>
+<li>In prediction CSV: LogD column has values, all other 8 columns are NaN</li>
+<li>Comparison table shows ST results only for LogD endpoint</li>
+</ul>
+<p><strong>D6. Subsampling affects training data only</strong></p>
+<ul>
+<li><code>--subsample 0.1</code> subsamples the training CSV before splitting</li>
+<li>Test set predictions always use the full test set (inference is fast)</li>
+<li>The split fractions apply to the subsampled training data</li>
+</ul>
+<p><strong>D7. Global best checkpoint only (no per-endpoint best)</strong></p>
+<ul>
+<li>Track one best model per variant by lowest macro RAE on validation set</li>
+<li>This single model is used for ALL endpoint predictions</li>
+<li>Per-endpoint best tracking can be added later if needed</li>
+</ul>
+<p><strong>D8. Config approach: dataclasses internally, YAML optional</strong></p>
+<ul>
+<li><code>config.py</code> defines <code>@dataclass</code> classes: <code>ModelConfig</code>, <code>PretrainConfig</code>, <code>FinetuneConfig</code></li>
+<li>Factory: <code>load_config(yaml_path=None, **cli_overrides)</code> → merges YAML + CLI args</li>
+<li>Defaults are sufficient for quick test runs (no YAML needed)</li>
+<li>YAML provides reproducibility for production runs</li>
+</ul>
+<p><strong>D9. No custom collate_fn</strong></p>
+<ul>
+<li>Standard PyG <code>DataLoader</code> (which uses its default <code>Batch.from_data_list</code> collate)</li>
+<li>No isoform aggregation, no custom batching</li>
+</ul>
+<p><strong>D10. Pretrain data pipeline builds Data objects in two steps</strong></p>
+<ul>
+<li>Step 1: <code>get_tensor_data(smiles, dummy_y, gnm=True)</code> → creates graph features (x, edge_index, edge_attr)</li>
+<li>Step 2: Overwrite <code>data.y = descriptor_targets</code> and <code>data.y_mask = descriptor_valid_mask</code></li>
+<li>Or build Data objects manually with both graph features and descriptor targets</li>
+<li>The implementing agent should choose the cleanest approach — the key constraint is that descriptor_valid_mask must NOT be the standard <code>isfinite(y)</code> mask (since NaN descriptors are stored as 0.0)</li>
+</ul>
+<h3 id="e-12-verification-checklist">E.12 — Verification Checklist</h3>
+<p>The implementing agent should verify:</p>
+<ol>
+<li><strong><code>uv pip install -e .</code></strong> succeeds</li>
+<li><strong><code>golem --help</code></strong> shows pretrain, finetune, compare commands</li>
+<li><strong>Feature dimensions</strong> match: <code>get_atom_feature_dim()</code> and <code>get_bond_feature_dim()</code> return consistent values</li>
+<li><strong>get_tensor_data</strong> creates Data objects with correct y and y_mask shapes</li>
+<li><strong>Pretrained weight loading</strong>: backbone keys load, head keys are skipped, no errors</li>
+<li><strong>Loss masking</strong>: NaN positions in y_mask=0 are excluded from loss (verify gradient is zero for those)</li>
+<li><strong>Scaler data leakage</strong>: verify scaler.mean_ differs when fit on train vs full dataset</li>
+<li><strong>Prediction CSV</strong>: inverse-transformed values are in original assay scale</li>
+<li><strong>Comparison</strong>: metrics are computed correctly between prediction CSVs and ground truth</li>
+<li><strong>4 models differ only in init and num_tasks</strong>: all other hyperparameters identical (spot-check by logging)</li>
+</ol>
+<h3 id="e-13-config-files">E.13 — Config Files</h3>
+<p><strong><code>configs/pretrain_openadmet.yaml</code>:</strong></p>
+<pre><code class="language-yaml">
+model:
+  hidden_dim: 128
+  num_gt_layers: 4
+  num_heads: 8
+  norm: &quot;bn&quot;
+  gt_aggregators: [&quot;sum&quot;, &quot;mean&quot;]
+  aggregators: [&quot;sum&quot;, &quot;mean&quot;, &quot;max&quot;, &quot;std&quot;]
+  dropout: 0.3
+  act: &quot;gelu&quot;
+  gate: true
+
+pretrain:
+  masking_ratio: 0.15
+  descriptor_head_hidden: 512
+  batch_size: 128
+  max_epochs: 500
+  patience: 50
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  warmup_epochs: 25
+  num_workers: 4
+  winsorize_range: [-6.0, 6.0]
+  split_ratios: [0.7, 0.2, 0.1]
+  seed: 42
+
+isoforms:
+  enabled: true
+  max_isoforms: 25
+  tautomers: { enabled: true, max_tautomers: 25 }
+  protonation: { enabled: true, tool: &quot;dimorphite_dl&quot;, ph_range: [6.4, 8.4], fallback: &quot;uncharger&quot; }
+  neutralization: { enabled: true }
+  deduplication: true
+</code></pre>
+<p><strong><code>configs/finetune_openadmet.yaml</code>:</strong></p>
+<pre><code class="language-yaml">
+model:
+  hidden_dim: 128
+  num_gt_layers: 4
+  num_heads: 8
+  norm: &quot;bn&quot;
+  gt_aggregators: [&quot;sum&quot;, &quot;mean&quot;]
+  aggregators: [&quot;sum&quot;, &quot;mean&quot;, &quot;max&quot;, &quot;std&quot;]
+  dropout: 0.3
+  act: &quot;gelu&quot;
+  gate: true
+
+finetune:
+  batch_train: 256
+  batch_eval: 1024
+  epochs: 2000
+  lr: 1.0e-3
+  min_lr: 1.0e-5
+  weight_decay: 1.0e-5
+  warmup_epochs: 25
+  grad_clip_norm: 5.0
+  split: [0.7, 0.2, 0.1]     # experiment: 70/20/10; production: [0.8, 0.2]
+  seed: 1928374650
+  loss:
+    w_rae: 1.0
+    w_huber: 0.25
+    w_corr: 0.25
+    w_tau: 0.1
+    w_r2: 0.1
+    huber_delta: 0.5
+    tau_temp: 2.0
+    rank_pairs: 512
+  calibration:
+    enabled: true
+    clip_delta: 0.2
+</code></pre>
+<hr>
+<hr>
+<h2 id="summary">Summary</h2>
+<h3 id="what-to-reuse-from-reference-code">What to Reuse from Reference Code</h3>
+<ul>
+<li><strong>Golem branch</strong>: validity mask pattern, NaN-aware scaler, YAML config, warmup+cosine schedule</li>
+<li><strong>CALIBRATE notebook</strong>: model architecture, 5-component loss, training loop structure, calibration, prediction pipeline</li>
+<li><strong>OpenADMET utils</strong>: log transform functions, endpoint mapping</li>
+<li><strong>Comparison notebooks</strong>: metrics computation, bootstrap analysis, visualization patterns</li>
+</ul>
+<h3 id="what-to-fix-vs-reference-code">What to Fix vs Reference Code</h3>
+<ol>
+<li><strong>Scaler data leakage</strong> (golem) — fit on train only</li>
+<li><strong>API mismatches</strong> (CALIBRATE) — no <code>pe</code> param, no <code>pe_in_dim</code>, use <code>gnm</code> not <code>gnn</code></li>
+<li><strong>Missing <code>encode()</code></strong> (gt-pyg main) — must add before pretrain model can work</li>
+<li><strong>Code duplication</strong> (notebooks) — factor into importable modules</li>
+<li><strong>Non-functional curriculum learning</strong> (golem) — don't include</li>
+<li><strong>Global mutable enumerator</strong> (golem) — use local instances</li>
+</ol>
+<h3 id="implementation-priority-order">Implementation Priority Order</h3>
+<ol>
+<li>Set up golem project structure + pyproject.toml + CLI skeleton + config dataclasses</li>
+<li>Copy OpenADMET data files from gt-pyg feature branch</li>
+<li>Implement <code>transforms.py</code> and <code>metrics.py</code> (self-contained, from OpenADMET utils)</li>
+<li>Implement <code>loss.py</code> (5-component custom loss, self-contained)</li>
+<li>Implement <code>utils.py</code> (seeding, split_data, DataLoader creation)</li>
+<li>Implement <code>finetune.py</code> + <code>predict.py</code> (the 4-model experiment — this is the core deliverable)</li>
+<li>Implement <code>compare</code> CLI command</li>
+<li><strong>TEST</strong>: Run 10 epochs on 10% subsampled data → verify 4 prediction CSVs → verify comparison table</li>
+<li>Implement <code>isoforms.py</code> + <code>descriptors.py</code> + <code>pretrain.py</code> (pretraining pipeline)</li>
+<li><strong>TEST</strong>: Run pretrain on small data → verify checkpoint → load into fine-tune → verify it works</li>
+<li>Production runs</li>
+</ol>
+<p><strong>Note</strong>: Steps 6-8 (fine-tuning + comparison) can run without pretraining — just use random init for all 4 models to verify the pipeline works. Then add pretraining (steps 9-10) and re-run with pretrained checkpoints.</p>
+</body>
+</html>
