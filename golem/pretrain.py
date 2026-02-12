@@ -190,11 +190,8 @@ def _build_pyg_dataset(
 
     num_descriptors = descriptor_values.shape[1]
 
-    # Dummy targets for get_tensor_data (will be overwritten)
-    dummy_y = [[0.0] * num_descriptors] * len(smiles_list)
-
     logger.info("Building PyG graph features for %d molecules …", len(smiles_list))
-    data_list = get_tensor_data(smiles_list, dummy_y, gnm=True)
+    data_list = get_tensor_data(smiles_list, y=None, gnm=True)
 
     # Overwrite y and y_mask with actual descriptor data.
     # Store as [1, D] so that PyG batching concatenates to [B, D]
@@ -353,7 +350,7 @@ def pretrain(
         num_tasks=num_descriptors,
     ).to(device)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_params = model.num_parameters()
     logger.info("Model: %d trainable parameters, num_tasks=%d", n_params, num_descriptors)
 
     # ------------------------------------------------------------------
@@ -454,8 +451,7 @@ def pretrain(
         test_loader = make_loader(test_data, config.batch_size, shuffle=False, num_workers=config.num_workers)
 
         # Load best checkpoint for test evaluation
-        ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_weights(best_ckpt_path, map_location=device)
 
         test_mse, test_rmse = _validate(model, test_loader, device)
         logger.info("Test RMSE (best model): %.4f", test_rmse)
