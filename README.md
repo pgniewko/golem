@@ -2,7 +2,7 @@
 
 MDAE (Masked Descriptor Autoencoding) pretraining for Graph Transformers on molecular descriptors. Inspired by [CheMeleon](https://github.com/JacksonBurns/chemeleon), with improvements including NaN-aware validity masking, isoform enumeration for data augmentation, and a clean train-only scaler.
 
-Golem pretrains a [gt-pyg](https://github.com/your-org/gt-pyg) `GraphTransformerNet` backbone to predict Mordred 2D molecular descriptors, then the pretrained weights transfer to downstream property-prediction tasks via fine-tuning notebooks.
+Golem pretrains a [gt-pyg](https://github.com/pgniewko/gt-pyg) `GraphTransformerNet` backbone to predict Mordred 2D molecular descriptors, then the pretrained weights transfer to downstream property-prediction tasks via fine-tuning notebooks.
 
 ## Installation
 
@@ -10,12 +10,12 @@ Golem pretrains a [gt-pyg](https://github.com/your-org/gt-pyg) `GraphTransformer
 
 - Python 3.10+
 - [uv](https://github.com/astral-sh/uv) (recommended) or pip
-- The [gt-pyg](https://github.com/your-org/gt-pyg) repository cloned locally
+- The [gt-pyg](https://github.com/pgniewko/gt-pyg) package
 
 ### Setup
 
 ```bash
-cd /Users/pawelgniewek/projects/golem
+cd golem
 
 # Create and activate virtual environment
 uv venv
@@ -24,8 +24,8 @@ source .venv/bin/activate
 # Install golem (editable)
 uv pip install -e .
 
-# Install gt-pyg (editable, from local clone)
-uv pip install -e /Users/pawelgniewek/projects/gt-pyg
+# Install gt-pyg from GitHub
+pip install git+https://github.com/pgniewko/gt-pyg.git
 
 # (Optional) Install dev dependencies for tests and notebooks
 uv pip install -e ".[dev]"
