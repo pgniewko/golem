@@ -24,8 +24,7 @@ pretrain:
 
 isoforms:
   enabled: true
-  max_isoforms: 25
-  tautomers: { enabled: true, max_tautomers: 25 }
-  protonation: { enabled: true, tool: "dimorphite_dl", ph_range: [6.4, 8.4], fallback: "uncharger" }
+  tautomers: { enabled: true, max_tautomers: 10 }
+  protonation: { enabled: true, ph_range: [6.4, 8.4], max_protomers: 10 }
   neutralization: { enabled: true }
   deduplication: true

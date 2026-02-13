@@ -40,6 +40,10 @@ def main() -> None:
     "--no-isoforms", is_flag=True, default=False,
     help="Disable isoform enumeration.",
 )
+@click.option(
+    "--verbose", is_flag=True, default=False,
+    help="Show DEBUG-level logs on console.",
+)
 def pretrain_cmd(
     smiles: str,
     config_path: str | None,
@@ -50,6 +54,7 @@ def pretrain_cmd(
     subsample: float | None,
     seed: int | None,
     no_isoforms: bool,
+    verbose: bool,
 ) -> None:
     """Run MDAE pretraining on molecular descriptors."""
     # Build CLI overrides dict (None values are ignored by load_config)
@@ -72,6 +77,7 @@ def pretrain_cmd(
         config=cfg,
         output_dir=output,
         subsample=subsample,
+        verbose=verbose,
     )
 
 

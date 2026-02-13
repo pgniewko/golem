@@ -28,6 +28,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
+from rdkit import Chem
 import torch.nn.functional as F
 import yaml
 from tqdm import tqdm
@@ -45,8 +46,13 @@ logger = logging.getLogger(__name__)
 # Logging setup
 # ---------------------------------------------------------------------------
 
-def _setup_logging(output_dir: Path) -> None:
-    """Configure logging to both stdout (INFO) and file (DEBUG)."""
+def _setup_logging(output_dir: Path, verbose: bool = False) -> None:
+    """Configure logging to both stdout and file.
+
+    Args:
+        output_dir: Directory for the log file.
+        verbose: If True, set console handler to DEBUG level.
+    """
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
@@ -54,9 +60,9 @@ def _setup_logging(output_dir: Path) -> None:
     for h in root.handlers[:]:
         root.removeHandler(h)
 
-    # Console handler (INFO)
+    # Console handler (INFO by default, DEBUG when verbose)
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
+    ch.setLevel(logging.DEBUG if verbose else logging.INFO)
     ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s — %(message)s", datefmt="%H:%M:%S"))
     root.addHandler(ch)
 
@@ -212,6 +218,7 @@ def pretrain(
     config: PretrainConfig,
     output_dir: str,
     subsample: Optional[float] = None,
+    verbose: bool = False,
 ) -> Path:
     """Full MDAE pretraining pipeline.
 
@@ -221,13 +228,23 @@ def pretrain(
         output_dir: Directory for checkpoints, logs, metrics.
         subsample: If set, randomly subsample this fraction of SMILES
             before processing (e.g. 0.1 for 10%).
+        verbose: If True, show DEBUG-level logs on console.
 
     Returns:
         Path to the best checkpoint file.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _setup_logging(output_dir)
+    _setup_logging(output_dir, verbose=verbose)
+
+    # Log library versions when verbose
+    if verbose:
+        try:
+            import rdkit
+            import dimorphite_dl
+            logger.debug("rdkit %s, dimorphite_dl %s", rdkit.__version__, dimorphite_dl.__version__)
+        except Exception:
+            pass
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
@@ -275,6 +292,25 @@ def pretrain(
         smiles_list = unique_smiles
     else:
         logger.info("Isoform enumeration disabled")
+
+    # ------------------------------------------------------------------
+    # 2b. Filter invalid SMILES before descriptor computation
+    # ------------------------------------------------------------------
+    valid_smiles = []
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is not None:
+            try:
+                Chem.SanitizeMol(mol)
+                valid_smiles.append(smi)
+            except Exception:
+                logger.debug("Filtered invalid SMILES: %s", smi)
+        else:
+            logger.debug("Filtered unparseable SMILES: %s", smi)
+    n_filtered = len(smiles_list) - len(valid_smiles)
+    if n_filtered > 0:
+        logger.info("Filtered %d invalid SMILES (%d remain)", n_filtered, len(valid_smiles))
+    smiles_list = valid_smiles
 
     # ------------------------------------------------------------------
     # 3. Compute Mordred descriptors

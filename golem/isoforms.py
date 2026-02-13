@@ -10,11 +10,15 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional, Set
 
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from rdkit.Chem.MolStandardize import rdMolStandardize
 from tqdm import tqdm
 
 from golem.config import IsoformConfig
+
+# Suppress RDKit C++ warnings (tautomer limit, kekulization errors, etc.)
+# These bypass Python logging and write directly to stderr.
+RDLogger.DisableLog('rdApp.*')
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +35,7 @@ def _canonical(mol: Chem.Mol) -> Optional[str]:
         return None
 
 
-def _enumerate_tautomers(mol: Chem.Mol, max_tautomers: int = 25) -> List[Chem.Mol]:
+def _enumerate_tautomers(mol: Chem.Mol, max_tautomers: int = 10) -> List[Chem.Mol]:
     """Enumerate tautomers using a **local** TautomerEnumerator instance."""
     try:
         enumerator = rdMolStandardize.TautomerEnumerator()
@@ -42,45 +46,113 @@ def _enumerate_tautomers(mol: Chem.Mol, max_tautomers: int = 25) -> List[Chem.Mo
         return []
 
 
-def _enumerate_protonation(
-    mol: Chem.Mol,
-    ph_range: tuple[float, float] = (6.4, 8.4),
-    max_protomers: int = 25,
-) -> List[Chem.Mol]:
-    """Enumerate protonation states with Dimorphite-DL (primary) or Uncharger (fallback)."""
-    smi = _canonical(mol)
-    if smi is None:
-        return []
+def _is_valid_protomer(protomer_mol: Chem.Mol, original_smi: str) -> bool:
+    """Validate a protomer against known Dimorphite-DL failure modes.
 
-    # --- Primary: Dimorphite-DL ---
+    Rejects:
+    1. Nitrogen with >=4 total hydrogens (NH4+ on organic N)
+    2. Tertiary amide false protonation (H added to amide N that had no H)
+    3. RDKit sanitization / kekulization failures
+    """
+    # 1. RDKit sanitization check
     try:
-        from dimorphite_dl import DimorphiteDL
+        Chem.SanitizeMol(protomer_mol)
+    except Exception:
+        logger.debug("Protomer failed sanitization: %s", _canonical(protomer_mol))
+        return False
 
-        dl = DimorphiteDL(
-            min_ph=ph_range[0],
-            max_ph=ph_range[1],
+    # 2. Nitrogen with >= 4 hydrogens (invalid for organic N)
+    for atom in protomer_mol.GetAtoms():
+        if atom.GetAtomicNum() == 7 and atom.GetTotalNumHs() >= 4:
+            logger.debug(
+                "Rejected protomer with N(4+H): %s", _canonical(protomer_mol)
+            )
+            return False
+
+    # 3. Tertiary amide false protonation
+    # Parse the original to find amide N atoms that have no H
+    orig_mol = Chem.MolFromSmiles(original_smi)
+    if orig_mol is not None:
+        # Build set of amide N atom indices in original (N bonded to C=O, no H)
+        orig_amide_n_indices: set = set()
+        for atom in orig_mol.GetAtoms():
+            if atom.GetAtomicNum() != 7:
+                continue
+            if atom.GetTotalNumHs() > 0:
+                continue  # already has H — not a tertiary amide N
+            # Check if bonded to a C=O
+            for neighbor in atom.GetNeighbors():
+                if neighbor.GetAtomicNum() == 6:  # carbon
+                    for bond in neighbor.GetBonds():
+                        other = bond.GetOtherAtom(neighbor)
+                        if (
+                            other.GetAtomicNum() == 8
+                            and bond.GetBondTypeAsDouble() == 2.0
+                        ):
+                            orig_amide_n_indices.add(atom.GetIdx())
+                            break
+
+        # Check protomer: if any of those amide N now has H, reject
+        if orig_amide_n_indices:
+            for idx in orig_amide_n_indices:
+                if idx < protomer_mol.GetNumAtoms():
+                    patom = protomer_mol.GetAtomWithIdx(idx)
+                    if patom.GetAtomicNum() == 7 and patom.GetTotalNumHs() > 0:
+                        logger.debug(
+                            "Rejected protomer with protonated amide N: %s",
+                            _canonical(protomer_mol),
+                        )
+                        return False
+
+    return True
+
+
+def _enumerate_protonation(
+    smi: str,
+    ph_range: tuple[float, float] = (6.4, 8.4),
+    max_protomers: int = 10,
+) -> List[Chem.Mol]:
+    """Enumerate protonation states with Dimorphite-DL (primary) or Uncharger (fallback).
+
+    Args:
+        smi: Input SMILES string.
+        ph_range: (min_pH, max_pH) for protonation enumeration.
+        max_protomers: Maximum number of protomers to generate.
+
+    Returns:
+        List of valid protomer Mol objects.
+    """
+    # --- Primary: Dimorphite-DL protonate_smiles ---
+    try:
+        from dimorphite_dl import protonate_smiles
+
+        protomer_smiles = protonate_smiles(
+            smi,
+            ph_min=ph_range[0],
+            ph_max=ph_range[1],
             max_variants=max_protomers,
-            label_states=False,
         )
-        protomer_smiles = dl.protonate(smi)
 
         protomers: List[Chem.Mol] = []
         for psmi in protomer_smiles:
             pmol = Chem.MolFromSmiles(psmi)
-            if pmol is not None:
+            if pmol is not None and _is_valid_protomer(pmol, smi):
                 protomers.append(pmol)
         return protomers
 
     except ImportError:
         logger.warning(
             "dimorphite_dl not installed – falling back to RDKit Uncharger. "
-            "Install with: pip install dimorphite_dl"
+            "Install with: pip install dimorphite-dl==2.0.2"
         )
     except Exception as e:
         logger.debug("Dimorphite-DL failed for %s: %s – falling back to Uncharger", smi, e)
 
     # --- Fallback: RDKit Uncharger ---
     try:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            return []
         uncharger = rdMolStandardize.Uncharger()
         uncharged = uncharger.uncharge(mol)
         if uncharged is not None:
@@ -135,23 +207,27 @@ def enumerate_isoforms(smiles: str, config: IsoformConfig) -> List[str]:
 
     def _add(mols: List[Chem.Mol]) -> None:
         for m in mols:
-            if len(isoforms) >= config.max_isoforms:
-                return
             can = _canonical(m)
             if can is not None and can not in seen:
                 seen.add(can)
                 isoforms.append(can)
 
     # Tautomers
-    if config.tautomers and len(isoforms) < config.max_isoforms:
+    if config.tautomers:
         _add(_enumerate_tautomers(mol, max_tautomers=config.max_tautomers))
 
-    # Protonation states
-    if config.protonation and len(isoforms) < config.max_isoforms:
-        _add(_enumerate_protonation(mol, ph_range=config.ph_range, max_protomers=config.max_isoforms))
+    # Protonation states — takes SMILES string directly
+    if config.protonation:
+        _add(
+            _enumerate_protonation(
+                original_can,
+                ph_range=config.ph_range,
+                max_protomers=config.max_protomers,
+            )
+        )
 
     # Neutralization
-    if config.neutralization and len(isoforms) < config.max_isoforms:
+    if config.neutralization:
         _add(_neutralize(mol))
 
     return isoforms

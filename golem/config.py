@@ -33,10 +33,10 @@ class IsoformConfig:
     """Isoform enumeration config."""
 
     enabled: bool = True
-    max_isoforms: int = 25
     tautomers: bool = True
-    max_tautomers: int = 25
+    max_tautomers: int = 10
     protonation: bool = True
+    max_protomers: int = 10
     ph_range: Tuple[float, float] = (6.4, 8.4)
     neutralization: bool = True
 
@@ -87,6 +87,8 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         isoform_d["protonation"] = prot.get("enabled", True)
         if "ph_range" in prot:
             isoform_d["ph_range"] = tuple(prot["ph_range"])
+        if "max_protomers" in prot:
+            isoform_d["max_protomers"] = prot["max_protomers"]
     if "neutralization" in isoform_d and isinstance(isoform_d["neutralization"], dict):
         neut = isoform_d.pop("neutralization")
         isoform_d["neutralization"] = neut.get("enabled", True)
