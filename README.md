@@ -1,6 +1,6 @@
 # Golem
 
-MDAE (Masked Descriptor Autoencoding) pretraining for Graph Transformers on molecular descriptors. Inspired by [CheMeleon](https://github.com/JacksonBurns/chemeleon), with improvements including NaN-aware validity masking, isoform enumeration for data augmentation, and a clean train-only scaler.
+Masked Descriptor Autoencoding pretraining for Graph Transformers on molecular descriptors. Inspired by [CheMeleon](https://github.com/JacksonBurns/chemeleon), with improvements including NaN-aware validity masking, isoform enumeration for data augmentation, and a clean train-only scaler.
 
 Golem pretrains a [gt-pyg](https://github.com/pgniewko/gt-pyg) `GraphTransformerNet` backbone to predict Mordred 2D molecular descriptors, then the pretrained weights transfer to downstream property-prediction tasks via fine-tuning notebooks.
 
