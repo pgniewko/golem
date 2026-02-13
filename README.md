@@ -25,7 +25,7 @@ source .venv/bin/activate
 uv pip install -e .
 
 # Install gt-pyg from GitHub
-pip install git+https://github.com/pgniewko/gt-pyg.git
+uv pip install git+https://github.com/pgniewko/gt-pyg.git
 
 # (Optional) Install dev dependencies for tests and notebooks
 uv pip install -e ".[dev]"
