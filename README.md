@@ -90,9 +90,32 @@ experiments/pretrain/
   pretrain.log              # Full log output
 ```
 
+## Generating Reports
+
+After a pretraining run completes, an HTML report with training curves is automatically generated in the output directory. You can also regenerate or create a report from any existing experiment directory:
+
+```bash
+golem report experiments/pretrain
+```
+
+This reads `metrics.csv` and `resolved_config.yaml` from the experiment directory and produces a self-contained Chart.js dashboard (`pretrain_report.html`) with:
+
+- Training & validation loss curves
+- Validation RMSE curve
+- Learning rate schedule
+- Train vs val loss gap
+- Summary cards (best epoch, best val loss, elapsed time, architecture)
+- Epoch-by-epoch table with the best row highlighted
+
+To write the report to a custom path:
+
+```bash
+golem report experiments/pretrain --output path/to/report.html
+```
+
 ## Running Fine-Tuning Notebooks
 
-The four notebooks in `notebooks/examples/` compare random-init vs pretrained models on single-task (LogD) and multi-task (9 endpoints) settings.
+The four fine-tuning notebooks in `notebooks/` compare random-init vs pretrained models on single-task (LogD) and multi-task (9 endpoints) settings.
 
 ### Setup
 
@@ -101,7 +124,7 @@ The four notebooks in `notebooks/examples/` compare random-init vs pretrained mo
 uv pip install jupyter scipy scikit-learn matplotlib
 
 # Launch Jupyter
-cd notebooks/examples
+cd notebooks
 jupyter notebook
 ```
 
@@ -129,9 +152,8 @@ The tests cover isoform enumeration, Mordred descriptor computation, the NaN-awa
 ```
 golem/
 ├── pyproject.toml                  # Package metadata + dependencies
-├── PLAN.md                         # Detailed implementation spec
-├── NOTES.md                        # Review and suggestions for the plan
-├── audit.html                      # Code audit report
+├── docs/
+│   └── audit.html                  # Comprehensive project audit
 │
 ├── golem/                          # The Python package (pretraining only)
 │   ├── __init__.py
@@ -159,13 +181,13 @@ golem/
 │       ├── expansion_data_test_full.csv
 │       └── expansion_data_test_full_lb_flag.csv  # With leaderboard flag
 │
-├── notebooks/
-│   ├── examples/                   # Fine-tuning comparison notebooks
-│   │   ├── finetune_st_random.ipynb
-│   │   ├── finetune_st_pretrained.ipynb
-│   │   ├── finetune_mt_random.ipynb
-│   │   └── finetune_mt_pretrained.ipynb
-│   └── CALIBRATE-MTME-0-reference.ipynb  # Reference notebook (read-only)
+├── notebooks/                      # Fine-tuning & analysis notebooks
+│   ├── finetune_st_random.ipynb
+│   ├── finetune_st_pretrained.ipynb
+│   ├── finetune_mt_random.ipynb
+│   ├── finetune_mt_pretrained.ipynb
+│   ├── inspect_isoforms.ipynb      # Isoform enumeration analysis
+│   └── compare_experiments.ipynb   # Cross-experiment comparison
 │
 ├── experiments/                    # Output directory for all runs
 │   ├── test_pretrain/              # Test run outputs

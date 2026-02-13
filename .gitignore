@@ -10,8 +10,10 @@ __pycache__/
 # Temp files
 tmp*
 
-# Planning and audit docs (not part of the project)
+# Old planning docs (retired, consolidated into docs/audit.html)
 PLAN.md
 PLAN.html
 NOTES.md
-audit.html
+
+# Allow docs/audit.html (the consolidated audit is tracked)
+!docs/audit.html
