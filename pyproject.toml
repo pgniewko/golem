@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov", "jupyter"]
+dev = ["pytest>=7.0", "pytest-cov", "jupyter", "scikit-learn", "scipy", "matplotlib", "seaborn"]
 
 [project.scripts]
 golem = "golem.cli:main"

@@ -9,7 +9,7 @@ Golem pretrains a [gt-pyg](https://github.com/pgniewko/gt-pyg) `GraphTransformer
 ### Prerequisites
 
 - Python 3.10+
-- [uv](https://github.com/astral-sh/uv) (recommended) or pip
+- pip (included with Python)
 - The [gt-pyg](https://github.com/pgniewko/gt-pyg) package
 
 ### Setup
@@ -18,24 +18,24 @@ Golem pretrains a [gt-pyg](https://github.com/pgniewko/gt-pyg) `GraphTransformer
 cd golem
 
 # Create and activate virtual environment
-uv venv
+python -m venv .venv
 source .venv/bin/activate
 
 # Install golem (editable)
-uv pip install -e .
+pip install -e .
 
 # Install gt-pyg from GitHub
-uv pip install git+https://github.com/pgniewko/gt-pyg.git
+pip install git+https://github.com/pgniewko/gt-pyg.git
 
 # (Optional) Install dev dependencies for tests and notebooks
-uv pip install -e ".[dev]"
+pip install -e ".[dev]"
 ```
 
 ### Verify installation
 
 ```bash
 golem --help
-# Should show the 'pretrain' command
+# Should show 'pretrain' and 'report' commands
 
 python -c "from gt_pyg import GraphTransformerNet; print('gt-pyg OK')"
 python -c "from golem.config import PretrainConfig; print('golem OK')"
@@ -76,6 +76,7 @@ golem pretrain \
 | `--subsample` | Subsample fraction (e.g. 0.1 for 10%) | None (use all) |
 | `--seed` | Override random seed | 42 |
 | `--no-isoforms` | Disable isoform enumeration | Enabled |
+| `--verbose` | Show DEBUG-level logs on console | Disabled |
 
 ### What pretraining produces
 
@@ -120,8 +121,8 @@ The four fine-tuning notebooks in `notebooks/` compare random-init vs pretrained
 ### Setup
 
 ```bash
-# Install notebook dependencies (scipy, scikit-learn not in package deps)
-uv pip install jupyter scipy scikit-learn matplotlib
+# Install dev dependencies (includes jupyter, scipy, scikit-learn, matplotlib, seaborn)
+pip install -e ".[dev]"
 
 # Launch Jupyter
 cd notebooks
@@ -137,7 +138,7 @@ jupyter notebook
 | `finetune_mt_random.ipynb` | 9 (all) | Random | Baseline multi-task |
 | `finetune_mt_pretrained.ipynb` | 9 (all) | Golem | Pretrained multi-task |
 
-All four notebooks are **structurally identical** &mdash; they differ only in the first cell (config). The pretrained notebooks expect a checkpoint at `../../experiments/pretrain/best_checkpoint.pt`.
+All four notebooks are **structurally identical** &mdash; they differ only in the first cell (config). The pretrained notebooks expect a checkpoint at `../experiments/pretrain/best_checkpoint.pt`.
 
 ## Running Tests
 
@@ -157,13 +158,14 @@ golem/
 │
 ├── golem/                          # The Python package (pretraining only)
 │   ├── __init__.py
-│   ├── cli.py                      # Click CLI: `golem pretrain`
+│   ├── cli.py                      # Click CLI: `golem pretrain`, `golem report`
 │   ├── config.py                   # Dataclasses (ModelConfig, IsoformConfig,
 │   │                               #   PretrainConfig) + YAML loading
 │   ├── isoforms.py                 # Tautomer / protonation / neutralization
 │   │                               #   enumeration (RDKit + Dimorphite-DL)
 │   ├── descriptors.py              # Mordred 2D computation + NaNAwareStandardScaler
 │   ├── pretrain.py                 # Full MDAE pretraining loop
+│   ├── report.py                   # HTML report generation (Chart.js dashboard)
 │   ├── utils.py                    # Seeding, data splitting, DataLoader, SMILES I/O
 │   └── _vendor/                    # Local copies of gt-pyg code if fixes are needed
 │       └── __init__.py             #   (currently empty — no fixes needed)
@@ -190,8 +192,7 @@ golem/
 │   └── compare_experiments.ipynb   # Cross-experiment comparison
 │
 ├── experiments/                    # Output directory for all runs
-│   ├── test_pretrain/              # Test run outputs
-│   ├── pretrain/                   # Production pretrain outputs (when run)
+│   ├── pretrain/                   # Production pretrain outputs
 │   ├── st_random/                  # Notebook experiment outputs
 │   ├── st_pretrained/
 │   ├── mt_random/
@@ -218,11 +219,11 @@ golem/
 
 | Looking for... | Go to |
 |----------------|-------|
-| How the model is constructed | `pretrain.py:339-353` and notebook cell 5 |
-| The masked MSE pretraining loss | `pretrain.py:117-128` |
+| How the model is constructed | `pretrain.py:373-387` and notebook cell 5 |
+| The masked MSE pretraining loss | `pretrain.py:124-135` |
 | The 5-component fine-tuning loss | Notebook cell 7 |
 | NaN handling / validity masking | `descriptors.py:72-76` |
-| Scaler fit (train-only, no leakage) | `pretrain.py:306-308` |
+| Scaler fit (train-only, no leakage) | `pretrain.py:340-341` |
 | Pretrained weight loading (shape-filter) | Notebook cell 6 |
 | Config defaults | `config.py` dataclass definitions |
 | Production config | `configs/pretrain_openadmet.yaml` |
