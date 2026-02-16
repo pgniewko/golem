@@ -132,7 +132,7 @@
   <li><a href="#chemeleon">CheMeleon Comparison</a> (incl. winsorization &amp; standardization)</li>
   <li><a href="#plan-vs-impl">Plan vs Implementation Cross-Reference</a></li>
   <li><a href="#notes-status">NOTES.md Suggestion Status</a></li>
-  <li><a href="#bugs">Current Bugs</a> (3 critical, 4 medium, 6 low/cosmetic)</li>
+  <li><a href="#bugs">Current Bugs</a> (3 critical, 4 medium, 5 low/cosmetic)</li>
   <li><a href="#fragilities">Fragilities &amp; Recommendations</a></li>
   <li><a href="#tests">Test Coverage</a></li>
 </ol>
@@ -158,7 +158,7 @@
     <div class="label">Medium bugs</div>
   </div>
   <div class="summary-card">
-    <div class="num" style="color:var(--yellow);">6</div>
+    <div class="num" style="color:var(--yellow);">5</div>
     <div class="label">Low / cosmetic</div>
   </div>
   <div class="summary-card">
@@ -650,7 +650,7 @@ ph_range: !!python/tuple
 <p>Mordred descriptor computation is the slowest step (minutes for thousands of molecules). If the pipeline crashes after descriptors are computed but before training, all computation is lost. No caching to disk.</p>
 <p><strong>Recommendation:</strong> Save descriptor matrix + validity mask to a <code>.npz</code> file after computation, check for it on startup.</p>
 
-<h3>5.3 &mdash; Low / Cosmetic (6)</h3>
+<h3>5.3 &mdash; Low / Cosmetic (5)</h3>
 
 <table>
 <thead>
@@ -671,24 +671,18 @@ ph_range: !!python/tuple
 </tr>
 <tr>
   <td>L3</td>
-  <td>Dead <code>import copy</code> in notebooks (imported but never used)</td>
-  <td class="file-ref">All 4 notebooks, cell 1</td>
-  <td><span class="tag tag-low">LOW</span></td>
-</tr>
-<tr>
-  <td>L4</td>
   <td><code>config.py</code> uses <code>import copy</code> &mdash; could be <code>from copy import deepcopy</code> for clarity</td>
   <td class="file-ref">config.py:5</td>
   <td><span class="tag tag-low">COSMETIC</span></td>
 </tr>
 <tr>
-  <td>L5</td>
+  <td>L4</td>
   <td>No validation: <code>max_epochs &lt;= warmup_epochs</code> is silently accepted but means the model only ever warms up</td>
   <td class="file-ref">config.py, pretrain.py:80-92</td>
   <td><span class="tag tag-low">LOW</span></td>
 </tr>
 <tr>
-  <td>L6</td>
+  <td>L5</td>
   <td>No bounds check on individual <code>split_ratios</code> values (e.g., negative values accepted)</td>
   <td class="file-ref">utils.py:39-40</td>
   <td><span class="tag tag-low">LOW</span></td>
@@ -775,12 +769,7 @@ ph_range: !!python/tuple
   <td>Add patience counter on macro RAE; break when patience exceeded</td>
 </tr>
 <tr>
-  <td>Dead <code>import copy</code> in notebooks</td>
-  <td>All 4 notebooks, cell 1</td>
-  <td>Remove the unused import</td>
-</tr>
-<tr>
-  <td>DimorphiteDL constructed per-molecule</td>
+  <td><code>protonate_smiles</code> called per-molecule</td>
   <td><code>isoforms.py:127</code></td>
   <td>Use function-level import (already done) but share a single <code>protonate_smiles</code> function reference across the batch call</td>
 </tr>
@@ -893,7 +882,7 @@ ph_range: !!python/tuple
 <tr><td>Plan deviations</td><td>7</td><td style="color:var(--yellow);">3 meaningful (D4 metrics, early stopping, scheduler save), 4 minor</td></tr>
 <tr><td>Critical bugs</td><td>3</td><td style="color:var(--red);">File handle leak, epoch undefined, root logger destruction</td></tr>
 <tr><td>Medium bugs</td><td>4</td><td style="color:var(--orange);">YAML tags, no resume, scheduler not saved, no descriptor cache</td></tr>
-<tr><td>Low / cosmetic issues</td><td>6</td><td style="color:var(--yellow);">Dead imports, missing validations, unused functions</td></tr>
+<tr><td>Low / cosmetic issues</td><td>5</td><td style="color:var(--yellow);">Missing validations, unused functions, cosmetic style</td></tr>
 <tr><td>Tests passing</td><td>60</td><td style="color:var(--green);">3 test files covering config, descriptors, isoforms, splitting, loading</td></tr>
 <tr><td>NOTES.md suggestions addressed</td><td>6/12</td><td style="color:var(--yellow);">6 resolved, 3 N/A, 2 not addressed, 1 not verified</td></tr>
 </tbody>

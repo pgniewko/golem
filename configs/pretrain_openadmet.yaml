@@ -8,6 +8,9 @@ model:
   dropout: 0.3
   act: "gelu"
   gate: true
+  num_head_layers: 2
+  head_norm: true
+  head_residual: falsw
 
 pretrain:
   masking_ratio: 0.15
