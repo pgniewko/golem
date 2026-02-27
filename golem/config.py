@@ -33,7 +33,7 @@ class IsoformConfig:
     """Isoform enumeration config."""
 
     enabled: bool = True
-    desalting: bool = True
+    desalting: bool = False
     tautomers: bool = True
     max_tautomers: int = 10
     protonation: bool = True
@@ -96,7 +96,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         isoform_d["neutralization"] = neut.get("enabled", True)
     if "desalting" in isoform_d and isinstance(isoform_d["desalting"], dict):
         desalt = isoform_d.pop("desalting")
-        isoform_d["desalting"] = desalt.get("enabled", True)
+        isoform_d["desalting"] = desalt.get("enabled", False)
     if "rdkit_fallback" in isoform_d and isinstance(isoform_d["rdkit_fallback"], dict):
         fb = isoform_d.pop("rdkit_fallback")
         isoform_d["rdkit_fallback"] = fb.get("enabled", False)
