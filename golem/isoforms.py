@@ -1,17 +1,19 @@
-"""Isoform enumeration: tautomers, protonation states, neutralization.
+"""Isoform enumeration: desalting, tautomers, protonation states, neutralization.
 
-Each enumeration function creates local RDKit/Dimorphite instances (no global
-singletons) for thread safety.  All isoforms are deduplicated by canonical
-SMILES, with the original molecule always at index 0.
+Each enumeration function creates local RDKit/Gypsum-DL/MolVS instances (no
+global singletons) for thread safety.  All isoforms are deduplicated by
+canonical SMILES, with the original molecule always at index 0.
 """
 
 from __future__ import annotations
 
 import logging
+import random
 from typing import Dict, List, Optional, Set
 
 from rdkit import Chem, RDLogger
 from rdkit.Chem.MolStandardize import rdMolStandardize
+from rdkit.Chem.SaltRemover import SaltRemover
 from tqdm import tqdm
 
 from golem.config import IsoformConfig
@@ -35,14 +37,60 @@ def _canonical(mol: Chem.Mol) -> Optional[str]:
         return None
 
 
-def _enumerate_tautomers(mol: Chem.Mol, max_tautomers: int = 10) -> List[Chem.Mol]:
-    """Enumerate tautomers using a **local** TautomerEnumerator instance."""
+def _desalt(mol: Chem.Mol) -> Optional[Chem.Mol]:
+    """Remove salt fragments, keeping the largest organic fragment."""
+    try:
+        remover = SaltRemover()
+        stripped = remover.StripMol(mol, dontRemoveEverything=True)
+        if stripped is not None and stripped.GetNumAtoms() > 0:
+            return stripped
+    except Exception as e:
+        logger.debug("Desalting failed for %s: %s", _canonical(mol), e)
+    return None
+
+
+def _enumerate_tautomers(
+    mol: Chem.Mol, max_tautomers: int = 10, rdkit_fallback: bool = False,
+) -> List[Chem.Mol]:
+    """Enumerate tautomers using MolVS (primary) or RDKit (fallback).
+
+    Args:
+        mol: Input molecule.
+        max_tautomers: Maximum number of tautomers to return.
+        rdkit_fallback: If True, skip MolVS and use RDKit directly.
+    """
+    if not rdkit_fallback:
+        try:
+            from molvs import tautomer as molvs_tautomer
+
+            m = Chem.RemoveHs(mol)
+            Chem.Kekulize(m)
+            enum = molvs_tautomer.TautomerEnumerator(max_tautomers=max_tautomers)
+            tauts = list(enum.enumerate(m))
+            results = []
+            for t in tauts:
+                try:
+                    Chem.SanitizeMol(t)
+                    results.append(t)
+                except Exception:
+                    continue
+            random.shuffle(results)
+            return results[:max_tautomers]
+        except ImportError:
+            logger.info(
+                "molvs not installed -- falling back to RDKit TautomerEnumerator"
+            )
+        except Exception as e:
+            logger.debug("MolVS tautomer failed: %s -- falling back to RDKit", e)
+
     try:
         enumerator = rdMolStandardize.TautomerEnumerator()
         enumerator.SetMaxTautomers(max_tautomers)
-        return list(enumerator.Enumerate(mol))
+        results = list(enumerator.Enumerate(mol))
+        random.shuffle(results)
+        return results
     except Exception as e:
-        logger.debug("Tautomer enumeration failed for %s: %s", _canonical(mol), e)
+        logger.debug("RDKit tautomer failed for %s: %s", _canonical(mol), e)
         return []
 
 
@@ -112,7 +160,7 @@ def _enumerate_protonation(
     ph_range: tuple[float, float] = (6.4, 8.4),
     max_protomers: int = 10,
 ) -> List[Chem.Mol]:
-    """Enumerate protonation states with Dimorphite-DL (primary) or Uncharger (fallback).
+    """Enumerate protonation states with Dimorphite-DL (via gypsum-dl) or Uncharger (fallback).
 
     Args:
         smi: Input SMILES string.
@@ -122,7 +170,7 @@ def _enumerate_protonation(
     Returns:
         List of valid protomer Mol objects.
     """
-    # --- Primary: Dimorphite-DL protonate_smiles ---
+    # --- Primary: Dimorphite-DL protonate_smiles (transitive dep of gypsum-dl) ---
     try:
         from dimorphite_dl import protonate_smiles
 
@@ -143,7 +191,7 @@ def _enumerate_protonation(
     except ImportError:
         logger.warning(
             "dimorphite_dl not installed – falling back to RDKit Uncharger. "
-            "Install with: pip install dimorphite-dl==2.0.2"
+            "Install with: pip install gypsum-dl>=1.3.0"
         )
     except Exception as e:
         logger.debug("Dimorphite-DL failed for %s: %s – falling back to Uncharger", smi, e)
@@ -197,7 +245,6 @@ def enumerate_isoforms(smiles: str, config: IsoformConfig) -> List[str]:
         logger.warning("Cannot parse SMILES: %s", smiles)
         return [smiles]  # keep original even if unparseable
 
-    # Always include the original
     original_can = _canonical(mol)
     if original_can is None:
         return [smiles]
@@ -212,9 +259,16 @@ def enumerate_isoforms(smiles: str, config: IsoformConfig) -> List[str]:
                 seen.add(can)
                 isoforms.append(can)
 
+    # Desalt: add desalted form as an isoform
+    if config.desalting:
+        desalted = _desalt(mol)
+        if desalted is not None:
+            _add([desalted])
+
     # Tautomers
     if config.tautomers:
-        _add(_enumerate_tautomers(mol, max_tautomers=config.max_tautomers))
+        _add(_enumerate_tautomers(mol, max_tautomers=config.max_tautomers,
+                                   rdkit_fallback=config.rdkit_fallback))
 
     # Protonation states — takes SMILES string directly
     if config.protonation:

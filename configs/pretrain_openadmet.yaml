@@ -27,6 +27,7 @@ pretrain:
 
 isoforms:
   enabled: true
+  desalting: { enabled: true }
   tautomers: { enabled: true, max_tautomers: 10 }
   protonation: { enabled: true, ph_range: [6.4, 8.4], max_protomers: 10 }
   neutralization: { enabled: true }
