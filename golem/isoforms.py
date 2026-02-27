@@ -8,6 +8,7 @@ canonical SMILES, with the original molecule always at index 0.
 from __future__ import annotations
 
 import logging
+import random
 from typing import Dict, List, Optional, Set
 
 from rdkit import Chem, RDLogger
@@ -73,6 +74,7 @@ def _enumerate_tautomers(
                     results.append(t)
                 except Exception:
                     continue
+            random.shuffle(results)
             return results[:max_tautomers]
         except ImportError:
             logger.info(
@@ -84,7 +86,9 @@ def _enumerate_tautomers(
     try:
         enumerator = rdMolStandardize.TautomerEnumerator()
         enumerator.SetMaxTautomers(max_tautomers)
-        return list(enumerator.Enumerate(mol))
+        results = list(enumerator.Enumerate(mol))
+        random.shuffle(results)
+        return results
     except Exception as e:
         logger.debug("RDKit tautomer failed for %s: %s", _canonical(mol), e)
         return []
@@ -241,13 +245,6 @@ def enumerate_isoforms(smiles: str, config: IsoformConfig) -> List[str]:
         logger.warning("Cannot parse SMILES: %s", smiles)
         return [smiles]  # keep original even if unparseable
 
-    # Desalt: strip counter-ions before enumeration
-    if config.desalting:
-        desalted = _desalt(mol)
-        if desalted is not None:
-            mol = desalted
-
-    # Always include the original
     original_can = _canonical(mol)
     if original_can is None:
         return [smiles]
@@ -261,6 +258,12 @@ def enumerate_isoforms(smiles: str, config: IsoformConfig) -> List[str]:
             if can is not None and can not in seen:
                 seen.add(can)
                 isoforms.append(can)
+
+    # Desalt: add desalted form as an isoform
+    if config.desalting:
+        desalted = _desalt(mol)
+        if desalted is not None:
+            _add([desalted])
 
     # Tautomers
     if config.tautomers:

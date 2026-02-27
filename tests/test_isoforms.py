@@ -245,7 +245,7 @@ class TestDesalting:
         result = _desalt(mol)
         assert result is not None
         smi = Chem.MolToSmiles(result, canonical=True)
-        assert "Cl" not in smi
+        assert smi == "CC[NH3+]", f"Expected 'CC[NH3+]', got '{smi}'"
 
     def test_non_salt_unchanged(self):
         """Non-salt molecule should be returned unchanged."""
@@ -256,7 +256,7 @@ class TestDesalting:
         assert smi == "c1ccccc1"
 
     def test_desalting_in_pipeline(self):
-        """Desalting should work within the full enumerate_isoforms pipeline."""
+        """Desalting should add the desalted form as an isoform."""
         config = IsoformConfig(
             desalting=True,
             tautomers=False,
@@ -264,10 +264,9 @@ class TestDesalting:
             neutralization=False,
         )
         isoforms = enumerate_isoforms("CC(=O)[O-].[Na+]", config)
-        assert len(isoforms) >= 1
-        # The sodium counter-ion should not appear in any isoform
-        for iso in isoforms:
-            assert "Na" not in iso, f"Salt fragment found in isoform: {iso}"
+        assert len(isoforms) >= 2
+        assert isoforms[0] == "CC(=O)[O-].[Na+]"
+        assert "CC(=O)[O-]" in isoforms, f"Expected desalted form 'CC(=O)[O-]' in {isoforms}"
 
 
 # ---------------------------------------------------------------------------
