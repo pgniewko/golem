@@ -241,8 +241,8 @@ def pretrain(
     if verbose:
         try:
             import rdkit
-            import dimorphite_dl
-            logger.debug("rdkit %s, dimorphite_dl %s", rdkit.__version__, dimorphite_dl.__version__)
+            import gypsum_dl
+            logger.debug("rdkit %s, gypsum_dl %s", rdkit.__version__, gypsum_dl.__version__)
         except Exception:
             pass
 

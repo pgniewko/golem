@@ -12,7 +12,7 @@ dependencies = [
     "torch_geometric",
     "mordredcommunity",
     "rdkit",
-    "dimorphite-dl==2.0.2",
+    "gypsum-dl>=1.3.0",
     "numpy",
     "pandas",
     "pyyaml",

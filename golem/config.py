@@ -33,12 +33,14 @@ class IsoformConfig:
     """Isoform enumeration config."""
 
     enabled: bool = True
+    desalting: bool = True
     tautomers: bool = True
     max_tautomers: int = 10
     protonation: bool = True
     max_protomers: int = 10
     ph_range: Tuple[float, float] = (6.4, 8.4)
     neutralization: bool = True
+    rdkit_fallback: bool = False
 
 
 @dataclass
@@ -92,6 +94,12 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     if "neutralization" in isoform_d and isinstance(isoform_d["neutralization"], dict):
         neut = isoform_d.pop("neutralization")
         isoform_d["neutralization"] = neut.get("enabled", True)
+    if "desalting" in isoform_d and isinstance(isoform_d["desalting"], dict):
+        desalt = isoform_d.pop("desalting")
+        isoform_d["desalting"] = desalt.get("enabled", True)
+    if "rdkit_fallback" in isoform_d and isinstance(isoform_d["rdkit_fallback"], dict):
+        fb = isoform_d.pop("rdkit_fallback")
+        isoform_d["rdkit_fallback"] = fb.get("enabled", False)
 
     # Remove keys not in dataclass (e.g. deduplication, tool, fallback)
     model_fields = {f.name for f in fields(ModelConfig)}

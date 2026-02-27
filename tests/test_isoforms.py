@@ -5,6 +5,7 @@ from rdkit import Chem
 
 from golem.config import IsoformConfig
 from golem.isoforms import (
+    _desalt,
     _enumerate_protonation,
     _enumerate_tautomers,
     _is_valid_protomer,
@@ -117,7 +118,7 @@ class TestProtonationEnumeration:
 
     def test_nitrogen_4h_rejected(self):
         """No protomer should have nitrogen with >= 4 hydrogens."""
-        # Test with simple amine that dimorphite_dl might over-protonate
+        # Test with simple amine that protonation tool might over-protonate
         protomers = _enumerate_protonation("CCN", ph_range=(6.4, 8.4), max_protomers=10)
         for pmol in protomers:
             for atom in pmol.GetAtoms():
@@ -221,6 +222,52 @@ class TestNeutralization:
         mol = Chem.MolFromSmiles("CC(=O)[O-]")
         neutralized = _neutralize(mol)
         assert len(neutralized) >= 1
+
+
+# ---------------------------------------------------------------------------
+# TestDesalting
+# ---------------------------------------------------------------------------
+
+class TestDesalting:
+    """Tests for desalting (salt fragment removal)."""
+
+    def test_sodium_salt_desalted(self):
+        """Sodium acetate salt should be desalted to acetic acid fragment."""
+        mol = Chem.MolFromSmiles("CC(=O)[O-].[Na+]")
+        result = _desalt(mol)
+        assert result is not None
+        smi = Chem.MolToSmiles(result, canonical=True)
+        assert "Na" not in smi
+
+    def test_hcl_salt_desalted(self):
+        """HCl salt of amine should be desalted to the amine."""
+        mol = Chem.MolFromSmiles("CC[NH3+].[Cl-]")
+        result = _desalt(mol)
+        assert result is not None
+        smi = Chem.MolToSmiles(result, canonical=True)
+        assert "Cl" not in smi
+
+    def test_non_salt_unchanged(self):
+        """Non-salt molecule should be returned unchanged."""
+        mol = Chem.MolFromSmiles("c1ccccc1")
+        result = _desalt(mol)
+        assert result is not None
+        smi = Chem.MolToSmiles(result, canonical=True)
+        assert smi == "c1ccccc1"
+
+    def test_desalting_in_pipeline(self):
+        """Desalting should work within the full enumerate_isoforms pipeline."""
+        config = IsoformConfig(
+            desalting=True,
+            tautomers=False,
+            protonation=False,
+            neutralization=False,
+        )
+        isoforms = enumerate_isoforms("CC(=O)[O-].[Na+]", config)
+        assert len(isoforms) >= 1
+        # The sodium counter-ion should not appear in any isoform
+        for iso in isoforms:
+            assert "Na" not in iso, f"Salt fragment found in isoform: {iso}"
 
 
 # ---------------------------------------------------------------------------
