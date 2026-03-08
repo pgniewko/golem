@@ -121,7 +121,7 @@ class TestLoadSmiles:
 
 
 class TestEpochDefinedWhenMaxEpochsZero:
-    """Bug #4: epoch must be defined even when max_epochs=0."""
+    """Epoch must be defined even when max_epochs=0."""
 
     def test_epoch_defined_when_max_epochs_zero(self):
         epoch = 0
@@ -131,7 +131,7 @@ class TestEpochDefinedWhenMaxEpochsZero:
 
 
 class TestWarmupCosineScheduler:
-    """Bug #5: LR scheduler creation and state serialization."""
+    """LR scheduler creation and state serialization."""
 
     def test_warmup_cosine_scheduler(self):
         model = torch.nn.Linear(4, 2)
@@ -165,7 +165,7 @@ class TestWarmupCosineScheduler:
 
 
 class TestSmilesCacheKey:
-    """Bug #6: descriptor cache key from SMILES list."""
+    """Descriptor cache key from SMILES list."""
 
     def test_smiles_cache_key(self):
         key1 = _smiles_cache_key(["CCO", "c1ccccc1"])
