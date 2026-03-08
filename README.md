@@ -122,44 +122,6 @@ pytest tests/ -v
 
 The tests cover isoform enumeration, Mordred descriptor computation, the NaN-aware scaler, config loading, data splitting, and SMILES file loading. Note: descriptor tests require `mordredcommunity` and may take a few seconds.
 
-## Project Structure
-
-```
-golem/
-├── pyproject.toml                  # Package metadata + dependencies
-├── docs/
-│   └── audit.html                  # Comprehensive project audit
-│
-├── golem/                          # The Python package (pretraining only)
-│   ├── __init__.py
-│   ├── cli.py                      # Click CLI: `golem pretrain`, `golem report`
-│   ├── config.py                   # Dataclasses (ModelConfig, IsoformConfig,
-│   │                               #   PretrainConfig) + YAML loading
-│   ├── isoforms.py                 # Tautomer / protonation / neutralization
-│   │                               #   enumeration (RDKit + Gypsum-DL)
-│   ├── descriptors.py              # Mordred 2D computation + NaNAwareStandardScaler
-│   ├── pretrain.py                 # Full MDAE pretraining loop
-│   ├── report.py                   # HTML report generation (Chart.js dashboard)
-│   └── utils.py                    # Seeding, data splitting, DataLoader, SMILES I/O
-│
-├── configs/
-│   └── pretrain_openadmet.yaml     # Production pretraining config
-│
-├── data/                           # Training and test data
-│   └── openadmet/
-│       └── train_test_smiles.smi   # 7,608 SMILES for pretraining
-│
-├── notebooks/                      # Analysis notebooks
-│   └── inspect_isoforms.ipynb      # Isoform enumeration analysis
-│
-├── experiments/                    # Output directory for runs
-│
-└── tests/
-    ├── test_isoforms.py            # Isoform enumeration tests
-    ├── test_descriptors.py         # Mordred + scaler tests
-    └── test_pretrain.py            # Config, splitting, SMILES loading tests
-```
-
 ### Key module responsibilities
 
 | Module | What it does |
