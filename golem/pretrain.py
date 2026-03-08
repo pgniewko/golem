@@ -19,6 +19,8 @@ Pipeline:
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import logging
 import math
 import time
@@ -31,8 +33,6 @@ import torch
 from rdkit import Chem
 import torch.nn.functional as F
 import yaml
-from tqdm import tqdm
-
 from golem.config import PretrainConfig
 from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
 from golem.isoforms import enumerate_isoforms_batch
@@ -49,50 +49,51 @@ logger = logging.getLogger(__name__)
 def _setup_logging(output_dir: Path, verbose: bool = False) -> None:
     """Configure logging to both stdout and file.
 
+    Uses a named ``"golem"`` logger with ``propagate=False`` so that
+    existing root-logger handlers (e.g. Jupyter, application loggers)
+    are not destroyed.
+
     Args:
         output_dir: Directory for the log file.
         verbose: If True, set console handler to DEBUG level.
     """
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
+    golem_logger = logging.getLogger("golem")
+    golem_logger.setLevel(logging.DEBUG)
+    golem_logger.propagate = False
 
-    # Remove existing handlers (avoid duplicates on re-runs)
-    for h in root.handlers[:]:
-        root.removeHandler(h)
+    # Remove existing golem handlers (avoid duplicates on re-runs)
+    for h in golem_logger.handlers[:]:
+        golem_logger.removeHandler(h)
 
     # Console handler (INFO by default, DEBUG when verbose)
     ch = logging.StreamHandler()
     ch.setLevel(logging.DEBUG if verbose else logging.INFO)
     ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s — %(message)s", datefmt="%H:%M:%S"))
-    root.addHandler(ch)
+    golem_logger.addHandler(ch)
 
     # File handler (DEBUG)
     fh = logging.FileHandler(output_dir / "pretrain.log", mode="w")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s — %(message)s"))
-    root.addHandler(fh)
+    golem_logger.addHandler(fh)
 
 
 # ---------------------------------------------------------------------------
 # LR schedule: linear warmup + cosine decay
 # ---------------------------------------------------------------------------
 
-def _warmup_cosine_lr(
+def _make_warmup_cosine_scheduler(
     optimizer: torch.optim.Optimizer,
-    epoch: int,
     warmup_epochs: int,
     max_epochs: int,
-    base_lr: float,
-) -> float:
-    """Apply linear warmup then cosine decay; returns current LR."""
-    if epoch < warmup_epochs:
-        lr = base_lr * (epoch + 1) / warmup_epochs
-    else:
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Return a LambdaLR with linear warmup then cosine decay."""
+    def _lr_lambda(epoch: int) -> float:
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
         progress = (epoch - warmup_epochs) / max(max_epochs - warmup_epochs, 1)
-        lr = base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
-    for pg in optimizer.param_groups:
-        pg["lr"] = lr
-    return lr
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +198,7 @@ def _build_pyg_dataset(
     num_descriptors = descriptor_values.shape[1]
 
     logger.info("Building PyG graph features for %d molecules …", len(smiles_list))
-    data_list = get_tensor_data(smiles_list, y=None, gnm=True)
+    data_list = get_tensor_data(smiles_list, y=None)
 
     # Overwrite y and y_mask with actual descriptor data.
     # Store as [1, D] so that PyG batching concatenates to [B, D]
@@ -213,12 +214,19 @@ def _build_pyg_dataset(
 # Main pretrain function
 # ---------------------------------------------------------------------------
 
+def _smiles_cache_key(smiles_list: List[str]) -> str:
+    """Return a 16-char hex SHA-256 hash of the SMILES list (order-sensitive)."""
+    h = hashlib.sha256("\n".join(smiles_list).encode())
+    return h.hexdigest()[:16]
+
+
 def pretrain(
     smiles_path: str,
     config: PretrainConfig,
     output_dir: str,
     subsample: Optional[float] = None,
     verbose: bool = False,
+    resume_from: Optional[str] = None,
 ) -> Path:
     """Full MDAE pretraining pipeline.
 
@@ -229,6 +237,7 @@ def pretrain(
         subsample: If set, randomly subsample this fraction of SMILES
             before processing (e.g. 0.1 for 10%).
         verbose: If True, show DEBUG-level logs on console.
+        resume_from: Path to a checkpoint file to resume training from.
 
     Returns:
         Path to the best checkpoint file.
@@ -251,9 +260,16 @@ def pretrain(
 
     seed_everything(config.seed)
 
-    # Save resolved config
+    if config.max_epochs > 0 and config.warmup_epochs >= config.max_epochs:
+        logger.warning(
+            "warmup_epochs (%d) >= max_epochs (%d): model will only warm up, never decay",
+            config.warmup_epochs, config.max_epochs,
+        )
+
+    # Save resolved config (convert tuples to lists for safe_load compatibility)
+    config_dict = json.loads(json.dumps(asdict(config)))
     with open(output_dir / "resolved_config.yaml", "w") as f:
-        yaml.dump(asdict(config), f, default_flow_style=False, sort_keys=False)
+        yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
     # ------------------------------------------------------------------
     # 1. Load SMILES
@@ -313,10 +329,23 @@ def pretrain(
     smiles_list = valid_smiles
 
     # ------------------------------------------------------------------
-    # 3. Compute Mordred descriptors
+    # 3. Compute Mordred descriptors (with disk cache)
     # ------------------------------------------------------------------
-    logger.info("Computing Mordred descriptors …")
-    desc_values, desc_valid, descriptor_names = compute_mordred_descriptors(smiles_list)
+    cache_key = _smiles_cache_key(smiles_list)
+    cache_path = output_dir / f"descriptors_{cache_key}.npz"
+
+    if cache_path.exists():
+        logger.info("Loading cached descriptors from %s", cache_path.name)
+        cached = np.load(cache_path, allow_pickle=True)
+        desc_values = cached["values"]
+        desc_valid = cached["valid"]
+        descriptor_names = cached["names"].tolist()
+    else:
+        logger.info("Computing Mordred descriptors …")
+        desc_values, desc_valid, descriptor_names = compute_mordred_descriptors(smiles_list)
+        np.savez(cache_path, values=desc_values, valid=desc_valid, names=np.array(descriptor_names))
+        logger.info("Saved descriptor cache to %s", cache_path.name)
+
     num_descriptors = desc_values.shape[1]
     logger.info("Descriptor matrix: %d molecules × %d descriptors", desc_values.shape[0], num_descriptors)
 
@@ -370,7 +399,9 @@ def pretrain(
     from gt_pyg.data import get_atom_feature_dim, get_bond_feature_dim
 
     mc = config.model
-    model = GraphTransformerNet(
+    import inspect
+    gt_params = inspect.signature(GraphTransformerNet.__init__).parameters
+    model_kwargs = dict(
         node_dim_in=get_atom_feature_dim(),
         edge_dim_in=get_bond_feature_dim(),
         num_gt_layers=mc.num_gt_layers,
@@ -384,80 +415,113 @@ def pretrain(
         gate=mc.gate,
         qkv_bias=mc.qkv_bias,
         num_tasks=num_descriptors,
-    ).to(device)
+        num_head_layers=mc.num_head_layers,
+        head_norm=mc.head_norm,
+        head_residual=mc.head_residual,
+    )
+    if "head_dropout" in gt_params and mc.head_dropout is not None:
+        model_kwargs["head_dropout"] = mc.head_dropout
+    model = GraphTransformerNet(**model_kwargs).to(device)
 
     n_params = model.num_parameters()
     logger.info("Model: %d trainable parameters, num_tasks=%d", n_params, num_descriptors)
 
     # ------------------------------------------------------------------
-    # 9. Optimizer
+    # 9. Optimizer + LR scheduler
     # ------------------------------------------------------------------
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay,
     )
+    scheduler = _make_warmup_cosine_scheduler(optimizer, config.warmup_epochs, config.max_epochs)
 
     # ------------------------------------------------------------------
-    # 10. Metrics CSV
+    # 9b. Resume from checkpoint (optional)
     # ------------------------------------------------------------------
-    metrics_path = output_dir / "metrics.csv"
-    metrics_file = open(metrics_path, "w", newline="")
-    metrics_writer = csv.writer(metrics_file)
-    metrics_writer.writerow(["epoch", "train_loss", "val_loss", "val_rmse", "learning_rate", "elapsed_seconds"])
-
-    # ------------------------------------------------------------------
-    # 11. Training loop
-    # ------------------------------------------------------------------
+    start_epoch = 0
     best_val_loss = float("inf")
     best_epoch = 0
+
+    if resume_from is not None:
+        resume_path = Path(resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        logger.info("Resuming from checkpoint: %s", resume_path)
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if "epoch" in ckpt and ckpt["epoch"] is not None:
+            start_epoch = ckpt["epoch"] + 1
+        if "best_metric" in ckpt and ckpt["best_metric"] is not None:
+            best_val_loss = ckpt["best_metric"]
+            best_epoch = ckpt.get("epoch", 0)
+        logger.info("Resumed at epoch %d (best_val_loss=%.4f)", start_epoch, best_val_loss)
+
+    # ------------------------------------------------------------------
+    # 10. Metrics CSV + Training loop
+    # ------------------------------------------------------------------
     patience_counter = 0
     start_time = time.time()
 
     best_ckpt_path = output_dir / "best_checkpoint.pt"
     last_ckpt_path = output_dir / "last_checkpoint.pt"
+    metrics_path = output_dir / "metrics.csv"
 
     logger.info("Starting training: max_epochs=%d  patience=%d  masking_ratio=%.2f",
                 config.max_epochs, config.patience, config.masking_ratio)
 
-    for epoch in range(config.max_epochs):
-        lr = _warmup_cosine_lr(optimizer, epoch, config.warmup_epochs, config.max_epochs, config.lr)
+    epoch = start_epoch
+    csv_mode = "a" if resume_from is not None and metrics_path.exists() else "w"
+    with open(metrics_path, csv_mode, newline="") as metrics_file:
+        metrics_writer = csv.writer(metrics_file)
+        if csv_mode == "w":
+            metrics_writer.writerow(["epoch", "train_loss", "val_loss", "val_rmse", "learning_rate", "elapsed_seconds"])
 
-        train_loss = _train_one_epoch(model, train_loader, optimizer, config.masking_ratio, device)
-        val_loss, val_rmse = _validate(model, val_loader, device)
+        for epoch in range(start_epoch, config.max_epochs):
+            lr = scheduler.get_last_lr()[0]
 
-        elapsed = time.time() - start_time
-        metrics_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_rmse:.6f}", f"{lr:.2e}", f"{elapsed:.1f}"])
-        metrics_file.flush()
+            train_loss = _train_one_epoch(model, train_loader, optimizer, config.masking_ratio, device)
+            val_loss, val_rmse = _validate(model, val_loader, device)
 
-        logger.info(
-            "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  lr=%.2e",
-            epoch + 1, config.max_epochs, train_loss, val_loss, val_rmse, lr,
-        )
+            elapsed = time.time() - start_time
+            metrics_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_rmse:.6f}", f"{lr:.2e}", f"{elapsed:.1f}"])
+            metrics_file.flush()
 
-        # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            patience_counter = 0
-
-            # Save best checkpoint
-            _save_checkpoint(
-                model, optimizer, best_ckpt_path,
-                epoch=epoch,
-                best_metric=best_val_loss,
-                config=config,
-                scaler=scaler,
-                descriptor_names=descriptor_names,
-                num_descriptors=num_descriptors,
-                train_idx=train_idx,
-                val_idx=val_idx,
-                test_idx=test_idx,
+            logger.info(
+                "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  lr=%.2e",
+                epoch + 1, config.max_epochs, train_loss, val_loss, val_rmse, lr,
             )
-            logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
-        else:
-            patience_counter += 1
-            if patience_counter >= config.patience:
-                logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, config.patience)
-                break
+
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                patience_counter = 0
+
+                # Save best checkpoint
+                _save_checkpoint(
+                    model, optimizer, best_ckpt_path,
+                    epoch=epoch,
+                    best_metric=best_val_loss,
+                    config=config,
+                    scaler=scaler,
+                    descriptor_names=descriptor_names,
+                    num_descriptors=num_descriptors,
+                    train_idx=train_idx,
+                    val_idx=val_idx,
+                    test_idx=test_idx,
+                    scheduler=scheduler,
+                )
+                logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
+            else:
+                patience_counter += 1
+                if patience_counter >= config.patience:
+                    logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, config.patience)
+                    break
+
+            scheduler.step()
 
     # Save last checkpoint
     _save_checkpoint(
@@ -471,9 +535,8 @@ def pretrain(
         train_idx=train_idx,
         val_idx=val_idx,
         test_idx=test_idx,
+        scheduler=scheduler,
     )
-
-    metrics_file.close()
 
     logger.info(
         "Training complete.  Best val_loss=%.4f at epoch %d",
@@ -522,11 +585,13 @@ def _save_checkpoint(
     train_idx: np.ndarray,
     val_idx: np.ndarray,
     test_idx: Optional[np.ndarray],
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> None:
     """Save checkpoint via gt-pyg's model.save_checkpoint()."""
     model.save_checkpoint(
         path=path,
         optimizer=optimizer,
+        scheduler=scheduler,
         epoch=epoch,
         best_metric=best_metric,
         extra={

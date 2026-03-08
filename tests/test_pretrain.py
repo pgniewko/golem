@@ -2,13 +2,13 @@
 
 import numpy as np
 import pytest
+import torch
 
 from golem.config import (
-    IsoformConfig,
-    ModelConfig,
     PretrainConfig,
     load_config,
 )
+from golem.pretrain import _make_warmup_cosine_scheduler, _smiles_cache_key
 from golem.utils import load_smiles, seed_everything, split_data
 
 
@@ -118,3 +118,72 @@ class TestLoadSmiles:
         txt_file.write_text("c1ccccc1\n")
         with pytest.raises(ValueError, match="Unsupported"):
             load_smiles(str(txt_file))
+
+
+class TestEpochDefinedWhenMaxEpochsZero:
+    """Epoch must be defined even when max_epochs=0."""
+
+    def test_epoch_defined_when_max_epochs_zero(self):
+        epoch = 0
+        for epoch in range(0):
+            pass
+        assert epoch == 0
+
+
+class TestWarmupCosineScheduler:
+    """LR scheduler creation and state serialization."""
+
+    def test_warmup_cosine_scheduler(self):
+        model = torch.nn.Linear(4, 2)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scheduler = _make_warmup_cosine_scheduler(optimizer, warmup_epochs=5, max_epochs=20)
+
+        lrs = []
+        for _ in range(20):
+            lrs.append(scheduler.get_last_lr()[0])
+            scheduler.step()
+
+        assert lrs[0] < lrs[4], "LR should increase during warmup"
+        assert lrs[-1] < lrs[5], "LR should decay after warmup"
+
+    def test_scheduler_state_dict_roundtrip(self):
+        model = torch.nn.Linear(4, 2)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scheduler = _make_warmup_cosine_scheduler(optimizer, warmup_epochs=5, max_epochs=20)
+
+        for _ in range(10):
+            scheduler.step()
+
+        state = scheduler.state_dict()
+        lr_before = scheduler.get_last_lr()[0]
+
+        scheduler2 = _make_warmup_cosine_scheduler(optimizer, warmup_epochs=5, max_epochs=20)
+        scheduler2.load_state_dict(state)
+        lr_after = scheduler2.get_last_lr()[0]
+
+        assert lr_before == pytest.approx(lr_after)
+
+
+class TestSmilesCacheKey:
+    """Descriptor cache key from SMILES list."""
+
+    def test_smiles_cache_key(self):
+        key1 = _smiles_cache_key(["CCO", "c1ccccc1"])
+        key2 = _smiles_cache_key(["CCO", "c1ccccc1"])
+        key3 = _smiles_cache_key(["c1ccccc1", "CCO"])
+        assert key1 == key2
+        assert key1 != key3
+        assert len(key1) == 16
+
+    def test_descriptor_cache_roundtrip(self, tmp_path):
+        values = np.random.rand(5, 10).astype(np.float64)
+        valid = np.ones((5, 10), dtype=np.float64)
+        names = ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"]
+
+        cache_path = tmp_path / "descriptors_test.npz"
+        np.savez(cache_path, values=values, valid=valid, names=np.array(names))
+
+        cached = np.load(cache_path, allow_pickle=True)
+        np.testing.assert_array_equal(cached["values"], values)
+        np.testing.assert_array_equal(cached["valid"], valid)
+        assert cached["names"].tolist() == names

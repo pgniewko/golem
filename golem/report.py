@@ -50,13 +50,9 @@ def _load_metrics(metrics_path: Path) -> List[Dict[str, Any]]:
 
 
 def _load_config(config_path: Path) -> Dict[str, Any]:
-    """Load resolved_config.yaml.
-
-    Uses ``FullLoader`` because the config may contain ``!!python/tuple``
-    tags written by ``yaml.dump(dataclasses.asdict(...))``.
-    """
+    """Load resolved_config.yaml."""
     with open(config_path) as f:
-        return yaml.load(f, Loader=yaml.FullLoader)  # noqa: S506
+        return yaml.safe_load(f)
 
 
 def _fmt_elapsed(seconds: float) -> str:

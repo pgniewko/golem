@@ -47,7 +47,7 @@ python -c "from golem.config import PretrainConfig; print('golem OK')"
 
 ```bash
 golem pretrain \
-  --smiles data/all_openadmet_smiles.smi \
+  --smiles data/openadmet/train_test_smiles.smi \
   --output experiments/test_pretrain \
   --max-epochs 10 \
   --subsample 0.1 \
@@ -58,7 +58,7 @@ golem pretrain \
 
 ```bash
 golem pretrain \
-  --smiles data/all_openadmet_smiles.smi \
+  --smiles data/openadmet/train_test_smiles.smi \
   --config configs/pretrain_openadmet.yaml \
   --output experiments/pretrain
 ```
@@ -114,32 +114,6 @@ To write the report to a custom path:
 golem report experiments/pretrain --output path/to/report.html
 ```
 
-## Running Fine-Tuning Notebooks
-
-The four fine-tuning notebooks in `notebooks/` compare random-init vs pretrained models on single-task (LogD) and multi-task (9 endpoints) settings.
-
-### Setup
-
-```bash
-# Install dev dependencies (includes jupyter, scipy, scikit-learn, matplotlib, seaborn)
-pip install -e ".[dev]"
-
-# Launch Jupyter
-cd notebooks
-jupyter notebook
-```
-
-### The four experiments
-
-| Notebook | Tasks | Init | What it tests |
-|----------|-------|------|---------------|
-| `finetune_st_random.ipynb` | 1 (LogD) | Random | Baseline single-task |
-| `finetune_st_pretrained.ipynb` | 1 (LogD) | Golem | Pretrained single-task |
-| `finetune_mt_random.ipynb` | 9 (all) | Random | Baseline multi-task |
-| `finetune_mt_pretrained.ipynb` | 9 (all) | Golem | Pretrained multi-task |
-
-All four notebooks are **structurally identical** &mdash; they differ only in the first cell (config). The pretrained notebooks expect a checkpoint at `../experiments/pretrain/best_checkpoint.pt`.
-
 ## Running Tests
 
 ```bash
@@ -147,62 +121,6 @@ pytest tests/ -v
 ```
 
 The tests cover isoform enumeration, Mordred descriptor computation, the NaN-aware scaler, config loading, data splitting, and SMILES file loading. Note: descriptor tests require `mordredcommunity` and may take a few seconds.
-
-## Project Structure
-
-```
-golem/
-├── pyproject.toml                  # Package metadata + dependencies
-├── docs/
-│   └── audit.html                  # Comprehensive project audit
-│
-├── golem/                          # The Python package (pretraining only)
-│   ├── __init__.py
-│   ├── cli.py                      # Click CLI: `golem pretrain`, `golem report`
-│   ├── config.py                   # Dataclasses (ModelConfig, IsoformConfig,
-│   │                               #   PretrainConfig) + YAML loading
-│   ├── isoforms.py                 # Tautomer / protonation / neutralization
-│   │                               #   enumeration (RDKit + Dimorphite-DL)
-│   ├── descriptors.py              # Mordred 2D computation + NaNAwareStandardScaler
-│   ├── pretrain.py                 # Full MDAE pretraining loop
-│   ├── report.py                   # HTML report generation (Chart.js dashboard)
-│   ├── utils.py                    # Seeding, data splitting, DataLoader, SMILES I/O
-│   └── _vendor/                    # Local copies of gt-pyg code if fixes are needed
-│       └── __init__.py             #   (currently empty — no fixes needed)
-│
-├── configs/
-│   └── pretrain_openadmet.yaml     # Production pretraining config
-│
-├── data/                           # Training and test data
-│   ├── all_openadmet_smiles.smi    # 7,608 SMILES for pretraining
-│   ├── train-set/
-│   │   ├── expansion_data_train.csv          # Original-scale training data
-│   │   └── expansion_log_data_train.csv      # Log-transformed (used by notebooks)
-│   └── test-set/
-│       ├── expansion_data_test_blinded.csv
-│       ├── expansion_data_test_full.csv
-│       └── expansion_data_test_full_lb_flag.csv  # With leaderboard flag
-│
-├── notebooks/                      # Fine-tuning & analysis notebooks
-│   ├── finetune_st_random.ipynb
-│   ├── finetune_st_pretrained.ipynb
-│   ├── finetune_mt_random.ipynb
-│   ├── finetune_mt_pretrained.ipynb
-│   ├── inspect_isoforms.ipynb      # Isoform enumeration analysis
-│   └── compare_experiments.ipynb   # Cross-experiment comparison
-│
-├── experiments/                    # Output directory for all runs
-│   ├── pretrain/                   # Production pretrain outputs
-│   ├── st_random/                  # Notebook experiment outputs
-│   ├── st_pretrained/
-│   ├── mt_random/
-│   └── mt_pretrained/
-│
-└── tests/
-    ├── test_isoforms.py            # Isoform enumeration tests
-    ├── test_descriptors.py         # Mordred + scaler tests
-    └── test_pretrain.py            # Config, splitting, SMILES loading tests
-```
 
 ### Key module responsibilities
 
@@ -219,12 +137,10 @@ golem/
 
 | Looking for... | Go to |
 |----------------|-------|
-| How the model is constructed | `pretrain.py:373-387` and notebook cell 5 |
-| The masked MSE pretraining loss | `pretrain.py:124-135` |
-| The 5-component fine-tuning loss | Notebook cell 7 |
-| NaN handling / validity masking | `descriptors.py:72-76` |
-| Scaler fit (train-only, no leakage) | `pretrain.py:340-341` |
-| Pretrained weight loading (shape-filter) | Notebook cell 6 |
+| How the model is constructed | `pretrain.py` model creation section |
+| The masked MSE pretraining loss | `pretrain.py:_train_one_epoch()` |
+| NaN handling / validity masking | `descriptors.py:compute_mordred_descriptors()` |
+| Scaler fit (train-only, no leakage) | `pretrain.py:pretrain()` step 5 |
 | Config defaults | `config.py` dataclass definitions |
 | Production config | `configs/pretrain_openadmet.yaml` |
-| Pretraining pipeline flow | `pretrain.py:pretrain()` docstring (lines 1-16) |
+| Pretraining pipeline flow | `pretrain.py` module docstring |

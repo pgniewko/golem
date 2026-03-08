@@ -5,18 +5,19 @@ model:
   norm: "bn"
   gt_aggregators: ["sum", "mean"]
   aggregators: ["sum", "mean", "max", "std"]
-  dropout: 0.3
+  dropout: 0.2
   act: "gelu"
   gate: true
   num_head_layers: 2
   head_norm: true
-  head_residual: falsw
+  head_residual: true
+  head_dropout: 0.4
 
 pretrain:
   masking_ratio: 0.15
   batch_size: 128
-  max_epochs: 500
-  patience: 50
+  max_epochs: 5000
+  patience: 100
   lr: 1.0e-4
   weight_decay: 1.0e-5
   warmup_epochs: 25
