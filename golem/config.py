@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import copy
+from copy import deepcopy
 from dataclasses import dataclass, field, asdict, fields
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import yaml
 
@@ -26,6 +25,10 @@ class ModelConfig:
     act: str = "gelu"
     gate: bool = True
     qkv_bias: bool = False
+    num_head_layers: int = 1
+    head_norm: bool = False
+    head_residual: bool = False
+    head_dropout: float | None = None
 
 
 @dataclass
@@ -64,7 +67,7 @@ class PretrainConfig:
 
 def _deep_update(base: dict, overrides: dict) -> dict:
     """Recursively update base dict with overrides."""
-    result = copy.deepcopy(base)
+    result = deepcopy(base)
     for k, v in overrides.items():
         if isinstance(v, dict) and isinstance(result.get(k), dict):
             result[k] = _deep_update(result[k], v)
