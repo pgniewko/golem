@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "golem"
 version = "0.1.0"
-description = "MDAE pretraining for Graph Transformers on molecular descriptors"
+description = "Descriptor pretraining for Graph Transformers on molecular descriptors"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=1.13.0",

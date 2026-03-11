@@ -12,7 +12,7 @@ from golem.report import generate_report
 @click.group()
 @click.version_option(package_name="golem")
 def main() -> None:
-    """Golem — MDAE pretraining for Graph Transformers on molecular descriptors."""
+    """Golem — Descriptor pretraining for Graph Transformers on molecular descriptors."""
 
 
 @main.command()
@@ -61,7 +61,7 @@ def pretrain_cmd(
     verbose: bool,
     resume_from: str | None,
 ) -> None:
-    """Run MDAE pretraining on molecular descriptors."""
+    """Run descriptor pretraining on molecular descriptors."""
     # Build CLI overrides dict (None values are ignored by load_config)
     overrides: dict = {}
     if max_epochs is not None:

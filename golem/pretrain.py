@@ -1,4 +1,4 @@
-"""MDAE pretraining loop for Graph Transformers on Mordred descriptors.
+"""Pretraining loop for Graph Transformers on Mordred descriptors.
 
 Uses ``GraphTransformerNet(num_tasks=num_descriptors)`` directly — no wrapper
 model.  The built-in ``mu_mlp`` serves as the descriptor prediction head.
@@ -228,7 +228,7 @@ def pretrain(
     verbose: bool = False,
     resume_from: Optional[str] = None,
 ) -> Path:
-    """Full MDAE pretraining pipeline.
+    """Full pretraining pipeline.
 
     Args:
         smiles_path: Path to SMILES file (``.smi`` or ``.csv``).

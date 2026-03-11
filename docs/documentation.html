@@ -107,7 +107,7 @@
 <body>
 
 <h1>Golem Technical Documentation</h1>
-<p class="subtitle">MDAE pretraining for Graph Transformers on molecular descriptors &mdash; 2026-03-07</p>
+<p class="subtitle">Descriptor pretraining for Graph Transformers on molecular descriptors &mdash; 2026-03-10</p>
 
 <!-- ===== TABLE OF CONTENTS ===== -->
 <div class="toc">
@@ -128,7 +128,7 @@
 <!-- ============================================================ -->
 <h2 id="overview">1. Overview</h2>
 
-<p>Golem pretrains a <a href="https://github.com/pgniewko/gt-pyg">gt-pyg</a> <code>GraphTransformerNet</code> backbone using Masked Descriptor AutoEncoding (MDAE) on Mordred 2D molecular descriptors. The pretrained weights transfer to downstream property-prediction tasks via fine-tuning.</p>
+<p>Golem pretrains a <a href="https://github.com/pgniewko/gt-pyg">gt-pyg</a> <code>GraphTransformerNet</code> backbone to predict Mordred 2D molecular descriptors. The pretrained weights transfer to downstream property-prediction tasks via fine-tuning.</p>
 
 <p>Inspired by <a href="https://github.com/JacksonBurns/chemeleon">CheMeleon</a>, with key improvements:</p>
 <ul>
@@ -417,7 +417,7 @@ loss = F.mse_loss(pred[final_mask], targets[final_mask])</code></pre>
 <tr><td><code>config.py</code></td><td>Dataclasses (<code>ModelConfig</code>, <code>IsoformConfig</code>, <code>PretrainConfig</code>) + YAML loading with 3-layer merge</td></tr>
 <tr><td><code>isoforms.py</code></td><td>Tautomer / protonation / neutralization enumeration (RDKit + Gypsum-DL) with protomer validation</td></tr>
 <tr><td><code>descriptors.py</code></td><td>Mordred 2D descriptor computation + <code>NaNAwareStandardScaler</code> (z-score + winsorization)</td></tr>
-<tr><td><code>pretrain.py</code></td><td>Full MDAE pipeline: load &rarr; isoforms &rarr; descriptors &rarr; split &rarr; scale &rarr; train &rarr; checkpoint</td></tr>
+<tr><td><code>pretrain.py</code></td><td>Full pretraining pipeline: load &rarr; isoforms &rarr; descriptors &rarr; split &rarr; scale &rarr; train &rarr; checkpoint</td></tr>
 <tr><td><code>report.py</code></td><td>Self-contained Chart.js HTML dashboard: loss curves, RMSE, LR schedule, summary cards</td></tr>
 <tr><td><code>utils.py</code></td><td>Seeding, train/val/test splitting, PyG DataLoader creation, SMILES file I/O</td></tr>
 </tbody>
@@ -517,7 +517,7 @@ loss = F.mse_loss(pred[final_mask], targets[final_mask])</code></pre>
 
 <hr style="margin-top:3rem;border:none;border-top:1px solid var(--border);">
 <p style="color:#9ca3af;font-size:.8rem;margin-top:1rem;">
-  Golem Technical Documentation &mdash; 2026-03-07
+  Golem Technical Documentation &mdash; 2026-03-10
 </p>
 
 </body>
