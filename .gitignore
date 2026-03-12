@@ -17,3 +17,6 @@ NOTES.md
 
 # Allow docs/audit.html (the consolidated audit is tracked)
 !docs/audit.html
+
+# Generated documentation
+docs/documentation.html
