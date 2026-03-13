@@ -18,7 +18,7 @@ Golem pretrains a [gt-pyg](https://github.com/pgniewko/gt-pyg) `GraphTransformer
 
 ```bash
 # Create and activate virtual environment
-python3 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 
@@ -40,7 +40,7 @@ If you are working in this sibling-checkout layout:
 
 ```bash
 cd /Users/pawelgniewek/projects/golem
-python3 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e ../gt-pyg
