@@ -5,16 +5,15 @@ model.  The built-in ``mu_mlp`` serves as the descriptor prediction head.
 
 Pipeline:
 1. Load SMILES
-2. Filter invalid parent SMILES
-3. Split into train / val / (test) at the parent-molecule level
-4. (Optional) Enumerate isoforms within each split only
-5. Fit ``NaNAwareStandardScaler`` on **train only**
-6. Compute Mordred 2D descriptors + validity masks
-7. Transform all splits + winsorise
-8. Build PyG datasets via ``get_tensor_data``
-9. Train with masked MSE (15% random mask ∩ validity mask)
-10. Early stopping on validation loss
-11. Save checkpoint with scaler, descriptor names, config
+2. Split into train / val / (test) at the parent-molecule level
+3. (Optional) Enumerate isoforms within each split only
+4. Fit ``NaNAwareStandardScaler`` on **train only**
+5. Compute Mordred 2D descriptors + validity masks
+6. Transform all splits + winsorise
+7. Build PyG datasets via ``get_tensor_data``
+8. Train with masked MSE (15% random mask ∩ validity mask)
+9. Early stopping on validation loss
+10. Save checkpoint with scaler, descriptor names, config
 """
 
 from __future__ import annotations
