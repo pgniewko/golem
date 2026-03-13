@@ -116,7 +116,7 @@ After a pretraining run completes, an HTML report with training curves is automa
 golem report experiments/pretrain
 ```
 
-This reads `metrics.csv` and `resolved_config.yaml` from the experiment directory and produces a self-contained Chart.js dashboard (`pretrain_report.html`) with:
+This reads `metrics.csv` and `resolved_config.yaml` from the experiment directory and produces a single-file HTML dashboard (`pretrain_report.html`) with:
 
 - Training & validation loss curves
 - Validation RMSE curve
@@ -124,6 +124,8 @@ This reads `metrics.csv` and `resolved_config.yaml` from the experiment director
 - Train vs val loss gap
 - Summary cards (best epoch, best val loss, elapsed time, architecture)
 - Epoch-by-epoch table with the best row highlighted
+
+Note: the generated HTML references Chart.js from a CDN, so it is not fully offline/self-contained.
 
 To write the report to a custom path:
 
