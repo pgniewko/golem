@@ -10,25 +10,41 @@ Golem pretrains a [gt-pyg](https://github.com/pgniewko/gt-pyg) `GraphTransformer
 
 - Python 3.10+
 - pip (included with Python)
-- The [gt-pyg](https://github.com/pgniewko/gt-pyg) package
+- A checkout of the [gt-pyg](https://github.com/pgniewko/gt-pyg) package
+
+`golem` imports `gt_pyg` at runtime, so `gt-pyg` must be installed in the same environment before running `golem pretrain`.
 
 ### Setup
 
 ```bash
-cd golem
-
 # Create and activate virtual environment
 python -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
+
+# Install gt-pyg first.
+# Local development checkout:
+python -m pip install -e /path/to/gt-pyg
+
+# Or install gt-pyg from GitHub instead:
+# python -m pip install "gt-pyg @ git+https://github.com/pgniewko/gt-pyg.git"
 
 # Install golem (editable)
-pip install -e .
-
-# Install gt-pyg from GitHub
-pip install git+https://github.com/pgniewko/gt-pyg.git
+python -m pip install -e .
 
 # (Optional) Install dev dependencies for tests and notebooks
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
+```
+
+If you are working in this sibling-checkout layout:
+
+```bash
+cd /Users/pawelgniewek/projects/golem
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ../gt-pyg
+python -m pip install -e ".[dev]"
 ```
 
 ### Verify installation
