@@ -8,7 +8,11 @@ from golem.config import (
     PretrainConfig,
     load_config,
 )
-from golem.pretrain import _make_warmup_cosine_scheduler, _smiles_cache_key
+from golem.pretrain import (
+    _make_warmup_cosine_scheduler,
+    _prepare_split_smiles,
+    _smiles_cache_key,
+)
 from golem.utils import load_smiles, seed_everything, split_data
 
 
@@ -187,3 +191,44 @@ class TestSmilesCacheKey:
         np.testing.assert_array_equal(cached["values"], values)
         np.testing.assert_array_equal(cached["valid"], valid)
         assert cached["names"].tolist() == names
+
+
+class TestParentLevelSplit:
+    """Split leakage prevention when isoforms are enabled."""
+
+    def test_isoforms_do_not_cross_split_boundaries(self, monkeypatch):
+        cfg = PretrainConfig(split_ratios=[0.5, 0.5], seed=0)
+        parent_smiles = ["parent_a", "parent_b"]
+
+        def fake_enumerate(smiles_list, _config):
+            return {
+                "parent_a": ["shared_isoform", "train_only"],
+                "parent_b": ["shared_isoform", "val_only"],
+            }
+
+        monkeypatch.setattr("golem.pretrain.enumerate_isoforms_batch", fake_enumerate)
+
+        all_smiles, train_idx, val_idx, test_idx = _prepare_split_smiles(parent_smiles, cfg)
+
+        assert test_idx is None
+        train_smiles = [all_smiles[i] for i in train_idx]
+        val_smiles = [all_smiles[i] for i in val_idx]
+
+        assert set(train_smiles).isdisjoint(val_smiles)
+        assert train_smiles.count("shared_isoform") + val_smiles.count("shared_isoform") == 1
+        assert {"train_only", "val_only"} <= set(train_smiles + val_smiles)
+
+    def test_raises_when_a_required_split_becomes_empty(self, monkeypatch):
+        cfg = PretrainConfig(split_ratios=[0.5, 0.5], seed=0)
+        parent_smiles = ["parent_a", "parent_b"]
+
+        def fake_enumerate(smiles_list, _config):
+            return {
+                "parent_a": ["shared_isoform"],
+                "parent_b": ["shared_isoform"],
+            }
+
+        monkeypatch.setattr("golem.pretrain.enumerate_isoforms_batch", fake_enumerate)
+
+        with pytest.raises(ValueError, match="empty"):
+            _prepare_split_smiles(parent_smiles, cfg)
