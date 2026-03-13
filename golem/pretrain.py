@@ -5,10 +5,10 @@ model.  The built-in ``mu_mlp`` serves as the descriptor prediction head.
 
 Pipeline:
 1. Load SMILES
-2. (Optional) Enumerate isoforms
-3. Compute Mordred 2D descriptors + validity masks
-4. Split into train / val / (test) — **before** fitting scaler
-5. Fit ``NaNAwareStandardScaler`` on **train only**
+2. Split into train / val / (test) at the parent-molecule level
+3. (Optional) Enumerate isoforms within each split only
+4. Fit ``NaNAwareStandardScaler`` on **train only**
+5. Compute Mordred 2D descriptors + validity masks
 6. Transform all splits + winsorise
 7. Build PyG datasets via ``get_tensor_data``
 8. Train with masked MSE (15% random mask ∩ validity mask)
@@ -220,6 +220,88 @@ def _smiles_cache_key(smiles_list: List[str]) -> str:
     return h.hexdigest()[:16]
 
 
+def _expand_smiles_within_split(
+    parent_smiles: List[str],
+    config: PretrainConfig,
+    seen_smiles: set[str],
+) -> List[str]:
+    """Expand parent SMILES within a single split and deduplicate across splits."""
+    if not parent_smiles:
+        return []
+
+    if config.isoforms.enabled:
+        iso_map = enumerate_isoforms_batch(parent_smiles, config.isoforms)
+        split_smiles: List[str] = []
+        for parent_smi in parent_smiles:
+            for smi in iso_map[parent_smi]:
+                if smi not in seen_smiles:
+                    seen_smiles.add(smi)
+                    split_smiles.append(smi)
+        return split_smiles
+
+    split_smiles = []
+    for smi in parent_smiles:
+        if smi not in seen_smiles:
+            seen_smiles.add(smi)
+            split_smiles.append(smi)
+    return split_smiles
+
+
+def _prepare_split_smiles(
+    parent_smiles: List[str],
+    config: PretrainConfig,
+) -> Tuple[List[str], np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Split parent molecules first, then expand isoforms within each split."""
+    parent_splits = split_data(len(parent_smiles), config.split_ratios, seed=config.seed)
+
+    if len(parent_splits) == 3:
+        parent_train_idx, parent_val_idx, parent_test_idx = parent_splits
+    else:
+        parent_train_idx, parent_val_idx = parent_splits
+        parent_test_idx = None
+
+    train_parents = [parent_smiles[i] for i in parent_train_idx]
+    val_parents = [parent_smiles[i] for i in parent_val_idx]
+    test_parents = [parent_smiles[i] for i in parent_test_idx] if parent_test_idx is not None else []
+
+    logger.info(
+        "Parent split: train=%d  val=%d%s",
+        len(train_parents),
+        len(val_parents),
+        f"  test={len(test_parents)}" if parent_test_idx is not None else "  (no test)",
+    )
+
+    seen_smiles: set[str] = set()
+    train_smiles = _expand_smiles_within_split(train_parents, config, seen_smiles)
+    val_smiles = _expand_smiles_within_split(val_parents, config, seen_smiles)
+    test_smiles = _expand_smiles_within_split(test_parents, config, seen_smiles)
+
+    if not train_smiles or not val_smiles or (parent_test_idx is not None and not test_smiles):
+        raise ValueError(
+            "One or more data splits became empty after parent-level splitting and "
+            "within-split isoform deduplication. Increase dataset size, adjust "
+            "split ratios, or disable aggressive subsampling."
+        )
+
+    all_smiles = train_smiles + val_smiles + test_smiles
+    train_idx = np.arange(0, len(train_smiles))
+    val_idx = np.arange(len(train_smiles), len(train_smiles) + len(val_smiles))
+    test_idx = (
+        np.arange(len(train_smiles) + len(val_smiles), len(all_smiles))
+        if parent_test_idx is not None
+        else None
+    )
+
+    logger.info(
+        "Expanded split: train=%d  val=%d%s",
+        len(train_smiles),
+        len(val_smiles),
+        f"  test={len(test_smiles)}" if test_idx is not None else "  (no test)",
+    )
+
+    return all_smiles, train_idx, val_idx, test_idx
+
+
 def pretrain(
     smiles_path: str,
     config: PretrainConfig,
@@ -285,32 +367,7 @@ def pretrain(
         logger.info("Subsampled to %d SMILES (%.1f%%)", len(smiles_list), subsample * 100)
 
     # ------------------------------------------------------------------
-    # 2. Enumerate isoforms (optional)
-    # ------------------------------------------------------------------
-    if config.isoforms.enabled:
-        logger.info("Enumerating isoforms …")
-        iso_map = enumerate_isoforms_batch(smiles_list, config.isoforms)
-        # Flatten: one entry per isoform
-        all_smiles: List[str] = []
-        for parent_smi in smiles_list:
-            all_smiles.extend(iso_map[parent_smi])
-        # Deduplicate globally (keep order)
-        seen = set()
-        unique_smiles: List[str] = []
-        for smi in all_smiles:
-            if smi not in seen:
-                seen.add(smi)
-                unique_smiles.append(smi)
-        logger.info(
-            "After isoform enumeration + dedup: %d → %d unique SMILES",
-            len(smiles_list), len(unique_smiles),
-        )
-        smiles_list = unique_smiles
-    else:
-        logger.info("Isoform enumeration disabled")
-
-    # ------------------------------------------------------------------
-    # 2b. Filter invalid SMILES before descriptor computation
+    # 2. Filter invalid parent SMILES before splitting
     # ------------------------------------------------------------------
     valid_smiles = []
     for smi in smiles_list:
@@ -329,7 +386,12 @@ def pretrain(
     smiles_list = valid_smiles
 
     # ------------------------------------------------------------------
-    # 3. Compute Mordred descriptors (with disk cache)
+    # 3. Split parents first, then expand isoforms within each split
+    # ------------------------------------------------------------------
+    smiles_list, train_idx, val_idx, test_idx = _prepare_split_smiles(smiles_list, config)
+
+    # ------------------------------------------------------------------
+    # 4. Compute Mordred descriptors (with disk cache)
     # ------------------------------------------------------------------
     cache_key = _smiles_cache_key(smiles_list)
     cache_path = output_dir / f"descriptors_{cache_key}.npz"
@@ -348,20 +410,6 @@ def pretrain(
 
     num_descriptors = desc_values.shape[1]
     logger.info("Descriptor matrix: %d molecules × %d descriptors", desc_values.shape[0], num_descriptors)
-
-    # ------------------------------------------------------------------
-    # 4. Split BEFORE fitting scaler
-    # ------------------------------------------------------------------
-    n = len(smiles_list)
-    splits = split_data(n, config.split_ratios, seed=config.seed)
-
-    if len(splits) == 3:
-        train_idx, val_idx, test_idx = splits
-        logger.info("Split: train=%d  val=%d  test=%d", len(train_idx), len(val_idx), len(test_idx))
-    else:
-        train_idx, val_idx = splits
-        test_idx = None
-        logger.info("Split: train=%d  val=%d  (no test)", len(train_idx), len(val_idx))
 
     # ------------------------------------------------------------------
     # 5. Fit scaler on TRAIN only
