@@ -1,0 +1,49 @@
+model:
+  hidden_dim: 128
+  num_gt_layers: 4
+  num_heads: 8
+  norm: bn
+  gt_aggregators:
+  - sum
+  - mean
+  aggregators:
+  - sum
+  - mean
+  - max
+  - std
+  dropout: 0.2
+  act: gelu
+  gate: true
+  qkv_bias: false
+  num_head_layers: 1
+  head_norm: false
+  head_residual: false
+  head_dropout: 0.2
+isoforms:
+  enabled: true
+  desalting: true
+  tautomers: true
+  max_tautomers: 10
+  protonation: true
+  max_protomers: 10
+  ph_range:
+  - 6.4
+  - 8.4
+  neutralization: true
+  rdkit_fallback: false
+masking_ratio: 0.15
+batch_size: 128
+max_epochs: 5000
+patience: 100
+lr: 0.0003
+weight_decay: 1.0e-05
+warmup_epochs: 25
+num_workers: 4
+winsorize_range:
+- -6.0
+- 6.0
+split_ratios:
+- 0.7
+- 0.2
+- 0.1
+seed: 42

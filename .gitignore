@@ -7,6 +7,11 @@ __pycache__/
 # Checkpoint binaries (too large for git)
 *.pt
 
+# Experiment artifacts
+descriptors_*.npz
+pretrain.log
+metrics.csv
+
 # Temp files
 tmp*
 
