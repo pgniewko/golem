@@ -14,7 +14,6 @@
 |------|-------------|
 | `best_checkpoint.pt.gz` | Gzip-compressed model checkpoint (epoch 1058). Decompress with `gunzip best_checkpoint.pt.gz`. |
 | `resolved_config.yaml` | Full resolved training configuration |
-| `pretrain_report.html` | Training report with loss curves and metrics |
 
 ## Command
 

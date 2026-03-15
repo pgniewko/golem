@@ -103,7 +103,7 @@ After a run completes, the output directory contains:
 experiments/pretrain/
   best_checkpoint.pt.gz     # Best model by validation loss (gzip-compressed)
   resolved_config.yaml      # Full resolved config used for the run
-  pretrain_report.html      # HTML dashboard with training curves and metrics
+  pretrain_report.html      # HTML dashboard with training curves and metrics (not tracked)
   last_checkpoint.pt        # Last epoch, for resuming (not tracked)
   metrics.csv               # Per-epoch: train_loss, val_loss, val_rmse, lr (not tracked)
   pretrain.log              # Full log output (not tracked)
