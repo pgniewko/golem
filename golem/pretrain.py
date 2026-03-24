@@ -25,14 +25,16 @@ import logging
 import math
 import time
 from dataclasses import asdict
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from rdkit import Chem
 import torch.nn.functional as F
 import yaml
+from golem import __version__ as GOLEM_VERSION
 from golem.config import PretrainConfig
 from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
 from golem.isoforms import enumerate_isoforms_batch
@@ -45,6 +47,60 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
+
+
+def _get_installed_package_version(package_name: str) -> Optional[str]:
+    """Return the installed distribution version when metadata is present."""
+    try:
+        return package_version(package_name)
+    except PackageNotFoundError:
+        return None
+
+
+def _get_gt_pyg_version() -> Optional[str]:
+    """Return ``gt_pyg.__version__`` when the package is importable."""
+    try:
+        import gt_pyg
+    except Exception:
+        return None
+    return getattr(gt_pyg, "__version__", None)
+
+
+def _extract_checkpoint_versions(checkpoint: Optional[dict]) -> Dict[str, str]:
+    """Read previously saved version metadata from a checkpoint payload."""
+    if not isinstance(checkpoint, dict):
+        return {}
+
+    versions = checkpoint.get("versions")
+    if isinstance(versions, dict):
+        return {str(k): str(v) for k, v in versions.items() if v is not None}
+
+    extra = checkpoint.get("extra")
+    if isinstance(extra, dict):
+        versions = extra.get("versions")
+        if isinstance(versions, dict):
+            return {str(k): str(v) for k, v in versions.items() if v is not None}
+
+    return {}
+
+
+def _resolve_library_versions(checkpoint: Optional[dict] = None) -> Dict[str, str]:
+    """Resolve runtime library versions with checkpoint metadata as fallback."""
+    checkpoint_versions = _extract_checkpoint_versions(checkpoint)
+    golem_version = _get_installed_package_version("golem") or GOLEM_VERSION or checkpoint_versions.get("golem")
+    gt_pyg_version = _get_gt_pyg_version() or checkpoint_versions.get("gt_pyg")
+
+    return {
+        "golem": golem_version or "unknown",
+        "gt_pyg": gt_pyg_version or "unknown",
+    }
+
+
+def _build_resolved_config(config: PretrainConfig, versions: Dict[str, str]) -> dict:
+    """Serialize the resolved config and attach library version metadata."""
+    config_dict = json.loads(json.dumps(asdict(config)))
+    config_dict["versions"] = versions
+    return config_dict
 
 def _setup_logging(output_dir: Path, verbose: bool = False) -> None:
     """Configure logging to both stdout and file.
@@ -340,6 +396,16 @@ def pretrain(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
 
+    resume_path = Path(resume_from) if resume_from is not None else None
+    resume_ckpt = None
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        resume_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+
+    versions = _resolve_library_versions(resume_ckpt)
+    logger.info("Library versions: golem=%s  gt-pyg=%s", versions["golem"], versions["gt_pyg"])
+
     seed_everything(config.seed)
 
     if config.max_epochs > 0 and config.warmup_epochs >= config.max_epochs:
@@ -349,7 +415,7 @@ def pretrain(
         )
 
     # Save resolved config (convert tuples to lists for safe_load compatibility)
-    config_dict = json.loads(json.dumps(asdict(config)))
+    config_dict = _build_resolved_config(config, versions)
     with open(output_dir / "resolved_config.yaml", "w") as f:
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
@@ -490,11 +556,10 @@ def pretrain(
     best_epoch = 0
 
     if resume_from is not None:
-        resume_path = Path(resume_from)
-        if not resume_path.exists():
-            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        assert resume_path is not None
+        assert resume_ckpt is not None
         logger.info("Resuming from checkpoint: %s", resume_path)
-        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        ckpt = resume_ckpt
         model.load_state_dict(ckpt["model_state_dict"])
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -560,6 +625,7 @@ def pretrain(
                     train_idx=train_idx,
                     val_idx=val_idx,
                     test_idx=test_idx,
+                    versions=versions,
                     scheduler=scheduler,
                 )
                 logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
@@ -583,6 +649,7 @@ def pretrain(
         train_idx=train_idx,
         val_idx=val_idx,
         test_idx=test_idx,
+        versions=versions,
         scheduler=scheduler,
     )
 
@@ -633,6 +700,7 @@ def _save_checkpoint(
     train_idx: np.ndarray,
     val_idx: np.ndarray,
     test_idx: Optional[np.ndarray],
+    versions: Dict[str, str],
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> None:
     """Save checkpoint via gt-pyg's model.save_checkpoint()."""
@@ -647,6 +715,7 @@ def _save_checkpoint(
             "descriptor_names": descriptor_names,
             "descriptor_count": num_descriptors,
             "config": asdict(config),
+            "versions": versions,
             "split_indices": {
                 "train": train_idx.tolist(),
                 "val": val_idx.tolist(),

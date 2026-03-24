@@ -8,9 +8,13 @@ from golem.config import (
     PretrainConfig,
     load_config,
 )
+from golem.descriptors import NaNAwareStandardScaler
 from golem.pretrain import (
+    _build_resolved_config,
     _make_warmup_cosine_scheduler,
     _prepare_split_smiles,
+    _resolve_library_versions,
+    _save_checkpoint,
     _smiles_cache_key,
 )
 from golem.utils import load_smiles, seed_everything, split_data
@@ -217,6 +221,64 @@ class TestParentLevelSplit:
         assert set(train_smiles).isdisjoint(val_smiles)
         assert train_smiles.count("shared_isoform") + val_smiles.count("shared_isoform") == 1
         assert {"train_only", "val_only"} <= set(train_smiles + val_smiles)
+
+
+class TestVersionMetadata:
+    """Version metadata persisted with outputs and checkpoints."""
+
+    def test_resolve_library_versions_prefers_runtime_versions(self, monkeypatch):
+        monkeypatch.setattr("golem.pretrain._get_installed_package_version", lambda name: "0.2.0" if name == "golem" else None)
+        monkeypatch.setattr("golem.pretrain._get_gt_pyg_version", lambda: "1.6.1")
+        versions = _resolve_library_versions({"versions": {"golem": "0.1.0", "gt_pyg": "1.5.0"}})
+        assert versions == {"golem": "0.2.0", "gt_pyg": "1.6.1"}
+
+    def test_resolve_library_versions_falls_back_to_checkpoint(self, monkeypatch):
+        monkeypatch.setattr("golem.pretrain._get_installed_package_version", lambda name: None)
+        monkeypatch.setattr("golem.pretrain.GOLEM_VERSION", "")
+        monkeypatch.setattr("golem.pretrain._get_gt_pyg_version", lambda: None)
+        versions = _resolve_library_versions({"extra": {"versions": {"golem": "0.1.0", "gt_pyg": "1.5.0"}}})
+        assert versions == {"golem": "0.1.0", "gt_pyg": "1.5.0"}
+
+    def test_build_resolved_config_includes_versions(self):
+        config = PretrainConfig(winsorize_range=(-1.0, 1.0))
+        resolved = _build_resolved_config(config, {"golem": "0.1.0", "gt_pyg": "1.6.1"})
+
+        assert resolved["versions"] == {"golem": "0.1.0", "gt_pyg": "1.6.1"}
+        assert resolved["winsorize_range"] == [-1.0, 1.0]
+
+    def test_save_checkpoint_includes_versions(self, tmp_path):
+        class FakeModel:
+            def __init__(self):
+                self.kwargs = None
+
+            def save_checkpoint(self, **kwargs):
+                self.kwargs = kwargs
+
+        torch_model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.AdamW(torch_model.parameters(), lr=1e-3)
+        scaler = NaNAwareStandardScaler()
+        scaler.mean_ = np.array([0.0], dtype=np.float64)
+        scaler.std_ = np.array([1.0], dtype=np.float64)
+        model = FakeModel()
+
+        _save_checkpoint(
+            model,
+            optimizer,
+            tmp_path / "checkpoint.pt",
+            epoch=3,
+            best_metric=0.123,
+            config=PretrainConfig(),
+            scaler=scaler,
+            descriptor_names=["desc"],
+            num_descriptors=1,
+            train_idx=np.array([0, 1]),
+            val_idx=np.array([2]),
+            test_idx=None,
+            versions={"golem": "0.1.0", "gt_pyg": "1.6.1"},
+        )
+
+        assert model.kwargs is not None
+        assert model.kwargs["extra"]["versions"] == {"golem": "0.1.0", "gt_pyg": "1.6.1"}
 
     def test_raises_when_a_required_split_becomes_empty(self, monkeypatch):
         cfg = PretrainConfig(split_ratios=[0.5, 0.5], seed=0)
