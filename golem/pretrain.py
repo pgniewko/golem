@@ -27,7 +27,7 @@ import time
 from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,7 @@ from rdkit import Chem
 import torch.nn.functional as F
 import yaml
 from golem import __version__ as GOLEM_VERSION
+from golem._version import get_source_info as get_golem_source_info
 from golem.config import PretrainConfig
 from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
 from golem.isoforms import enumerate_isoforms_batch
@@ -84,6 +85,24 @@ def _extract_checkpoint_versions(checkpoint: Optional[dict]) -> Dict[str, str]:
     return {}
 
 
+def _extract_checkpoint_source_info(checkpoint: Optional[dict]) -> Dict[str, Any]:
+    """Read previously saved source metadata from a checkpoint payload."""
+    if not isinstance(checkpoint, dict):
+        return {}
+
+    source_info = checkpoint.get("source_info")
+    if isinstance(source_info, dict):
+        return source_info
+
+    extra = checkpoint.get("extra")
+    if isinstance(extra, dict):
+        source_info = extra.get("source_info")
+        if isinstance(source_info, dict):
+            return source_info
+
+    return {}
+
+
 def _resolve_library_versions(checkpoint: Optional[dict] = None) -> Dict[str, str]:
     """Resolve runtime library versions with checkpoint metadata as fallback."""
     checkpoint_versions = _extract_checkpoint_versions(checkpoint)
@@ -96,10 +115,30 @@ def _resolve_library_versions(checkpoint: Optional[dict] = None) -> Dict[str, st
     }
 
 
-def _build_resolved_config(config: PretrainConfig, versions: Dict[str, str]) -> dict:
+def _resolve_golem_source_info(checkpoint: Optional[dict] = None) -> Dict[str, Any]:
+    """Resolve exact golem source metadata with checkpoint fallback."""
+    runtime_source_info = get_golem_source_info()
+    if runtime_source_info:
+        return runtime_source_info
+
+    checkpoint_source_info = _extract_checkpoint_source_info(checkpoint)
+    golem_source_info = checkpoint_source_info.get("golem")
+    if isinstance(golem_source_info, dict):
+        return golem_source_info
+
+    return {}
+
+
+def _build_resolved_config(
+    config: PretrainConfig,
+    versions: Dict[str, str],
+    source_info: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> dict:
     """Serialize the resolved config and attach library version metadata."""
     config_dict = json.loads(json.dumps(asdict(config)))
     config_dict["versions"] = versions
+    if source_info:
+        config_dict["source_info"] = source_info
     return config_dict
 
 def _setup_logging(output_dir: Path, verbose: bool = False) -> None:
@@ -404,7 +443,16 @@ def pretrain(
         resume_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
 
     versions = _resolve_library_versions(resume_ckpt)
+    golem_source_info = _resolve_golem_source_info(resume_ckpt)
+    source_info = {"golem": golem_source_info} if golem_source_info else {}
     logger.info("Library versions: golem=%s  gt-pyg=%s", versions["golem"], versions["gt_pyg"])
+    if golem_source_info:
+        logger.info(
+            "Golem source: commit=%s  describe=%s  dirty=%s",
+            golem_source_info.get("short_commit", golem_source_info.get("commit", "unknown")),
+            golem_source_info.get("describe", "unknown"),
+            golem_source_info.get("dirty", "unknown"),
+        )
 
     seed_everything(config.seed)
 
@@ -415,7 +463,7 @@ def pretrain(
         )
 
     # Save resolved config (convert tuples to lists for safe_load compatibility)
-    config_dict = _build_resolved_config(config, versions)
+    config_dict = _build_resolved_config(config, versions, source_info=source_info)
     with open(output_dir / "resolved_config.yaml", "w") as f:
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
@@ -626,6 +674,7 @@ def pretrain(
                     val_idx=val_idx,
                     test_idx=test_idx,
                     versions=versions,
+                    source_info=source_info,
                     scheduler=scheduler,
                 )
                 logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
@@ -650,6 +699,7 @@ def pretrain(
         val_idx=val_idx,
         test_idx=test_idx,
         versions=versions,
+        source_info=source_info,
         scheduler=scheduler,
     )
 
@@ -701,6 +751,7 @@ def _save_checkpoint(
     val_idx: np.ndarray,
     test_idx: Optional[np.ndarray],
     versions: Dict[str, str],
+    source_info: Dict[str, Dict[str, Any]],
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> None:
     """Save checkpoint via gt-pyg's model.save_checkpoint()."""
@@ -716,6 +767,7 @@ def _save_checkpoint(
             "descriptor_count": num_descriptors,
             "config": asdict(config),
             "versions": versions,
+            "source_info": source_info,
             "split_indices": {
                 "train": train_idx.tolist(),
                 "val": val_idx.tolist(),

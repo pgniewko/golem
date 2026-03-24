@@ -13,6 +13,7 @@ from golem.pretrain import (
     _build_resolved_config,
     _make_warmup_cosine_scheduler,
     _prepare_split_smiles,
+    _resolve_golem_source_info,
     _resolve_library_versions,
     _save_checkpoint,
     _smiles_cache_key,
@@ -239,14 +240,37 @@ class TestVersionMetadata:
         versions = _resolve_library_versions({"extra": {"versions": {"golem": "0.1.0", "gt_pyg": "1.5.0"}}})
         assert versions == {"golem": "0.1.0", "gt_pyg": "1.5.0"}
 
-    def test_build_resolved_config_includes_versions(self):
+    def test_resolve_golem_source_info_prefers_runtime_git_info(self, monkeypatch):
+        monkeypatch.setattr(
+            "golem.pretrain.get_golem_source_info",
+            lambda: {"commit": "runtime", "short_commit": "runtime", "describe": "runtime-desc", "dirty": True},
+        )
+        source_info = _resolve_golem_source_info(
+            {"extra": {"source_info": {"golem": {"commit": "checkpoint"}}}}
+        )
+        assert source_info["commit"] == "runtime"
+        assert source_info["describe"] == "runtime-desc"
+
+    def test_resolve_golem_source_info_falls_back_to_checkpoint(self, monkeypatch):
+        monkeypatch.setattr("golem.pretrain.get_golem_source_info", lambda: {})
+        source_info = _resolve_golem_source_info(
+            {"extra": {"source_info": {"golem": {"commit": "checkpoint", "dirty": False}}}}
+        )
+        assert source_info == {"commit": "checkpoint", "dirty": False}
+
+    def test_build_resolved_config_includes_versions_and_source_info(self):
         config = PretrainConfig(winsorize_range=(-1.0, 1.0))
-        resolved = _build_resolved_config(config, {"golem": "0.1.0", "gt_pyg": "1.6.1"})
+        resolved = _build_resolved_config(
+            config,
+            {"golem": "0.1.0", "gt_pyg": "1.6.1"},
+            source_info={"golem": {"commit": "abc123", "dirty": False}},
+        )
 
         assert resolved["versions"] == {"golem": "0.1.0", "gt_pyg": "1.6.1"}
+        assert resolved["source_info"]["golem"]["commit"] == "abc123"
         assert resolved["winsorize_range"] == [-1.0, 1.0]
 
-    def test_save_checkpoint_includes_versions(self, tmp_path):
+    def test_save_checkpoint_includes_versions_and_source_info(self, tmp_path):
         class FakeModel:
             def __init__(self):
                 self.kwargs = None
@@ -275,10 +299,12 @@ class TestVersionMetadata:
             val_idx=np.array([2]),
             test_idx=None,
             versions={"golem": "0.1.0", "gt_pyg": "1.6.1"},
+            source_info={"golem": {"commit": "abc123", "dirty": False}},
         )
 
         assert model.kwargs is not None
         assert model.kwargs["extra"]["versions"] == {"golem": "0.1.0", "gt_pyg": "1.6.1"}
+        assert model.kwargs["extra"]["source_info"] == {"golem": {"commit": "abc123", "dirty": False}}
 
     def test_raises_when_a_required_split_becomes_empty(self, monkeypatch):
         cfg = PretrainConfig(split_ratios=[0.5, 0.5], seed=0)
