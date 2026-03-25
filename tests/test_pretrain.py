@@ -12,22 +12,24 @@ from golem.config import (
     load_config,
 )
 from golem.descriptors import NaNAwareStandardScaler
+from golem.geometry import (
+    _compute_ecfp_fingerprints,
+    _fingerprint_cache_path,
+    _latent_distance_for_pairs,
+    _load_or_compute_fingerprints,
+    _pair_order_surrogate,
+    _sample_batch_pairs,
+    _tanimoto_distance_for_pairs,
+)
 from golem.pretrain import (
     METRICS_FIELDNAMES,
     _build_pyg_dataset,
     _checkpoint_library_versions,
-    _compute_ecfp_fingerprints,
-    _fingerprint_cache_path,
-    _latent_distance_for_pairs,
     _make_warmup_cosine_scheduler,
-    _load_or_compute_fingerprints,
-    _pair_order_surrogate,
     _prepare_split_smiles,
     _prepare_metrics_file,
-    _sample_batch_pairs,
     _save_checkpoint,
     _smiles_cache_key,
-    _tanimoto_distance_for_pairs,
 )
 from golem.report import generate_report
 from golem.utils import load_smiles, seed_everything, split_data
