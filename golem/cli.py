@@ -7,10 +7,11 @@ import click
 from golem.config import load_config
 from golem.pretrain import pretrain
 from golem.report import generate_report
+from golem._version import __version__
 
 
 @click.group()
-@click.version_option(package_name="golem")
+@click.version_option(version=__version__)
 def main() -> None:
     """Golem — Descriptor pretraining for Graph Transformers on molecular descriptors."""
 

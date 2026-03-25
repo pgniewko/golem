@@ -1,3 +1,3 @@
 """Golem — Descriptor pretraining for Graph Transformers on molecular descriptors."""
 
-__version__ = "0.1.0"
+from golem._version import __version__
