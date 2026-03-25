@@ -106,7 +106,7 @@ def _extract_checkpoint_source_info(checkpoint: Optional[dict]) -> Dict[str, Any
 def _resolve_library_versions(checkpoint: Optional[dict] = None) -> Dict[str, str]:
     """Resolve runtime library versions with checkpoint metadata as fallback."""
     checkpoint_versions = _extract_checkpoint_versions(checkpoint)
-    golem_version = _get_installed_package_version("golem") or GOLEM_VERSION or checkpoint_versions.get("golem")
+    golem_version = GOLEM_VERSION or _get_installed_package_version("golem") or checkpoint_versions.get("golem")
     gt_pyg_version = _get_gt_pyg_version() or checkpoint_versions.get("gt_pyg")
 
     return {

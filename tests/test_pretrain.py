@@ -227,11 +227,12 @@ class TestParentLevelSplit:
 class TestVersionMetadata:
     """Version metadata persisted with outputs and checkpoints."""
 
-    def test_resolve_library_versions_prefers_runtime_versions(self, monkeypatch):
+    def test_resolve_library_versions_prefers_runtime_module_version(self, monkeypatch):
+        monkeypatch.setattr("golem.pretrain.GOLEM_VERSION", "0.2.0.dev5+abc123def456")
         monkeypatch.setattr("golem.pretrain._get_installed_package_version", lambda name: "0.2.0" if name == "golem" else None)
         monkeypatch.setattr("golem.pretrain._get_gt_pyg_version", lambda: "1.6.1")
         versions = _resolve_library_versions({"versions": {"golem": "0.1.0", "gt_pyg": "1.5.0"}})
-        assert versions == {"golem": "0.2.0", "gt_pyg": "1.6.1"}
+        assert versions == {"golem": "0.2.0.dev5+abc123def456", "gt_pyg": "1.6.1"}
 
     def test_resolve_library_versions_falls_back_to_checkpoint(self, monkeypatch):
         monkeypatch.setattr("golem.pretrain._get_installed_package_version", lambda name: None)

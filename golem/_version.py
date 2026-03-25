@@ -37,37 +37,18 @@ def _normalize_prerelease(ver: str) -> str:
 
 def _get_version_from_git() -> str:
     """Return a git-derived version string for a source checkout."""
-    try:
-        desc = _run_git(["describe", "--tags", "--long", "--dirty"])
-    except Exception:
-        sha = _run_git(["rev-parse", "--short=12", "HEAD"])
-        dirty = bool(_run_git(["status", "--porcelain", "--untracked-files=normal"]))
-        resolved = f"0+g{sha}"
-        if dirty:
-            resolved = f"{resolved}.dirty"
-        return resolved
-
-    dirty = desc.endswith("-dirty")
-    if dirty:
-        desc = desc[:-6]
+    desc = _run_git(["describe", "--tags", "--long"])
 
     desc = desc.lstrip("v")
     parts = desc.rsplit("-", 2)
     if len(parts) != 3 or not parts[2].startswith("g"):
-        resolved = f"0+g{desc}"
-    else:
-        ver, distance, sha = parts[0], parts[1], parts[2][1:]
-        ver = _normalize_prerelease(ver)
-        if int(distance) == 0:
-            resolved = ver
-        else:
-            resolved = f"{ver}.dev{distance}+{sha}"
+        raise RuntimeError(f"Cannot parse git describe output: {desc!r}")
 
-    if dirty:
-        if "+" in resolved:
-            return f"{resolved}.dirty"
-        return f"{resolved}+dirty"
-    return resolved
+    ver, distance, sha = parts[0], parts[1], parts[2][1:]
+    ver = _normalize_prerelease(ver)
+    if int(distance) == 0:
+        return ver
+    return f"{ver}.dev{distance}+{sha}"
 
 
 def _get_version_from_metadata() -> str:
