@@ -20,26 +20,63 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import inspect
 import json
 import logging
 import math
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
-from rdkit import Chem
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem
 import torch.nn.functional as F
 import yaml
-from golem.config import PretrainConfig
+from golem.config import GeometryConfig, PretrainConfig
 from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
 from golem.isoforms import enumerate_isoforms_batch
 from golem.report import generate_report
 from golem.utils import load_smiles, make_loader, seed_everything, split_data
 
 logger = logging.getLogger(__name__)
+
+METRICS_FIELDNAMES = [
+    "epoch",
+    "train_loss",
+    "val_loss",
+    "val_rmse",
+    "learning_rate",
+    "elapsed_seconds",
+    "train_main_loss",
+    "train_rank_loss",
+    "train_total_loss",
+    "val_rank_loss",
+    "val_spearman",
+    "val_kendall",
+]
+
+
+@dataclass
+class TrainEpochMetrics:
+    """Aggregated training losses for a single epoch."""
+
+    main_loss: float
+    rank_loss: float
+    total_loss: float
+
+
+@dataclass
+class ValidationMetrics:
+    """Aggregated validation metrics for a single epoch."""
+
+    loss: float
+    rmse: float
+    rank_loss: float = math.nan
+    spearman: float = math.nan
+    kendall: float = math.nan
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +149,228 @@ def _make_warmup_cosine_scheduler(
 
 
 # ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+def _sample_batch_pairs(
+    batch_size: int,
+    num_pairs: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample unique unordered graph pairs from a batch."""
+    if batch_size < 2 or num_pairs <= 0:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty
+
+    all_pairs = torch.triu_indices(batch_size, batch_size, offset=1, device=device)
+    if all_pairs.size(1) <= num_pairs:
+        return all_pairs[0], all_pairs[1]
+
+    perm = torch.randperm(all_pairs.size(1), device=device)[:num_pairs]
+    return all_pairs[0, perm], all_pairs[1, perm]
+
+
+def _tanimoto_distance_for_pairs(
+    fp_bits: torch.Tensor,
+    pair_i: torch.Tensor,
+    pair_j: torch.Tensor,
+) -> torch.Tensor:
+    """Compute Tanimoto distance for sampled fingerprint pairs."""
+    fp_i = fp_bits[pair_i].bool()
+    fp_j = fp_bits[pair_j].bool()
+    intersection = (fp_i & fp_j).sum(dim=-1).float()
+    union = (fp_i | fp_j).sum(dim=-1).float()
+    similarity = torch.where(union > 0, intersection / union, torch.ones_like(union))
+    return 1.0 - similarity
+
+
+def _latent_distance_for_pairs(
+    z: torch.Tensor,
+    pair_i: torch.Tensor,
+    pair_j: torch.Tensor,
+    metric: str,
+) -> torch.Tensor:
+    """Compute latent distances for sampled graph-embedding pairs."""
+    metric = metric.lower()
+    z_norm = F.normalize(z, p=2, dim=-1, eps=1e-8)
+
+    if metric == "cosine":
+        cosine_sim = (z_norm[pair_i] * z_norm[pair_j]).sum(dim=-1).clamp(-1.0, 1.0)
+        return 1.0 - cosine_sim
+    if metric == "l2_norm":
+        return (z_norm[pair_i] - z_norm[pair_j]).pow(2).sum(dim=-1)
+
+    raise ValueError(f"Unsupported latent metric: {metric!r}")
+
+
+def _pair_order_surrogate(
+    d_fp: torch.Tensor,
+    d_z: torch.Tensor,
+    temperature: float,
+    tie_epsilon: float,
+) -> Tuple[torch.Tensor, int]:
+    """Smooth pair-of-pairs ranking loss over sampled distances."""
+    if d_fp.numel() < 2 or d_z.numel() < 2:
+        return d_z.sum() * 0.0, 0
+
+    delta_fp = d_fp[:, None] - d_fp[None, :]
+    delta_z = d_z[:, None] - d_z[None, :]
+    upper_mask = torch.triu(
+        torch.ones_like(delta_fp, dtype=torch.bool), diagonal=1
+    )
+    informative = delta_fp.abs() > tie_epsilon
+    mask = upper_mask & informative
+
+    if not mask.any():
+        return d_z.sum() * 0.0, 0
+
+    direction = torch.sign(delta_fp[mask])
+    scaled_margin = direction * delta_z[mask] / max(temperature, 1e-8)
+    weights = delta_fp[mask].abs()
+    loss = (F.softplus(-scaled_margin) * weights).sum() / weights.sum().clamp_min(1e-8)
+    return loss, int(mask.sum().item())
+
+
+def _average_ranks(values: np.ndarray) -> np.ndarray:
+    """Return 1-based average ranks with stable tie handling."""
+    order = np.argsort(values, kind="mergesort")
+    sorted_values = values[order]
+    ranks = np.empty(values.shape[0], dtype=np.float64)
+
+    start = 0
+    while start < len(sorted_values):
+        end = start + 1
+        while end < len(sorted_values) and sorted_values[end] == sorted_values[start]:
+            end += 1
+        avg_rank = 0.5 * (start + end - 1) + 1.0
+        ranks[order[start:end]] = avg_rank
+        start = end
+
+    return ranks
+
+
+def _spearman_correlation(x: np.ndarray, y: np.ndarray) -> float:
+    """Compute Spearman rank correlation on 1-D arrays."""
+    if x.size < 2 or y.size < 2:
+        return math.nan
+
+    rx = _average_ranks(x)
+    ry = _average_ranks(y)
+    rx = rx - rx.mean()
+    ry = ry - ry.mean()
+    denom = np.sqrt(np.sum(rx ** 2) * np.sum(ry ** 2))
+    if denom == 0.0:
+        return math.nan
+    return float(np.sum(rx * ry) / denom)
+
+
+def _kendall_tau(x: np.ndarray, y: np.ndarray) -> float:
+    """Compute Kendall tau-b for 1-D arrays."""
+    n = x.size
+    if n < 2:
+        return math.nan
+
+    concordant = 0
+    discordant = 0
+    ties_x = 0
+    ties_y = 0
+
+    for i in range(n - 1):
+        dx = x[i] - x[i + 1 :]
+        dy = y[i] - y[i + 1 :]
+        for dx_ij, dy_ij in zip(dx, dy, strict=False):
+            sign_x = 0 if dx_ij == 0 else (1 if dx_ij > 0 else -1)
+            sign_y = 0 if dy_ij == 0 else (1 if dy_ij > 0 else -1)
+            if sign_x == 0 and sign_y == 0:
+                continue
+            if sign_x == 0:
+                ties_x += 1
+            elif sign_y == 0:
+                ties_y += 1
+            elif sign_x == sign_y:
+                concordant += 1
+            else:
+                discordant += 1
+
+    denom = math.sqrt((concordant + discordant + ties_x) * (concordant + discordant + ties_y))
+    if denom == 0.0:
+        return math.nan
+    return (concordant - discordant) / denom
+
+
+def _pair_rank_metrics(d_fp: torch.Tensor, d_z: torch.Tensor) -> Tuple[float, float]:
+    """Compute exact rank-correlation metrics on sampled pair distances."""
+    if d_fp.numel() < 2 or d_z.numel() < 2:
+        return math.nan, math.nan
+
+    fp_np = d_fp.detach().cpu().numpy().astype(np.float64, copy=False)
+    z_np = d_z.detach().cpu().numpy().astype(np.float64, copy=False)
+    return _spearman_correlation(fp_np, z_np), _kendall_tau(fp_np, z_np)
+
+
+def _forward_with_latent(
+    model: torch.nn.Module,
+    batch,
+    *,
+    zero_var: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward pass that also returns the pre-dropout graph embedding."""
+    h = model.node_emb(batch.x)
+    h = model.input_norm(h)
+    h = model.input_dropout(h)
+
+    if model.edge_emb is not None:
+        if batch.edge_attr is None:
+            raise ValueError("Model expects edge_attr but batch.edge_attr is None")
+        e = model.edge_emb(batch.edge_attr)
+    else:
+        e = None
+
+    for gt_layer in model.gt_layers:
+        h, e = gt_layer(x=h, edge_index=batch.edge_index, edge_attr=e)
+
+    z = model.global_pool(h, batch.batch)
+    z = model.readout_norm(z)
+    head_input = model.readout_dropout(z)
+    mu = model.mu_mlp(head_input)
+    log_var = torch.clamp(model.log_var_mlp(head_input), min=-10.0, max=10.0)
+
+    if model.training and not zero_var:
+        std = torch.exp(0.5 * log_var)
+        pred = mu + std * torch.randn_like(std)
+    else:
+        pred = mu
+
+    return pred, log_var, z
+
+
+def _compute_geometry_batch(
+    batch,
+    z: torch.Tensor,
+    geometry: GeometryConfig,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Return geometry loss and sampled primal/latent pair distances."""
+    if not hasattr(batch, "ecfp"):
+        empty = z.new_empty(0)
+        return z.sum() * 0.0, empty, empty, 0
+
+    pair_i, pair_j = _sample_batch_pairs(z.size(0), geometry.num_pairs, z.device)
+    if pair_i.numel() == 0:
+        empty = z.new_empty(0)
+        return z.sum() * 0.0, empty, empty, 0
+
+    d_fp = _tanimoto_distance_for_pairs(batch.ecfp, pair_i, pair_j)
+    d_z = _latent_distance_for_pairs(z, pair_i, pair_j, geometry.latent_metric)
+    loss, num_comparisons = _pair_order_surrogate(
+        d_fp,
+        d_z,
+        temperature=geometry.temperature,
+        tie_epsilon=geometry.tie_epsilon,
+    )
+    return loss, d_fp, d_z, num_comparisons
+
+
+# ---------------------------------------------------------------------------
 # Single-epoch routines
 # ---------------------------------------------------------------------------
 
@@ -121,21 +380,31 @@ def _train_one_epoch(
     optimizer: torch.optim.Optimizer,
     masking_ratio: float,
     device: torch.device,
-) -> float:
-    """Run one training epoch.  Returns mean loss."""
+    *,
+    epoch: int,
+    geometry: GeometryConfig,
+) -> TrainEpochMetrics:
+    """Run one training epoch and return aggregated main/rank/total losses."""
     model.train()
-    total_loss = 0.0
+    total_main_loss = 0.0
+    total_rank_loss = 0.0
+    total_total_loss = 0.0
     n_batches = 0
+    geometry_active = geometry.enabled and epoch >= geometry.warmup_epochs
 
     for batch in loader:
         batch = batch.to(device)
         targets = batch.y  # [B, D]
         valid_mask = batch.y_mask.bool()  # [B, D]
 
-        pred, _log_var = model(
-            batch.x, batch.edge_index, batch.edge_attr,
-            batch=batch.batch, zero_var=True,
-        )
+        if geometry.enabled:
+            pred, _log_var, z = _forward_with_latent(model, batch, zero_var=True)
+        else:
+            pred, _log_var = model(
+                batch.x, batch.edge_index, batch.edge_attr,
+                batch=batch.batch, zero_var=True,
+            )
+            z = None
 
         # Random 15% mask ∩ validity mask
         rand_mask = (torch.rand_like(targets) < masking_ratio).bool()
@@ -148,17 +417,28 @@ def _train_one_epoch(
         if final_mask.sum() == 0:
             continue  # skip batch if no valid positions at all
 
-        loss = F.mse_loss(pred[final_mask], targets[final_mask])
+        main_loss = F.mse_loss(pred[final_mask], targets[final_mask])
+        rank_loss = main_loss.new_zeros(())
+        if geometry_active and z is not None:
+            rank_loss, _d_fp, _d_z, _num_comparisons = _compute_geometry_batch(batch, z, geometry)
+        total_loss = main_loss + geometry.weight * rank_loss
 
         optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
-        total_loss += loss.item()
+        total_main_loss += main_loss.item()
+        total_rank_loss += rank_loss.item()
+        total_total_loss += total_loss.item()
         n_batches += 1
 
-    return total_loss / max(n_batches, 1)
+    denom = max(n_batches, 1)
+    return TrainEpochMetrics(
+        main_loss=total_main_loss / denom,
+        rank_loss=total_rank_loss / denom,
+        total_loss=total_total_loss / denom,
+    )
 
 
 @torch.no_grad()
@@ -166,21 +446,37 @@ def _validate(
     model: torch.nn.Module,
     loader,
     device: torch.device,
-) -> Tuple[float, float]:
-    """Validate.  Returns (mean_mse_loss, rmse) on valid positions (no random mask)."""
+    *,
+    geometry: GeometryConfig,
+) -> ValidationMetrics:
+    """Validate on valid positions and optionally track geometry metrics."""
     model.eval()
     total_se = 0.0
     total_count = 0
+    rank_losses: List[float] = []
+    spearmans: List[float] = []
+    kendalls: List[float] = []
 
     for batch in loader:
         batch = batch.to(device)
         targets = batch.y
         valid_mask = batch.y_mask.bool()
 
-        pred, _ = model(
-            batch.x, batch.edge_index, batch.edge_attr,
-            batch=batch.batch, zero_var=True,
-        )
+        if geometry.enabled:
+            pred, _log_var, z = _forward_with_latent(model, batch, zero_var=True)
+            rank_loss, d_fp, d_z, _num_comparisons = _compute_geometry_batch(batch, z, geometry)
+            rank_losses.append(rank_loss.item())
+            if geometry.log_rank_metrics:
+                spearman, kendall = _pair_rank_metrics(d_fp, d_z)
+                if math.isfinite(spearman):
+                    spearmans.append(spearman)
+                if math.isfinite(kendall):
+                    kendalls.append(kendall)
+        else:
+            pred, _ = model(
+                batch.x, batch.edge_index, batch.edge_attr,
+                batch=batch.batch, zero_var=True,
+            )
 
         if valid_mask.sum() == 0:
             continue
@@ -191,7 +487,13 @@ def _validate(
 
     mse = total_se / max(total_count, 1)
     rmse = math.sqrt(mse)
-    return mse, rmse
+    return ValidationMetrics(
+        loss=mse,
+        rmse=rmse,
+        rank_loss=float(np.mean(rank_losses)) if rank_losses else math.nan,
+        spearman=float(np.mean(spearmans)) if spearmans else math.nan,
+        kendall=float(np.mean(kendalls)) if kendalls else math.nan,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +504,7 @@ def _build_pyg_dataset(
     smiles_list: List[str],
     descriptor_values: np.ndarray,
     validity_mask: np.ndarray,
+    fingerprint_bits: Optional[np.ndarray] = None,
 ) -> list:
     """Build PyG Data objects with graph features + descriptor targets.
 
@@ -221,6 +524,8 @@ def _build_pyg_dataset(
     for i, data in enumerate(data_list):
         data.y = torch.tensor(descriptor_values[i], dtype=torch.float32).unsqueeze(0)
         data.y_mask = torch.tensor(validity_mask[i], dtype=torch.float32).unsqueeze(0)
+        if fingerprint_bits is not None:
+            data.ecfp = torch.tensor(fingerprint_bits[i], dtype=torch.bool).unsqueeze(0)
 
     return data_list
 
@@ -233,6 +538,86 @@ def _smiles_cache_key(smiles_list: List[str]) -> str:
     """Return a 16-char hex SHA-256 hash of the SMILES list (order-sensitive)."""
     h = hashlib.sha256("\n".join(smiles_list).encode())
     return h.hexdigest()[:16]
+
+
+def _fingerprint_cache_path(
+    output_dir: Path,
+    cache_key: str,
+    geometry: GeometryConfig,
+) -> Path:
+    """Return the fingerprint cache path for the current geometry settings."""
+    return output_dir / (
+        f"ecfp_r{geometry.fp_radius}_b{geometry.fp_bits}_{cache_key}.npz"
+    )
+
+
+def _compute_ecfp_fingerprints(
+    smiles_list: List[str],
+    *,
+    radius: int,
+    fp_bits: int,
+) -> np.ndarray:
+    """Compute Morgan/ECFP bit vectors for a list of SMILES."""
+    fps = np.zeros((len(smiles_list), fp_bits), dtype=np.bool_)
+    for idx, smiles in enumerate(smiles_list):
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError(f"Could not parse SMILES for fingerprinting: {smiles!r}")
+        bit_vect = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=fp_bits)
+        fp_array = np.zeros((fp_bits,), dtype=np.int8)
+        DataStructs.ConvertToNumpyArray(bit_vect, fp_array)
+        fps[idx] = fp_array.astype(np.bool_)
+    return fps
+
+
+def _load_or_compute_fingerprints(
+    output_dir: Path,
+    smiles_list: List[str],
+    geometry: GeometryConfig,
+) -> np.ndarray:
+    """Load cached ECFP bits or compute them from expanded isoform SMILES."""
+    cache_key = _smiles_cache_key(smiles_list)
+    cache_path = _fingerprint_cache_path(output_dir, cache_key, geometry)
+
+    if cache_path.exists():
+        logger.info("Loading cached ECFP bits from %s", cache_path.name)
+        cached = np.load(cache_path, allow_pickle=False)
+        return cached["bits"].astype(np.bool_, copy=False)
+
+    logger.info(
+        "Computing ECFP fingerprints for %d molecules (radius=%d, bits=%d) …",
+        len(smiles_list),
+        geometry.fp_radius,
+        geometry.fp_bits,
+    )
+    fp_bits = _compute_ecfp_fingerprints(
+        smiles_list,
+        radius=geometry.fp_radius,
+        fp_bits=geometry.fp_bits,
+    )
+    np.savez(cache_path, bits=fp_bits)
+    logger.info("Saved fingerprint cache to %s", cache_path.name)
+    return fp_bits
+
+
+def _prepare_metrics_file(metrics_path: Path, fieldnames: List[str]) -> None:
+    """Upgrade an existing metrics.csv to the current header when resuming."""
+    if not metrics_path.exists():
+        return
+
+    with open(metrics_path, newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        existing_fieldnames = reader.fieldnames or []
+
+    if existing_fieldnames == fieldnames:
+        return
+
+    with open(metrics_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
 def _expand_smiles_within_split(
@@ -426,6 +811,15 @@ def pretrain(
     num_descriptors = desc_values.shape[1]
     logger.info("Descriptor matrix: %d molecules × %d descriptors", desc_values.shape[0], num_descriptors)
 
+    fp_bits = None
+    if config.geometry.enabled:
+        fp_bits = _load_or_compute_fingerprints(output_dir, smiles_list, config.geometry)
+        logger.info(
+            "Fingerprint matrix: %d molecules × %d bits",
+            fp_bits.shape[0],
+            fp_bits.shape[1],
+        )
+
     # ------------------------------------------------------------------
     # 5. Fit scaler on TRAIN only
     # ------------------------------------------------------------------
@@ -444,13 +838,32 @@ def pretrain(
     train_smiles = [smiles_list[i] for i in train_idx]
     val_smiles = [smiles_list[i] for i in val_idx]
 
-    train_data = _build_pyg_dataset(train_smiles, desc_values[train_idx], desc_valid[train_idx])
-    val_data = _build_pyg_dataset(val_smiles, desc_values[val_idx], desc_valid[val_idx])
+    train_fp = fp_bits[train_idx] if fp_bits is not None else None
+    val_fp = fp_bits[val_idx] if fp_bits is not None else None
+
+    train_data = _build_pyg_dataset(
+        train_smiles,
+        desc_values[train_idx],
+        desc_valid[train_idx],
+        fingerprint_bits=train_fp,
+    )
+    val_data = _build_pyg_dataset(
+        val_smiles,
+        desc_values[val_idx],
+        desc_valid[val_idx],
+        fingerprint_bits=val_fp,
+    )
 
     test_data = None
     if test_idx is not None:
         test_smiles = [smiles_list[i] for i in test_idx]
-        test_data = _build_pyg_dataset(test_smiles, desc_values[test_idx], desc_valid[test_idx])
+        test_fp = fp_bits[test_idx] if fp_bits is not None else None
+        test_data = _build_pyg_dataset(
+            test_smiles,
+            desc_values[test_idx],
+            desc_valid[test_idx],
+            fingerprint_bits=test_fp,
+        )
 
     train_loader = make_loader(train_data, config.batch_size, shuffle=True, num_workers=config.num_workers)
     val_loader = make_loader(val_data, config.batch_size, shuffle=False, num_workers=config.num_workers)
@@ -462,7 +875,6 @@ def pretrain(
     from gt_pyg.data import get_atom_feature_dim, get_bond_feature_dim
 
     mc = config.model
-    import inspect
     gt_params = inspect.signature(GraphTransformerNet.__init__).parameters
     model_kwargs = dict(
         node_dim_in=get_atom_feature_dim(),
@@ -537,29 +949,73 @@ def pretrain(
 
     epoch = start_epoch
     csv_mode = "a" if resume_from is not None and metrics_path.exists() else "w"
+    if csv_mode == "a":
+        _prepare_metrics_file(metrics_path, METRICS_FIELDNAMES)
+
     with open(metrics_path, csv_mode, newline="") as metrics_file:
-        metrics_writer = csv.writer(metrics_file)
+        metrics_writer = csv.DictWriter(metrics_file, fieldnames=METRICS_FIELDNAMES)
         if csv_mode == "w":
-            metrics_writer.writerow(["epoch", "train_loss", "val_loss", "val_rmse", "learning_rate", "elapsed_seconds"])
+            metrics_writer.writeheader()
 
         for epoch in range(start_epoch, config.max_epochs):
             lr = scheduler.get_last_lr()[0]
 
-            train_loss = _train_one_epoch(model, train_loader, optimizer, config.masking_ratio, device)
-            val_loss, val_rmse = _validate(model, val_loader, device)
+            train_metrics = _train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                config.masking_ratio,
+                device,
+                epoch=epoch,
+                geometry=config.geometry,
+            )
+            val_metrics = _validate(
+                model,
+                val_loader,
+                device,
+                geometry=config.geometry,
+            )
 
             elapsed = time.time() - start_time
-            metrics_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_rmse:.6f}", f"{lr:.2e}", f"{elapsed:.1f}"])
+            metrics_writer.writerow({
+                "epoch": epoch,
+                "train_loss": f"{train_metrics.main_loss:.6f}",
+                "val_loss": f"{val_metrics.loss:.6f}",
+                "val_rmse": f"{val_metrics.rmse:.6f}",
+                "learning_rate": f"{lr:.2e}",
+                "elapsed_seconds": f"{elapsed:.1f}",
+                "train_main_loss": f"{train_metrics.main_loss:.6f}",
+                "train_rank_loss": f"{train_metrics.rank_loss:.6f}",
+                "train_total_loss": f"{train_metrics.total_loss:.6f}",
+                "val_rank_loss": f"{val_metrics.rank_loss:.6f}",
+                "val_spearman": f"{val_metrics.spearman:.6f}",
+                "val_kendall": f"{val_metrics.kendall:.6f}",
+            })
             metrics_file.flush()
 
             logger.info(
-                "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  lr=%.2e",
-                epoch + 1, config.max_epochs, train_loss, val_loss, val_rmse, lr,
+                "Epoch %3d/%d — train_loss=%.4f  train_rank=%.4f  train_total=%.4f  "
+                "val_loss=%.4f  val_rmse=%.4f  val_rank=%.4f  lr=%.2e",
+                epoch + 1,
+                config.max_epochs,
+                train_metrics.main_loss,
+                train_metrics.rank_loss,
+                train_metrics.total_loss,
+                val_metrics.loss,
+                val_metrics.rmse,
+                val_metrics.rank_loss,
+                lr,
             )
+            if math.isfinite(val_metrics.spearman) or math.isfinite(val_metrics.kendall):
+                logger.info(
+                    "           geometry metrics — val_spearman=%.4f  val_kendall=%.4f",
+                    val_metrics.spearman,
+                    val_metrics.kendall,
+                )
 
             # Early stopping
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_metrics.loss < best_val_loss:
+                best_val_loss = val_metrics.loss
                 best_epoch = epoch
                 patience_counter = 0
 
@@ -615,8 +1071,8 @@ def pretrain(
         # Load best checkpoint for test evaluation
         model.load_weights(best_ckpt_path, map_location=device)
 
-        test_mse, test_rmse = _validate(model, test_loader, device)
-        logger.info("Test RMSE (best model): %.4f", test_rmse)
+        test_metrics = _validate(model, test_loader, device, geometry=config.geometry)
+        logger.info("Test RMSE (best model): %.4f", test_metrics.rmse)
 
     # ------------------------------------------------------------------
     # 13. Generate HTML report

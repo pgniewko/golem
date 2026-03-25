@@ -27,6 +27,15 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+OPTIONAL_METRIC_FIELDS = [
+    "train_main_loss",
+    "train_rank_loss",
+    "train_total_loss",
+    "val_rank_loss",
+    "val_spearman",
+    "val_kendall",
+]
+
 
 # ---------------------------------------------------------------------------
 # Data loading helpers
@@ -38,15 +47,29 @@ def _load_metrics(metrics_path: Path) -> List[Dict[str, Any]]:
     with open(metrics_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            rows.append({
+            parsed = {
                 "epoch": int(row["epoch"]),
                 "train_loss": float(row["train_loss"]),
                 "val_loss": float(row["val_loss"]),
                 "val_rmse": float(row["val_rmse"]),
                 "learning_rate": float(row["learning_rate"]),
                 "elapsed_seconds": float(row["elapsed_seconds"]),
-            })
+            }
+            for field in OPTIONAL_METRIC_FIELDS:
+                parsed[field] = _parse_optional_float(row, field)
+            rows.append(parsed)
     return rows
+
+
+def _parse_optional_float(row: Dict[str, str], key: str) -> float:
+    """Parse an optional float field from a CSV row."""
+    raw = row.get(key, "")
+    if raw in ("", None):
+        return math.nan
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return math.nan
 
 
 def _load_config(config_path: Path) -> Dict[str, Any]:
@@ -87,6 +110,8 @@ def _compute_summary(
         "best_epoch": best_row["epoch"],
         "best_val_loss": best_row["val_loss"],
         "best_val_rmse": best_row["val_rmse"],
+        "best_val_spearman": _best_optional_metric(metrics, "val_spearman"),
+        "best_val_kendall": _best_optional_metric(metrics, "val_kendall"),
         "total_epochs": len(metrics),
         "max_epochs": config.get("max_epochs", "?"),
         "elapsed": _fmt_elapsed(last_row["elapsed_seconds"]),
@@ -104,6 +129,34 @@ def _compute_summary(
         "num_gt_layers": config.get("model", {}).get("num_gt_layers", "?"),
         "num_heads": config.get("model", {}).get("num_heads", "?"),
     }
+
+
+def _best_optional_metric(metrics: List[Dict[str, Any]], key: str) -> float:
+    """Return the best finite value for an optional metric or NaN."""
+    values = [row.get(key, math.nan) for row in metrics]
+    finite = [value for value in values if math.isfinite(value)]
+    return max(finite) if finite else math.nan
+
+
+def _has_geometry_metrics(metrics: List[Dict[str, Any]]) -> bool:
+    """Return True if any geometry-specific metric is finite."""
+    geometry_fields = [
+        "val_rank_loss",
+        "val_spearman",
+        "val_kendall",
+    ]
+    return any(
+        math.isfinite(row.get(field, math.nan))
+        for row in metrics
+        for field in geometry_fields
+    )
+
+
+def _format_metric(value: float, precision: int = 6) -> str:
+    """Format a metric value for HTML tables."""
+    if not math.isfinite(value):
+        return "n/a"
+    return f"{value:.{precision}f}"
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +254,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="value">GT-{{NUM_GT_LAYERS}}L</div>
     <div class="detail">{{HIDDEN_DIM}}d / {{NUM_HEADS}}h</div>
   </div>
+  {{GEOMETRY_CARDS}}
 </div>
 
 <!-- Charts -->
@@ -221,6 +275,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h3>Train vs Val Loss Gap</h3>
     <canvas id="gapChart"></canvas>
   </div>
+  {{GEOMETRY_CHARTS}}
 </div>
 
 <!-- Config -->
@@ -239,6 +294,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       <tr>
         <th>Epoch</th><th>Train Loss</th><th>Val Loss</th>
         <th>Val RMSE</th><th>LR</th><th>Elapsed</th>
+        {{TABLE_EXTRA_HEADERS}}
       </tr>
     </thead>
     <tbody>
@@ -256,6 +312,7 @@ const valLoss = {{VAL_LOSS_JSON}};
 const valRmse = {{VAL_RMSE_JSON}};
 const lr = {{LR_JSON}};
 const gap = trainLoss.map((t, i) => t - valLoss[i]);
+{{GEOMETRY_JSON_DECLS}}
 
 const gridColor = 'rgba(148,163,184,0.1)';
 const tickColor = '#94a3b8';
@@ -316,6 +373,7 @@ new Chart(document.getElementById('gapChart'), {
   },
   options: makeOpts('Loss Gap'),
 });
+{{GEOMETRY_CHART_SCRIPTS}}
 </script>
 </body>
 </html>
@@ -358,6 +416,8 @@ def generate_report(
         config = _load_config(config_path)
 
     summary = _compute_summary(metrics, config)
+    geometry_enabled = bool(config.get("geometry", {}).get("enabled", False))
+    has_geometry_metrics = geometry_enabled or _has_geometry_metrics(metrics)
 
     # Destination path
     if html_path is None:
@@ -372,6 +432,89 @@ def generate_report(
     val_loss_json = json.dumps([r["val_loss"] for r in metrics])
     val_rmse_json = json.dumps([r["val_rmse"] for r in metrics])
     lr_json = json.dumps([r["learning_rate"] for r in metrics])
+    geometry_json_decls = ""
+    geometry_chart_scripts = ""
+    geometry_cards = ""
+    geometry_charts = ""
+    table_extra_headers = ""
+
+    if has_geometry_metrics:
+        train_main_json = json.dumps([r["train_main_loss"] for r in metrics])
+        train_rank_json = json.dumps([r["train_rank_loss"] for r in metrics])
+        train_total_json = json.dumps([r["train_total_loss"] for r in metrics])
+        val_rank_json = json.dumps([r["val_rank_loss"] for r in metrics])
+        val_spearman_json = json.dumps([r["val_spearman"] for r in metrics])
+        val_kendall_json = json.dumps([r["val_kendall"] for r in metrics])
+        geometry_json_decls = (
+            f"const trainMainLoss = {train_main_json};\n"
+            f"const trainRankLoss = {train_rank_json};\n"
+            f"const trainTotalLoss = {train_total_json};\n"
+            f"const valRankLoss = {val_rank_json};\n"
+            f"const valSpearman = {val_spearman_json};\n"
+            f"const valKendall = {val_kendall_json};"
+        )
+        geometry_chart_scripts = """
+new Chart(document.getElementById('geometryLossChart'), {
+  type: 'line',
+  data: {
+    labels: epochs,
+    datasets: [
+      { label: 'Train Main Loss',  data: trainMainLoss,  borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,0.1)', tension: 0.3, pointRadius: 2 },
+      { label: 'Train Rank Loss',  data: trainRankLoss,  borderColor: '#f97316', backgroundColor: 'rgba(249,115,22,0.1)', tension: 0.3, pointRadius: 2 },
+      { label: 'Train Total Loss', data: trainTotalLoss, borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)', tension: 0.3, pointRadius: 2 },
+    ],
+  },
+  options: makeOpts('Train Loss Components'),
+});
+
+new Chart(document.getElementById('geometryMetricChart'), {
+  type: 'line',
+  data: {
+    labels: epochs,
+    datasets: [
+      { label: 'Val Rank Loss', data: valRankLoss, borderColor: '#facc15', backgroundColor: 'rgba(250,204,21,0.1)', tension: 0.3, pointRadius: 2, yAxisID: 'y' },
+      { label: 'Val Spearman',  data: valSpearman, borderColor: '#c084fc', backgroundColor: 'rgba(192,132,252,0.1)', tension: 0.3, pointRadius: 2, yAxisID: 'y1' },
+      { label: 'Val Kendall',   data: valKendall, borderColor: '#fb7185', backgroundColor: 'rgba(251,113,133,0.1)', tension: 0.3, pointRadius: 2, yAxisID: 'y1' },
+    ],
+  },
+  options: {
+    responsive: true,
+    interaction: { mode: 'index', intersect: false },
+    plugins: { legend: { labels: { color: tickColor, usePointStyle: true, pointStyle: 'circle' } } },
+    scales: {
+      x: { title: { display: true, text: 'Epoch', color: tickColor }, ticks: { color: tickColor }, grid: { color: gridColor } },
+      y: { title: { display: true, text: 'Val Rank Loss', color: tickColor }, ticks: { color: tickColor }, grid: { color: gridColor } },
+      y1: { position: 'right', title: { display: true, text: 'Rank Correlation', color: tickColor }, ticks: { color: tickColor }, grid: { drawOnChartArea: false } },
+    },
+  },
+});
+"""
+        geometry_cards = (
+            '<div class="card info">'
+            '<div class="label">Best Val Spearman</div>'
+            f'<div class="value">{_format_metric(summary["best_val_spearman"], precision=4)}</div>'
+            '<div class="detail">Pair-distance rank agreement</div>'
+            '</div>\n'
+            '  <div class="card info">'
+            '<div class="label">Best Val Kendall</div>'
+            f'<div class="value">{_format_metric(summary["best_val_kendall"], precision=4)}</div>'
+            '<div class="detail">Pair-distance rank agreement</div>'
+            '</div>'
+        )
+        geometry_charts = """
+  <div class="chart-card">
+    <h3>Geometry Loss Components</h3>
+    <canvas id="geometryLossChart"></canvas>
+  </div>
+  <div class="chart-card">
+    <h3>Geometry Validation Metrics</h3>
+    <canvas id="geometryMetricChart"></canvas>
+  </div>
+"""
+        table_extra_headers = (
+            "<th>Train Main</th><th>Train Rank</th><th>Train Total</th>"
+            "<th>Val Rank</th><th>Val Spearman</th><th>Val Kendall</th>"
+        )
 
     # Build config items HTML
     flat_config = _flatten_config(config)
@@ -386,6 +529,16 @@ def generate_report(
     table_rows = []
     for r in metrics:
         cls = ' class="best-row"' if r["epoch"] == best_epoch else ""
+        extra_cells = ""
+        if has_geometry_metrics:
+            extra_cells = (
+                f"<td>{_format_metric(r['train_main_loss'])}</td>"
+                f"<td>{_format_metric(r['train_rank_loss'])}</td>"
+                f"<td>{_format_metric(r['train_total_loss'])}</td>"
+                f"<td>{_format_metric(r['val_rank_loss'])}</td>"
+                f"<td>{_format_metric(r['val_spearman'])}</td>"
+                f"<td>{_format_metric(r['val_kendall'])}</td>"
+            )
         table_rows.append(
             f"<tr{cls}>"
             f"<td>{r['epoch']}</td>"
@@ -394,6 +547,7 @@ def generate_report(
             f"<td>{r['val_rmse']:.6f}</td>"
             f"<td>{r['learning_rate']:.2e}</td>"
             f"<td>{_fmt_elapsed(r['elapsed_seconds'])}</td>"
+            f"{extra_cells}"
             f"</tr>"
         )
     table_rows_html = "\n      ".join(table_rows)
@@ -411,6 +565,9 @@ def generate_report(
         "{{HIDDEN_DIM}}": str(summary["hidden_dim"]),
         "{{NUM_GT_LAYERS}}": str(summary["num_gt_layers"]),
         "{{NUM_HEADS}}": str(summary["num_heads"]),
+        "{{GEOMETRY_CARDS}}": geometry_cards,
+        "{{GEOMETRY_CHARTS}}": geometry_charts,
+        "{{TABLE_EXTRA_HEADERS}}": table_extra_headers,
         "{{CONFIG_ITEMS}}": config_items,
         "{{TABLE_ROWS}}": table_rows_html,
         "{{EPOCHS_JSON}}": epochs_json,
@@ -418,6 +575,8 @@ def generate_report(
         "{{VAL_LOSS_JSON}}": val_loss_json,
         "{{VAL_RMSE_JSON}}": val_rmse_json,
         "{{LR_JSON}}": lr_json,
+        "{{GEOMETRY_JSON_DECLS}}": geometry_json_decls,
+        "{{GEOMETRY_CHART_SCRIPTS}}": geometry_chart_scripts,
     }
     for placeholder, value in replacements.items():
         html = html.replace(placeholder, value)

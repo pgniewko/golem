@@ -33,3 +33,15 @@ isoforms:
   protonation: { enabled: true, ph_range: [6.4, 8.4], max_protomers: 10 }
   neutralization: { enabled: true }
   deduplication: true
+
+geometry:
+  enabled: false
+  weight: 0.01
+  fp_bits: 2048
+  fp_radius: 2
+  num_pairs: 128
+  latent_metric: cosine
+  temperature: 0.1
+  tie_epsilon: 0.02
+  warmup_epochs: 5
+  log_rank_metrics: true

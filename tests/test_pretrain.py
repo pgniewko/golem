@@ -1,21 +1,35 @@
 """Tests for golem.pretrain and golem.config."""
 
+import csv
+import math
 import numpy as np
 import pytest
 import torch
 
 from golem.config import (
+    GeometryConfig,
     PretrainConfig,
     load_config,
 )
 from golem.descriptors import NaNAwareStandardScaler
 from golem.pretrain import (
+    METRICS_FIELDNAMES,
+    _build_pyg_dataset,
     _checkpoint_library_versions,
+    _compute_ecfp_fingerprints,
+    _fingerprint_cache_path,
+    _latent_distance_for_pairs,
     _make_warmup_cosine_scheduler,
+    _load_or_compute_fingerprints,
+    _pair_order_surrogate,
     _prepare_split_smiles,
+    _prepare_metrics_file,
+    _sample_batch_pairs,
     _save_checkpoint,
     _smiles_cache_key,
+    _tanimoto_distance_for_pairs,
 )
+from golem.report import generate_report
 from golem.utils import load_smiles, seed_everything, split_data
 
 
@@ -29,6 +43,8 @@ class TestConfig:
         assert cfg.batch_size == 128
         assert cfg.model.hidden_dim == 128
         assert cfg.isoforms.enabled is True
+        assert cfg.geometry.enabled is False
+        assert cfg.geometry.latent_metric == "cosine"
 
     def test_load_config_defaults_only(self):
         """load_config with no args should return defaults."""
@@ -59,6 +75,22 @@ class TestConfig:
         yaml_file.write_text("pretrain:\n  max_epochs: 7\n")
         cfg = load_config(yaml_path=str(yaml_file), max_epochs=3)
         assert cfg.max_epochs == 3
+
+    def test_load_config_geometry_block(self, tmp_path):
+        """Geometry config should round-trip from YAML."""
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text(
+            "geometry:\n"
+            "  enabled: true\n"
+            "  weight: 0.05\n"
+            "  num_pairs: 32\n"
+            "  latent_metric: l2_norm\n"
+        )
+        cfg = load_config(yaml_path=str(yaml_file))
+        assert cfg.geometry.enabled is True
+        assert cfg.geometry.weight == pytest.approx(0.05)
+        assert cfg.geometry.num_pairs == 32
+        assert cfg.geometry.latent_metric == "l2_norm"
 
 
 class TestSeedEverything:
@@ -196,6 +228,108 @@ class TestSmilesCacheKey:
         assert cached["names"].tolist() == names
 
 
+class TestGeometryHelpers:
+    """Tests for geometry regularizer helpers."""
+
+    def test_sample_batch_pairs_are_unique_and_unordered(self):
+        pair_i, pair_j = _sample_batch_pairs(batch_size=4, num_pairs=10, device=torch.device("cpu"))
+        pairs = list(zip(pair_i.tolist(), pair_j.tolist(), strict=False))
+        assert len(pairs) == 6
+        assert len(set(pairs)) == len(pairs)
+        assert all(i < j for i, j in pairs)
+
+    def test_sample_batch_pairs_handles_small_batches(self):
+        pair_i, pair_j = _sample_batch_pairs(batch_size=1, num_pairs=8, device=torch.device("cpu"))
+        assert pair_i.numel() == 0
+        assert pair_j.numel() == 0
+
+    def test_tanimoto_distance_for_pairs(self):
+        fp_bits = torch.tensor(
+            [
+                [1, 1, 0, 0],
+                [1, 0, 1, 0],
+                [0, 0, 1, 1],
+            ],
+            dtype=torch.bool,
+        )
+        pair_i = torch.tensor([0, 0], dtype=torch.long)
+        pair_j = torch.tensor([1, 2], dtype=torch.long)
+        distances = _tanimoto_distance_for_pairs(fp_bits, pair_i, pair_j)
+        assert distances[0].item() == pytest.approx(2.0 / 3.0)
+        assert distances[1].item() == pytest.approx(1.0)
+
+    def test_latent_distance_for_pairs_cosine(self):
+        z = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 0.0],
+            ]
+        )
+        pair_i = torch.tensor([0, 0], dtype=torch.long)
+        pair_j = torch.tensor([1, 2], dtype=torch.long)
+        distances = _latent_distance_for_pairs(z, pair_i, pair_j, metric="cosine")
+        assert distances.tolist() == pytest.approx([1.0, 0.0])
+
+    def test_pair_order_surrogate_ignores_ties(self):
+        d_fp = torch.tensor([0.10, 0.11], dtype=torch.float32)
+        d_z = torch.tensor([0.20, 0.40], dtype=torch.float32, requires_grad=True)
+        loss, comparisons = _pair_order_surrogate(d_fp, d_z, temperature=0.1, tie_epsilon=0.02)
+        assert comparisons == 0
+        assert loss.item() == pytest.approx(0.0)
+
+    def test_pair_order_surrogate_backpropagates(self):
+        d_fp = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float32)
+        d_z = torch.tensor([0.4, 0.2, 0.8], dtype=torch.float32, requires_grad=True)
+        loss, comparisons = _pair_order_surrogate(d_fp, d_z, temperature=0.1, tie_epsilon=0.01)
+        assert comparisons == 3
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert d_z.grad is not None
+        assert torch.isfinite(d_z.grad).all()
+
+
+class TestFingerprintPipeline:
+    """Tests for ECFP computation and attachment."""
+
+    def test_compute_ecfp_fingerprints_shape_and_dtype(self):
+        fps = _compute_ecfp_fingerprints(["CCO", "CCO", "c1ccccc1"], radius=2, fp_bits=128)
+        assert fps.shape == (3, 128)
+        assert fps.dtype == np.bool_
+        np.testing.assert_array_equal(fps[0], fps[1])
+
+    def test_load_or_compute_fingerprints_roundtrip(self, tmp_path):
+        geometry = GeometryConfig(enabled=True, fp_bits=128, fp_radius=2)
+        smiles = ["CCO", "c1ccccc1"]
+        fps_first = _load_or_compute_fingerprints(tmp_path, smiles, geometry)
+        cache_path = _fingerprint_cache_path(tmp_path, _smiles_cache_key(smiles), geometry)
+        assert cache_path.exists()
+        fps_second = _load_or_compute_fingerprints(tmp_path, smiles, geometry)
+        np.testing.assert_array_equal(fps_first, fps_second)
+
+    def test_build_pyg_dataset_attaches_ecfp_bits(self):
+        descriptor_values = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        validity_mask = np.array([[True, False], [True, True]], dtype=np.bool_)
+        fingerprint_bits = np.array(
+            [
+                [True, False, True, False],
+                [False, True, False, True],
+            ],
+            dtype=np.bool_,
+        )
+        dataset = _build_pyg_dataset(
+            ["CCO", "c1ccccc1"],
+            descriptor_values,
+            validity_mask,
+            fingerprint_bits=fingerprint_bits,
+        )
+        assert len(dataset) == 2
+        assert hasattr(dataset[0], "ecfp")
+        assert dataset[0].ecfp.dtype == torch.bool
+        assert tuple(dataset[0].ecfp.shape) == (1, 4)
+        assert dataset[1].ecfp.squeeze(0).tolist() == [False, True, False, True]
+
+
 class TestParentLevelSplit:
     """Split leakage prevention when isoforms are enabled."""
 
@@ -298,3 +432,78 @@ class TestCheckpointMetadata:
             "golem": "1.2.3",
             "gt_pyg": "4.5.6",
         }
+
+
+class TestMetricsAndReport:
+    """Tests for metrics CSV compatibility and report generation."""
+
+    def test_prepare_metrics_file_upgrades_legacy_header(self, tmp_path):
+        metrics_path = tmp_path / "metrics.csv"
+        with open(metrics_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["epoch", "train_loss", "val_loss", "val_rmse", "learning_rate", "elapsed_seconds"])
+            writer.writerow([0, "1.000000", "2.000000", "1.414214", "1.00e-04", "3.0"])
+
+        _prepare_metrics_file(metrics_path, METRICS_FIELDNAMES)
+
+        with open(metrics_path, newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        assert reader.fieldnames == METRICS_FIELDNAMES
+        assert len(rows) == 1
+        assert rows[0]["train_loss"] == "1.000000"
+        assert rows[0]["val_rank_loss"] == ""
+
+    def test_generate_report_supports_legacy_metrics_csv(self, tmp_path):
+        metrics_path = tmp_path / "metrics.csv"
+        config_path = tmp_path / "resolved_config.yaml"
+        metrics_path.write_text(
+            "epoch,train_loss,val_loss,val_rmse,learning_rate,elapsed_seconds\n"
+            "0,1.000000,2.000000,1.414214,1.00e-04,3.0\n"
+        )
+        config_path.write_text("max_epochs: 1\nmodel:\n  hidden_dim: 64\n  num_gt_layers: 2\n  num_heads: 4\n")
+
+        html_path = generate_report(tmp_path)
+        html = html_path.read_text()
+
+        assert html_path.exists()
+        assert "Geometry Loss Components" not in html
+        assert "Best Val Loss" in html
+
+    def test_generate_report_includes_geometry_sections(self, tmp_path):
+        metrics_path = tmp_path / "metrics.csv"
+        config_path = tmp_path / "resolved_config.yaml"
+        with open(metrics_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=METRICS_FIELDNAMES)
+            writer.writeheader()
+            writer.writerow({
+                "epoch": 0,
+                "train_loss": "1.000000",
+                "val_loss": "2.000000",
+                "val_rmse": "1.414214",
+                "learning_rate": "1.00e-04",
+                "elapsed_seconds": "3.0",
+                "train_main_loss": "1.000000",
+                "train_rank_loss": "0.050000",
+                "train_total_loss": "1.000500",
+                "val_rank_loss": "0.060000",
+                "val_spearman": "0.700000",
+                "val_kendall": "0.500000",
+            })
+        config_path.write_text(
+            "max_epochs: 1\n"
+            "model:\n"
+            "  hidden_dim: 64\n"
+            "  num_gt_layers: 2\n"
+            "  num_heads: 4\n"
+            "geometry:\n"
+            "  enabled: true\n"
+        )
+
+        html_path = generate_report(tmp_path)
+        html = html_path.read_text()
+
+        assert "Geometry Loss Components" in html
+        assert "Geometry Validation Metrics" in html
+        assert "Best Val Kendall" in html

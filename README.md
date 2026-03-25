@@ -79,6 +79,18 @@ golem pretrain \
   --output experiments/pretrain
 ```
 
+### Optional geometry regularizer
+
+Pretraining can also add a weak rank-based geometry regularizer that nudges graph-level latent distances to respect ECFP4/Tanimoto distance ordering on the expanded isoforms actually seen by the model. Enable it in YAML via the `geometry` block:
+
+```yaml
+geometry:
+  enabled: true
+  weight: 0.01
+  num_pairs: 128
+  latent_metric: cosine
+```
+
 ### CLI options
 
 | Flag | Description | Default |
@@ -105,7 +117,7 @@ experiments/pretrain/
   resolved_config.yaml      # Full resolved config used for the run
   pretrain_report.html      # HTML dashboard with training curves and metrics (not tracked)
   last_checkpoint.pt        # Last epoch, for resuming (not tracked)
-  metrics.csv               # Per-epoch: train_loss, val_loss, val_rmse, lr (not tracked)
+  metrics.csv               # Per-epoch descriptor losses, validation RMSE, LR, and geometry metrics when enabled (not tracked)
   pretrain.log              # Full log output (not tracked)
 ```
 
@@ -123,6 +135,7 @@ This reads `metrics.csv` and `resolved_config.yaml` from the experiment director
 - Validation RMSE curve
 - Learning rate schedule
 - Train vs val loss gap
+- Geometry loss and rank-agreement charts when the regularizer is enabled
 - Summary cards (best epoch, best val loss, elapsed time, architecture)
 - Epoch-by-epoch table with the best row highlighted
 
