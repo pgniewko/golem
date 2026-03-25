@@ -43,6 +43,21 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint metadata
+# ---------------------------------------------------------------------------
+
+def _checkpoint_library_versions() -> dict[str, str]:
+    """Return library versions recorded in generated checkpoints."""
+    import golem
+    import gt_pyg
+
+    return {
+        "golem": golem.__version__,
+        "gt_pyg": gt_pyg.__version__,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
 
@@ -647,6 +662,7 @@ def _save_checkpoint(
             "descriptor_names": descriptor_names,
             "descriptor_count": num_descriptors,
             "config": asdict(config),
+            "library_versions": _checkpoint_library_versions(),
             "split_indices": {
                 "train": train_idx.tolist(),
                 "val": val_idx.tolist(),

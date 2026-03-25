@@ -8,9 +8,12 @@ from golem.config import (
     PretrainConfig,
     load_config,
 )
+from golem.descriptors import NaNAwareStandardScaler
 from golem.pretrain import (
+    _checkpoint_library_versions,
     _make_warmup_cosine_scheduler,
     _prepare_split_smiles,
+    _save_checkpoint,
     _smiles_cache_key,
 )
 from golem.utils import load_smiles, seed_everything, split_data
@@ -232,3 +235,66 @@ class TestParentLevelSplit:
 
         with pytest.raises(ValueError, match="empty"):
             _prepare_split_smiles(parent_smiles, cfg)
+
+
+class TestCheckpointMetadata:
+    """Checkpoint metadata should include training library versions."""
+
+    def test_checkpoint_library_versions_uses_module_versions(self, monkeypatch):
+        class DummyGtPyg:
+            __version__ = "4.5.6"
+
+        import golem
+        import sys
+
+        monkeypatch.setattr(golem, "__version__", "1.2.3")
+        monkeypatch.setitem(sys.modules, "gt_pyg", DummyGtPyg())
+
+        assert _checkpoint_library_versions() == {
+            "golem": "1.2.3",
+            "gt_pyg": "4.5.6",
+        }
+
+    def test_save_checkpoint_includes_library_versions(self, monkeypatch, tmp_path):
+        class DummyCheckpointModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = torch.nn.Linear(1, 1)
+                self.saved_kwargs = None
+
+            def save_checkpoint(self, **kwargs):
+                self.saved_kwargs = kwargs
+
+        model = DummyCheckpointModel()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scaler = NaNAwareStandardScaler()
+        scaler.fit(
+            np.array([[1.0, 2.0]], dtype=np.float32),
+            np.array([[True, True]], dtype=np.bool_),
+        )
+
+        monkeypatch.setattr(
+            "golem.pretrain._checkpoint_library_versions",
+            lambda: {"golem": "1.2.3", "gt_pyg": "4.5.6"},
+        )
+
+        _save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            path=tmp_path / "checkpoint.pt",
+            epoch=7,
+            best_metric=0.123,
+            config=PretrainConfig(),
+            scaler=scaler,
+            descriptor_names=["d0", "d1"],
+            num_descriptors=2,
+            train_idx=np.array([0, 1]),
+            val_idx=np.array([2]),
+            test_idx=None,
+        )
+
+        assert model.saved_kwargs is not None
+        assert model.saved_kwargs["extra"]["library_versions"] == {
+            "golem": "1.2.3",
+            "gt_pyg": "4.5.6",
+        }
