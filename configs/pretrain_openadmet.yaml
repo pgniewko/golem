@@ -34,6 +34,24 @@ isoforms:
   neutralization: { enabled: true }
   deduplication: true
 
+descriptors:
+  include_2d_targets: true
+  use_3d_targets: false
+  three_d:
+    aggregation: boltz_mean
+    rdkit3d_include_getaway: false
+    electroshape_charge_model: gasteiger
+
+conformers:
+  backend: rdkit
+  n_generate: 32
+  n_keep: 8
+  energy_window_kcal: 10.0
+  prune_rms: 0.75
+  embedding: ETKDGv3
+  optimize: MMFF
+  fallback_optimize: UFF
+
 geometry:
   enabled: false
   weight: 0.01

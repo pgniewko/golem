@@ -1,4 +1,4 @@
-"""Pretraining loop for Graph Transformers on Mordred descriptors.
+"""Pretraining loop for Graph Transformers on molecular descriptor targets.
 
 Uses ``GraphTransformerNet(num_tasks=num_descriptors)`` directly — no wrapper
 model.  The built-in ``mu_mlp`` serves as the descriptor prediction head.
@@ -8,7 +8,7 @@ Pipeline:
 2. Split into train / val / (test) at the parent-molecule level
 3. (Optional) Enumerate isoforms within each split only
 4. Fit ``NaNAwareStandardScaler`` on **train only**
-5. Compute Mordred 2D descriptors + validity masks
+5. Compute descriptor targets + validity masks
 6. Transform all splits + winsorise
 7. Build PyG datasets via ``get_tensor_data``
 8. Train with masked MSE (15% random mask ∩ validity mask)
@@ -35,7 +35,8 @@ from rdkit import Chem
 import torch.nn.functional as F
 import yaml
 from golem.config import GeometryConfig, PretrainConfig
-from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
+from golem.descriptors import NaNAwareStandardScaler
+from golem.descriptors3d import DEFAULT_3D_PACK_ID, compute_descriptor_targets
 from golem.geometry import (
     _compute_geometry_batch,
     _load_or_compute_fingerprints,
@@ -342,6 +343,94 @@ def _smiles_cache_key(smiles_list: List[str]) -> str:
     return h.hexdigest()[:16]
 
 
+def _descriptor_cache_key(smiles_list: List[str], config: PretrainConfig) -> str:
+    """Return a cache key for descriptor targets and their generation settings."""
+    if not config.descriptors.use_3d_targets:
+        return _smiles_cache_key(smiles_list)
+
+    payload = {
+        "smiles": smiles_list,
+        "seed": config.seed,
+        "three_d_pack": DEFAULT_3D_PACK_ID,
+        "descriptors": asdict(config.descriptors),
+        "conformers": asdict(config.conformers),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _filter_molecules_with_no_valid_targets(
+    smiles_list: List[str],
+    descriptor_values: np.ndarray,
+    validity_mask: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: Optional[np.ndarray],
+) -> Tuple[List[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Drop molecules whose target row is entirely invalid and remap splits."""
+    keep_mask = validity_mask.any(axis=1)
+    if keep_mask.all():
+        return (
+            smiles_list,
+            descriptor_values,
+            validity_mask,
+            train_idx,
+            val_idx,
+            test_idx,
+        )
+
+    old_to_new = np.full(len(smiles_list), -1, dtype=np.int64)
+    old_to_new[keep_mask] = np.arange(int(keep_mask.sum()), dtype=np.int64)
+
+    def _remap(split_idx: np.ndarray) -> np.ndarray:
+        kept = split_idx[keep_mask[split_idx]]
+        return old_to_new[kept]
+
+    new_train_idx = _remap(train_idx)
+    new_val_idx = _remap(val_idx)
+    new_test_idx = _remap(test_idx) if test_idx is not None else None
+
+    if new_train_idx.size == 0 or new_val_idx.size == 0:
+        raise ValueError(
+            "Dropping molecules with no valid descriptor targets emptied the train "
+            "or validation split. Enable 2D targets, adjust descriptor settings, "
+            "or use a larger dataset."
+        )
+
+    dropped_total = int((~keep_mask).sum())
+    dropped_train = int(train_idx.size - new_train_idx.size)
+    dropped_val = int(val_idx.size - new_val_idx.size)
+    dropped_test = int(test_idx.size - new_test_idx.size) if test_idx is not None else 0
+    logger.info(
+        "Dropped %d molecules with no valid descriptor targets "
+        "(train=%d, val=%d, test=%d)",
+        dropped_total,
+        dropped_train,
+        dropped_val,
+        dropped_test,
+    )
+
+    if new_test_idx is not None and new_test_idx.size == 0:
+        logger.warning(
+            "All test molecules were dropped because they had no valid descriptor targets"
+        )
+        new_test_idx = None
+
+    filtered_smiles = [
+        smiles
+        for smiles, keep in zip(smiles_list, keep_mask, strict=False)
+        if keep
+    ]
+    return (
+        filtered_smiles,
+        descriptor_values[keep_mask],
+        validity_mask[keep_mask],
+        new_train_idx,
+        new_val_idx,
+        new_test_idx,
+    )
+
+
 def _prepare_metrics_file(metrics_path: Path, fieldnames: List[str]) -> None:
     """Upgrade an existing metrics.csv to the current header when resuming."""
     if not metrics_path.exists():
@@ -533,9 +622,9 @@ def pretrain(
     smiles_list, train_idx, val_idx, test_idx = _prepare_split_smiles(smiles_list, config)
 
     # ------------------------------------------------------------------
-    # 4. Compute Mordred descriptors (with disk cache)
+    # 4. Compute descriptor targets (with disk cache)
     # ------------------------------------------------------------------
-    cache_key = _smiles_cache_key(smiles_list)
+    cache_key = _descriptor_cache_key(smiles_list, config)
     cache_path = output_dir / f"descriptors_{cache_key}.npz"
 
     if cache_path.exists():
@@ -545,10 +634,34 @@ def pretrain(
         desc_valid = cached["valid"]
         descriptor_names = cached["names"].tolist()
     else:
-        logger.info("Computing Mordred descriptors …")
-        desc_values, desc_valid, descriptor_names = compute_mordred_descriptors(smiles_list)
+        logger.info(
+            "Computing descriptor targets (3D enabled=%s) …",
+            config.descriptors.use_3d_targets,
+        )
+        desc_values, desc_valid, descriptor_names = compute_descriptor_targets(
+            smiles_list,
+            config.descriptors,
+            config.conformers,
+            seed=config.seed,
+        )
         np.savez(cache_path, values=desc_values, valid=desc_valid, names=np.array(descriptor_names))
         logger.info("Saved descriptor cache to %s", cache_path.name)
+
+    (
+        smiles_list,
+        desc_values,
+        desc_valid,
+        train_idx,
+        val_idx,
+        test_idx,
+    ) = _filter_molecules_with_no_valid_targets(
+        smiles_list,
+        desc_values,
+        desc_valid,
+        train_idx,
+        val_idx,
+        test_idx,
+    )
 
     num_descriptors = desc_values.shape[1]
     logger.info("Descriptor matrix: %d molecules × %d descriptors", desc_values.shape[0], num_descriptors)

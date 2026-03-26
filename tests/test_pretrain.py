@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from golem.config import (
+    DescriptorConfig,
     GeometryConfig,
     PretrainConfig,
     load_config,
@@ -28,6 +29,8 @@ from golem.pretrain import (
     METRICS_FIELDNAMES,
     _build_pyg_dataset,
     _checkpoint_library_versions,
+    _descriptor_cache_key,
+    _filter_molecules_with_no_valid_targets,
     _make_warmup_cosine_scheduler,
     _prepare_split_smiles,
     _prepare_metrics_file,
@@ -99,6 +102,8 @@ class TestConfig:
         assert cfg.batch_size == 128
         assert cfg.model.hidden_dim == 128
         assert cfg.isoforms.enabled is True
+        assert cfg.descriptors.include_2d_targets is True
+        assert cfg.descriptors.use_3d_targets is False
         assert cfg.geometry.enabled is False
         assert cfg.geometry.latent_metric == "cosine"
 
@@ -147,6 +152,26 @@ class TestConfig:
         assert cfg.geometry.weight == pytest.approx(0.05)
         assert cfg.geometry.num_pairs == 32
         assert cfg.geometry.latent_metric == "l2_norm"
+
+    def test_load_config_descriptors_block(self, tmp_path):
+        """Descriptor config should round-trip from YAML."""
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text(
+            "descriptors:\n"
+            "  include_2d_targets: false\n"
+            "  use_3d_targets: true\n"
+            "  three_d:\n"
+            "    electroshape_charge_model: mmff94\n"
+            "conformers:\n"
+            "  n_generate: 16\n"
+            "  n_keep: 4\n"
+        )
+        cfg = load_config(yaml_path=str(yaml_file))
+        assert cfg.descriptors.include_2d_targets is False
+        assert cfg.descriptors.use_3d_targets is True
+        assert cfg.descriptors.three_d.electroshape_charge_model == "mmff94"
+        assert cfg.conformers.n_generate == 16
+        assert cfg.conformers.n_keep == 4
 
 
 class TestSeedEverything:
@@ -282,6 +307,31 @@ class TestSmilesCacheKey:
         np.testing.assert_array_equal(cached["values"], values)
         np.testing.assert_array_equal(cached["valid"], valid)
         assert cached["names"].tolist() == names
+
+    def test_descriptor_cache_key_changes_with_3d_settings(self):
+        smiles = ["CCO", "c1ccccc1"]
+        cfg_2d = PretrainConfig()
+        cfg_3d = PretrainConfig(
+            descriptors=DescriptorConfig(use_3d_targets=True),
+        )
+        cfg_3d_conformers = PretrainConfig(
+            descriptors=DescriptorConfig(use_3d_targets=True),
+        )
+        cfg_3d_conformers.conformers.n_keep = 16
+        cfg_3d_seed = PretrainConfig(
+            descriptors=DescriptorConfig(use_3d_targets=True),
+            seed=7,
+        )
+
+        key_2d = _descriptor_cache_key(smiles, cfg_2d)
+        key_3d = _descriptor_cache_key(smiles, cfg_3d)
+        key_3d_conformers = _descriptor_cache_key(smiles, cfg_3d_conformers)
+        key_3d_seed = _descriptor_cache_key(smiles, cfg_3d_seed)
+
+        assert key_2d == _smiles_cache_key(smiles)
+        assert key_2d != key_3d
+        assert key_3d != key_3d_conformers
+        assert key_3d != key_3d_seed
 
 
 class TestGeometryHelpers:
@@ -573,6 +623,67 @@ class TestFingerprintPipeline:
         assert dataset[0].ecfp.dtype == torch.bool
         assert tuple(dataset[0].ecfp.shape) == (1, 4)
         assert dataset[1].ecfp.squeeze(0).tolist() == [False, True, False, True]
+
+
+class TestTargetFiltering:
+    """Rows with no valid targets should be dropped after descriptor generation."""
+
+    def test_filter_molecules_with_no_valid_targets_remaps_splits(self):
+        smiles = ["a", "b", "c", "d"]
+        values = np.arange(12, dtype=np.float32).reshape(4, 3)
+        valid = np.array(
+            [
+                [True, False, False],
+                [False, False, False],
+                [True, True, False],
+                [False, False, False],
+            ],
+            dtype=np.bool_,
+        )
+
+        (
+            filtered_smiles,
+            filtered_values,
+            filtered_valid,
+            train_idx,
+            val_idx,
+            test_idx,
+        ) = _filter_molecules_with_no_valid_targets(
+            smiles,
+            values,
+            valid,
+            np.array([0, 1]),
+            np.array([2]),
+            np.array([3]),
+        )
+
+        assert filtered_smiles == ["a", "c"]
+        np.testing.assert_array_equal(filtered_values, values[[0, 2]])
+        np.testing.assert_array_equal(filtered_valid, valid[[0, 2]])
+        np.testing.assert_array_equal(train_idx, np.array([0]))
+        np.testing.assert_array_equal(val_idx, np.array([1]))
+        assert test_idx is None
+
+    def test_filter_molecules_with_no_valid_targets_requires_train_and_val(self):
+        values = np.zeros((3, 2), dtype=np.float32)
+        valid = np.array(
+            [
+                [True, False],
+                [False, False],
+                [False, False],
+            ],
+            dtype=np.bool_,
+        )
+
+        with pytest.raises(ValueError, match="emptied the train or validation split"):
+            _filter_molecules_with_no_valid_targets(
+                ["a", "b", "c"],
+                values,
+                valid,
+                np.array([0]),
+                np.array([1]),
+                np.array([2]),
+            )
 
 
 class TestParentLevelSplit:

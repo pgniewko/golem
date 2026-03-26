@@ -1,8 +1,8 @@
 # Golem
 
-Descriptor pretraining for Graph Transformers on molecular descriptors. Inspired by [CheMeleon](https://github.com/JacksonBurns/chemeleon), with improvements including NaN-aware validity masking and scaling, and isoform enumeration for data augmentation.
+Descriptor pretraining for Graph Transformers on molecular descriptors. Inspired by [CheMeleon](https://github.com/JacksonBurns/chemeleon), with improvements including NaN-aware validity masking and scaling, isoform enumeration for data augmentation, and optional offline-aggregated 3D descriptor targets.
 
-Golem pretrains a [gt-pyg](https://github.com/pgniewko/gt-pyg) `GraphTransformerNet` backbone to predict Mordred 2D molecular descriptors, then the pretrained weights transfer to downstream property-prediction tasks via fine-tuning notebooks.
+Golem pretrains a [gt-pyg](https://github.com/pgniewko/gt-pyg) `GraphTransformerNet` backbone to predict Mordred 2D molecular descriptors and, optionally, an additional offline-generated 3D descriptor block. The pretrained weights then transfer to downstream property-prediction tasks via fine-tuning notebooks.
 
 ## Installation
 
@@ -92,6 +92,30 @@ geometry:
   latent_metric: cosine
 ```
 
+### Optional 3D descriptor targets
+
+The default target path is still the 2D Mordred baseline. You can opt into an additional offline-generated 3D descriptor block by enabling `descriptors.use_3d_targets`.
+
+```yaml
+descriptors:
+  include_2d_targets: true
+  use_3d_targets: true
+
+conformers:
+  backend: rdkit
+  n_generate: 32
+  n_keep: 8
+  energy_window_kcal: 10.0
+  prune_rms: 0.75
+  embedding: ETKDGv3
+  optimize: MMFF
+  fallback_optimize: UFF
+```
+
+When enabled, Golem computes a fixed 3D pack offline from conformer ensembles, caches the aggregated targets, and keeps inference unchanged: the model still consumes the same 2D molecular graph at serving time.
+
+To run on only the 3D target block, set `descriptors.include_2d_targets: false` together with `descriptors.use_3d_targets: true`.
+
 ### CLI options
 
 | Flag | Description | Default |
@@ -164,6 +188,8 @@ The tests cover isoform enumeration, Mordred descriptor computation, the NaN-awa
 | `config.py` | Defines `PretrainConfig` dataclass tree; merges defaults / YAML / CLI |
 | `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
 | `descriptors.py` | Computes Mordred 2D descriptors; provides `NaNAwareStandardScaler` |
+| `conformers.py` | Generates and filters offline RDKit conformer ensembles for 3D targets |
+| `descriptors3d.py` | Builds optional 2D+3D target matrices with masking and aggregation |
 | `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; isoforms &rarr; descriptors &rarr; split &rarr; scale &rarr; train &rarr; checkpoint |
 | `utils.py` | Shared utilities: seeding, train/val/test splitting, PyG DataLoader creation, SMILES file loading |
 

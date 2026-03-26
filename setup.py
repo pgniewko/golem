@@ -56,6 +56,7 @@ setup(
         "torch>=1.13.0",
         "torch_geometric",
         "mordredcommunity",
+        "molfeat",
         "rdkit",
         "gypsum-dl>=1.3.0",
         "numpy",
