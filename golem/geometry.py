@@ -192,42 +192,6 @@ def _pair_rank_metrics(d_fp: torch.Tensor, d_z: torch.Tensor) -> Tuple[float, fl
     return _spearman_correlation(fp_np, z_np), _kendall_tau(fp_np, z_np)
 
 
-def _forward_with_latent(
-    model: torch.nn.Module,
-    batch,
-    *,
-    zero_var: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Forward pass that also returns the pre-dropout graph embedding."""
-    h = model.node_emb(batch.x)
-    h = model.input_norm(h)
-    h = model.input_dropout(h)
-
-    if model.edge_emb is not None:
-        if batch.edge_attr is None:
-            raise ValueError("Model expects edge_attr but batch.edge_attr is None")
-        e = model.edge_emb(batch.edge_attr)
-    else:
-        e = None
-
-    for gt_layer in model.gt_layers:
-        h, e = gt_layer(x=h, edge_index=batch.edge_index, edge_attr=e)
-
-    z = model.global_pool(h, batch.batch)
-    z = model.readout_norm(z)
-    head_input = model.readout_dropout(z)
-    mu = model.mu_mlp(head_input)
-    log_var = torch.clamp(model.log_var_mlp(head_input), min=-10.0, max=10.0)
-
-    if model.training and not zero_var:
-        std = torch.exp(0.5 * log_var)
-        pred = mu + std * torch.randn_like(std)
-    else:
-        pred = mu
-
-    return pred, log_var, z
-
-
 def _compute_geometry_batch(
     batch,
     z: torch.Tensor,

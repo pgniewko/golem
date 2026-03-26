@@ -38,7 +38,6 @@ from golem.config import GeometryConfig, PretrainConfig
 from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
 from golem.geometry import (
     _compute_geometry_batch,
-    _forward_with_latent,
     _load_or_compute_fingerprints,
     _pair_rank_metrics,
 )
@@ -181,7 +180,14 @@ def _train_one_epoch(
         valid_mask = batch.y_mask.bool()  # [B, D]
 
         if geometry.enabled:
-            pred, _log_var, z = _forward_with_latent(model, batch, zero_var=True)
+            pred, _log_var, z = model(
+                batch.x,
+                batch.edge_index,
+                batch.edge_attr,
+                batch=batch.batch,
+                zero_var=True,
+                return_latent=True,
+            )
         else:
             pred, _log_var = model(
                 batch.x, batch.edge_index, batch.edge_attr,
@@ -246,7 +252,14 @@ def _validate(
         valid_mask = batch.y_mask.bool()
 
         if geometry.enabled:
-            pred, _log_var, z = _forward_with_latent(model, batch, zero_var=True)
+            pred, _log_var, z = model(
+                batch.x,
+                batch.edge_index,
+                batch.edge_attr,
+                batch=batch.batch,
+                zero_var=True,
+                return_latent=True,
+            )
             geometry_batch = _compute_geometry_batch(batch, z, geometry)
             rank_losses.append(geometry_batch.loss.item())
             if geometry.log_rank_metrics:
@@ -616,6 +629,14 @@ def pretrain(
     if "head_dropout" in gt_params and mc.head_dropout is not None:
         model_kwargs["head_dropout"] = mc.head_dropout
     model = GraphTransformerNet(**model_kwargs).to(device)
+
+    if config.geometry.enabled:
+        forward_params = inspect.signature(model.forward).parameters
+        if "return_latent" not in forward_params:
+            raise RuntimeError(
+                "Geometry regularizer requires gt-pyg with "
+                "GraphTransformerNet.forward(..., return_latent=True)."
+            )
 
     n_params = model.num_parameters()
     logger.info("Model: %d trainable parameters, num_tasks=%d", n_params, num_descriptors)
