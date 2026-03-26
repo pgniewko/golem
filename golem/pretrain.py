@@ -54,7 +54,6 @@ METRICS_FIELDNAMES = [
     "val_rmse",
     "learning_rate",
     "elapsed_seconds",
-    "train_main_loss",
     "train_rank_loss",
     "train_total_loss",
     "val_rank_loss",
@@ -237,6 +236,7 @@ def _validate(
     device: torch.device,
     *,
     geometry: GeometryConfig,
+    epoch: Optional[int] = None,
 ) -> ValidationMetrics:
     """Validate on valid positions and optionally track geometry metrics."""
     model.eval()
@@ -245,13 +245,16 @@ def _validate(
     rank_losses: List[float] = []
     spearmans: List[float] = []
     kendalls: List[float] = []
+    geometry_active = geometry.enabled and (
+        epoch is None or epoch >= geometry.warmup_epochs
+    )
 
     for batch in loader:
         batch = batch.to(device)
         targets = batch.y
         valid_mask = batch.y_mask.bool()
 
-        if geometry.enabled:
+        if geometry_active:
             pred, _log_var, z = model(
                 batch.x,
                 batch.edge_index,
@@ -260,7 +263,12 @@ def _validate(
                 zero_var=True,
                 return_latent=True,
             )
-            geometry_batch = _compute_geometry_batch(batch, z, geometry)
+            geometry_batch = _compute_geometry_batch(
+                batch,
+                z,
+                geometry,
+                deterministic_pairs=True,
+            )
             rank_losses.append(geometry_batch.loss.item())
             if geometry.log_rank_metrics:
                 spearman, kendall = _pair_rank_metrics(geometry_batch.d_fp, geometry_batch.d_z)
@@ -332,6 +340,8 @@ def _smiles_cache_key(smiles_list: List[str]) -> str:
     """Return a 16-char hex SHA-256 hash of the SMILES list (order-sensitive)."""
     h = hashlib.sha256("\n".join(smiles_list).encode())
     return h.hexdigest()[:16]
+
+
 def _prepare_metrics_file(metrics_path: Path, fieldnames: List[str]) -> None:
     """Upgrade an existing metrics.csv to the current header when resuming."""
     if not metrics_path.exists():
@@ -714,6 +724,7 @@ def pretrain(
                 val_loader,
                 device,
                 geometry=config.geometry,
+                epoch=epoch,
             )
 
             elapsed = time.time() - start_time
@@ -724,7 +735,6 @@ def pretrain(
                 "val_rmse": f"{val_metrics.rmse:.6f}",
                 "learning_rate": f"{lr:.2e}",
                 "elapsed_seconds": f"{elapsed:.1f}",
-                "train_main_loss": f"{train_metrics.main_loss:.6f}",
                 "train_rank_loss": f"{train_metrics.rank_loss:.6f}",
                 "train_total_loss": f"{train_metrics.total_loss:.6f}",
                 "val_rank_loss": f"{val_metrics.rank_loss:.6f}",

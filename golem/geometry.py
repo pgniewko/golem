@@ -6,7 +6,7 @@ import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -38,20 +38,28 @@ def _smiles_cache_key(smiles_list: List[str]) -> str:
 
 def _sample_batch_pairs(
     batch_size: int,
-    num_pairs: int,
+    num_pairs: Optional[int],
     device: torch.device,
+    *,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Sample unique unordered graph pairs from a batch."""
-    if batch_size < 2 or num_pairs <= 0:
+    """Select unique unordered graph pairs from a batch."""
+    if batch_size < 2 or (num_pairs is not None and num_pairs <= 0):
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
 
     all_pairs = torch.triu_indices(batch_size, batch_size, offset=1, device=device)
-    if all_pairs.size(1) <= num_pairs:
+    total_pairs = all_pairs.size(1)
+    if num_pairs is None or total_pairs <= num_pairs:
         return all_pairs[0], all_pairs[1]
 
-    perm = torch.randperm(all_pairs.size(1), device=device)[:num_pairs]
-    return all_pairs[0, perm], all_pairs[1, perm]
+    if deterministic:
+        # Spread validation coverage across the batch without introducing RNG noise.
+        step = total_pairs / num_pairs
+        indices = torch.floor(torch.arange(num_pairs, device=device) * step).long()
+    else:
+        indices = torch.randperm(total_pairs, device=device)[:num_pairs]
+    return all_pairs[0, indices], all_pairs[1, indices]
 
 
 def _tanimoto_distance_for_pairs(
@@ -196,13 +204,20 @@ def _compute_geometry_batch(
     batch,
     z: torch.Tensor,
     geometry: GeometryConfig,
+    *,
+    deterministic_pairs: bool = False,
 ) -> GeometryBatchResult:
     """Return geometry loss and sampled primal/latent pair distances."""
     if not hasattr(batch, "ecfp"):
         empty = z.new_empty(0)
         return GeometryBatchResult(loss=z.sum() * 0.0, d_fp=empty, d_z=empty)
 
-    pair_i, pair_j = _sample_batch_pairs(z.size(0), geometry.num_pairs, z.device)
+    pair_i, pair_j = _sample_batch_pairs(
+        z.size(0),
+        geometry.num_pairs,
+        z.device,
+        deterministic=deterministic_pairs,
+    )
     if pair_i.numel() == 0:
         empty = z.new_empty(0)
         return GeometryBatchResult(loss=z.sum() * 0.0, d_fp=empty, d_z=empty)

@@ -28,7 +28,6 @@ import yaml
 logger = logging.getLogger(__name__)
 
 OPTIONAL_METRIC_FIELDS = [
-    "train_main_loss",
     "train_rank_loss",
     "train_total_loss",
     "val_rank_loss",
@@ -439,14 +438,12 @@ def generate_report(
     table_extra_headers = ""
 
     if has_geometry_metrics:
-        train_main_json = json.dumps([r["train_main_loss"] for r in metrics])
         train_rank_json = json.dumps([r["train_rank_loss"] for r in metrics])
         train_total_json = json.dumps([r["train_total_loss"] for r in metrics])
         val_rank_json = json.dumps([r["val_rank_loss"] for r in metrics])
         val_spearman_json = json.dumps([r["val_spearman"] for r in metrics])
         val_kendall_json = json.dumps([r["val_kendall"] for r in metrics])
         geometry_json_decls = (
-            f"const trainMainLoss = {train_main_json};\n"
             f"const trainRankLoss = {train_rank_json};\n"
             f"const trainTotalLoss = {train_total_json};\n"
             f"const valRankLoss = {val_rank_json};\n"
@@ -459,7 +456,7 @@ new Chart(document.getElementById('geometryLossChart'), {
   data: {
     labels: epochs,
     datasets: [
-      { label: 'Train Main Loss',  data: trainMainLoss,  borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,0.1)', tension: 0.3, pointRadius: 2 },
+      { label: 'Train Loss',       data: trainLoss,      borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,0.1)', tension: 0.3, pointRadius: 2 },
       { label: 'Train Rank Loss',  data: trainRankLoss,  borderColor: '#f97316', backgroundColor: 'rgba(249,115,22,0.1)', tension: 0.3, pointRadius: 2 },
       { label: 'Train Total Loss', data: trainTotalLoss, borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)', tension: 0.3, pointRadius: 2 },
     ],
@@ -512,8 +509,8 @@ new Chart(document.getElementById('geometryMetricChart'), {
   </div>
 """
         table_extra_headers = (
-            "<th>Train Main</th><th>Train Rank</th><th>Train Total</th>"
-            "<th>Val Rank</th><th>Val Spearman</th><th>Val Kendall</th>"
+            "<th>Train Rank</th><th>Train Total</th><th>Val Rank</th>"
+            "<th>Val Spearman</th><th>Val Kendall</th>"
         )
 
     # Build config items HTML
@@ -532,7 +529,6 @@ new Chart(document.getElementById('geometryMetricChart'), {
         extra_cells = ""
         if has_geometry_metrics:
             extra_cells = (
-                f"<td>{_format_metric(r['train_main_loss'])}</td>"
                 f"<td>{_format_metric(r['train_rank_loss'])}</td>"
                 f"<td>{_format_metric(r['train_total_loss'])}</td>"
                 f"<td>{_format_metric(r['val_rank_loss'])}</td>"

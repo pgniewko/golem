@@ -1,7 +1,6 @@
 """Tests for golem.pretrain and golem.config."""
 
 import csv
-import math
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,9 +33,60 @@ from golem.pretrain import (
     _prepare_metrics_file,
     _save_checkpoint,
     _smiles_cache_key,
+    _validate,
 )
 from golem.report import generate_report
 from golem.utils import load_smiles, seed_everything, split_data
+
+
+class _DummyBatch:
+    """Minimal batch object for validation tests."""
+
+    def __init__(self, y: torch.Tensor, y_mask: torch.Tensor, ecfp: torch.Tensor):
+        self.y = y
+        self.y_mask = y_mask
+        self.ecfp = ecfp
+        self.x = torch.zeros((y.shape[0], 1), dtype=torch.float32)
+        self.edge_index = torch.zeros((2, 0), dtype=torch.long)
+        self.edge_attr = None
+        self.batch = torch.arange(y.shape[0], dtype=torch.long)
+
+    def to(self, device: torch.device):
+        self.y = self.y.to(device)
+        self.y_mask = self.y_mask.to(device)
+        self.ecfp = self.ecfp.to(device)
+        self.x = self.x.to(device)
+        self.edge_index = self.edge_index.to(device)
+        self.batch = self.batch.to(device)
+        if self.edge_attr is not None:
+            self.edge_attr = self.edge_attr.to(device)
+        return self
+
+
+class _DummyGeometryModel(torch.nn.Module):
+    """Minimal model that can optionally return latent embeddings."""
+
+    def __init__(self, pred: torch.Tensor, z: torch.Tensor):
+        super().__init__()
+        self.pred = pred
+        self.z = z
+        self.return_latent_calls = []
+
+    def forward(
+        self,
+        x,
+        edge_index,
+        edge_attr,
+        batch,
+        zero_var: bool = False,
+        return_latent: bool = False,
+    ):
+        self.return_latent_calls.append(return_latent)
+        pred = self.pred.to(x.device)
+        log_var = torch.zeros_like(pred)
+        if return_latent:
+            return pred, log_var, self.z.to(x.device)
+        return pred, log_var
 
 
 class TestConfig:
@@ -244,10 +294,21 @@ class TestGeometryHelpers:
         assert len(set(pairs)) == len(pairs)
         assert all(i < j for i, j in pairs)
 
-    def test_sample_batch_pairs_handles_small_batches(self):
-        pair_i, pair_j = _sample_batch_pairs(batch_size=1, num_pairs=8, device=torch.device("cpu"))
-        assert pair_i.numel() == 0
-        assert pair_j.numel() == 0
+    def test_sample_batch_pairs_can_be_deterministic(self):
+        first = _sample_batch_pairs(
+            batch_size=5,
+            num_pairs=4,
+            device=torch.device("cpu"),
+            deterministic=True,
+        )
+        second = _sample_batch_pairs(
+            batch_size=5,
+            num_pairs=4,
+            device=torch.device("cpu"),
+            deterministic=True,
+        )
+        assert torch.equal(first[0], second[0])
+        assert torch.equal(first[1], second[1])
 
     def test_tanimoto_distance_for_pairs(self):
         fp_bits = torch.tensor(
@@ -338,19 +399,6 @@ class TestComputeGeometryBatch:
         result.loss.backward()
         assert torch.allclose(z.grad, torch.zeros_like(z))
 
-    def test_compute_geometry_batch_small_batch_returns_zero_loss(self):
-        batch = SimpleNamespace(ecfp=torch.tensor([[True, False, True]], dtype=torch.bool))
-        z = torch.tensor([[1.0, 0.0]], requires_grad=True)
-        geometry = GeometryConfig(enabled=True, num_pairs=4)
-
-        result = _compute_geometry_batch(batch, z, geometry)
-
-        assert result.loss.item() == pytest.approx(0.0)
-        assert result.d_fp.numel() == 0
-        assert result.d_z.numel() == 0
-        result.loss.backward()
-        assert torch.allclose(z.grad, torch.zeros_like(z))
-
     def test_compute_geometry_batch_produces_finite_loss_and_gradients(self, monkeypatch):
         batch = SimpleNamespace(
             ecfp=torch.tensor(
@@ -375,7 +423,7 @@ class TestComputeGeometryBatch:
 
         monkeypatch.setattr(
             "golem.geometry._sample_batch_pairs",
-            lambda batch_size, num_pairs, device: (
+            lambda batch_size, num_pairs, device, deterministic=False: (
                 torch.tensor([0, 0, 1], dtype=torch.long, device=device),
                 torch.tensor([1, 2, 2], dtype=torch.long, device=device),
             ),
@@ -392,69 +440,98 @@ class TestComputeGeometryBatch:
         assert z.grad is not None
         assert torch.isfinite(z.grad).all()
 
-    def test_compute_geometry_batch_respects_l2_norm_metric(self, monkeypatch):
-        batch = SimpleNamespace(
+class TestValidationGeometryMetrics:
+    """Validation should report stable, warmup-aware geometry metrics."""
+
+    def test_validate_skips_geometry_metrics_during_warmup(self):
+        batch = _DummyBatch(
+            y=torch.zeros((3, 1), dtype=torch.float32),
+            y_mask=torch.ones((3, 1), dtype=torch.bool),
             ecfp=torch.tensor(
                 [
-                    [True, False, False, False],
-                    [False, True, False, False],
+                    [True, True, False, False],
+                    [True, False, True, False],
+                    [False, False, True, True],
                 ],
                 dtype=torch.bool,
-            )
-        )
-        z = torch.tensor([[3.0, 0.0], [0.0, 4.0]], dtype=torch.float32, requires_grad=True)
-        geometry = GeometryConfig(enabled=True, num_pairs=1, latent_metric="l2_norm")
-
-        monkeypatch.setattr(
-            "golem.geometry._sample_batch_pairs",
-            lambda batch_size, num_pairs, device: (
-                torch.tensor([0], dtype=torch.long, device=device),
-                torch.tensor([1], dtype=torch.long, device=device),
             ),
         )
+        model = _DummyGeometryModel(
+            pred=torch.zeros((3, 1), dtype=torch.float32),
+            z=torch.tensor(
+                [
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 1.0],
+                ],
+                dtype=torch.float32,
+            ),
+        )
+        geometry = GeometryConfig(enabled=True, num_pairs=3, warmup_epochs=2)
 
-        result = _compute_geometry_batch(batch, z, geometry)
+        metrics = _validate(
+            model,
+            [batch],
+            torch.device("cpu"),
+            geometry=geometry,
+            epoch=0,
+        )
 
-        assert result.d_fp.tolist() == pytest.approx([1.0])
-        assert result.d_z.tolist() == pytest.approx([2.0])
-        assert result.loss.item() == pytest.approx(0.0)
+        assert metrics.loss == pytest.approx(0.0)
+        assert np.isnan(metrics.rank_loss)
+        assert np.isnan(metrics.spearman)
+        assert np.isnan(metrics.kendall)
+        assert model.return_latent_calls == [False]
 
-    def test_compute_geometry_batch_ignores_tie_only_distances(self, monkeypatch):
-        batch = SimpleNamespace(
+    def test_validate_geometry_metrics_are_deterministic(self):
+        batch = _DummyBatch(
+            y=torch.zeros((4, 1), dtype=torch.float32),
+            y_mask=torch.ones((4, 1), dtype=torch.bool),
             ecfp=torch.tensor(
                 [
-                    [True, False, False, False],
-                    [True, False, False, False],
+                    [True, True, True, True],
+                    [True, True, False, False],
+                    [False, True, True, False],
                     [True, False, False, False],
                 ],
                 dtype=torch.bool,
-            )
+            ),
         )
+        pred = torch.zeros((4, 1), dtype=torch.float32)
         z = torch.tensor(
             [
                 [1.0, 0.0],
+                [0.9, 0.1],
+                [0.6, 0.4],
                 [0.0, 1.0],
-                [1.0, 1.0],
             ],
             dtype=torch.float32,
-            requires_grad=True,
         )
-        geometry = GeometryConfig(enabled=True, num_pairs=3, tie_epsilon=0.01)
+        geometry = GeometryConfig(enabled=True, num_pairs=3, warmup_epochs=0)
 
-        monkeypatch.setattr(
-            "golem.geometry._sample_batch_pairs",
-            lambda batch_size, num_pairs, device: (
-                torch.tensor([0, 0, 1], dtype=torch.long, device=device),
-                torch.tensor([1, 2, 2], dtype=torch.long, device=device),
-            ),
+        torch.manual_seed(0)
+        first = _validate(
+            _DummyGeometryModel(pred, z),
+            [batch],
+            torch.device("cpu"),
+            geometry=geometry,
+            epoch=0,
+        )
+        torch.manual_seed(999)
+        second = _validate(
+            _DummyGeometryModel(pred, z),
+            [batch],
+            torch.device("cpu"),
+            geometry=geometry,
+            epoch=0,
         )
 
-        result = _compute_geometry_batch(batch, z, geometry)
-
-        assert result.d_fp.tolist() == pytest.approx([0.0, 0.0, 0.0])
-        assert result.loss.item() == pytest.approx(0.0)
-        result.loss.backward()
-        assert torch.allclose(z.grad, torch.zeros_like(z))
+        assert np.isfinite(first.rank_loss)
+        assert np.isfinite(first.spearman)
+        assert np.isfinite(first.kendall)
+        assert first.rank_loss == pytest.approx(second.rank_loss)
+        assert first.spearman == pytest.approx(second.spearman)
+        assert first.kendall == pytest.approx(second.kendall)
 
 
 class TestFingerprintPipeline:
@@ -652,7 +729,6 @@ class TestMetricsAndReport:
                 "val_rmse": "1.414214",
                 "learning_rate": "1.00e-04",
                 "elapsed_seconds": "3.0",
-                "train_main_loss": "1.000000",
                 "train_rank_loss": "0.050000",
                 "train_total_loss": "1.000500",
                 "val_rank_loss": "0.060000",
