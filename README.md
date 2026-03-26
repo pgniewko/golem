@@ -82,6 +82,7 @@ golem pretrain \
 ### Optional geometry regularizer
 
 Pretraining can also add a weak rank-based geometry regularizer that nudges graph-level latent distances to respect ECFP4/Tanimoto distance ordering on the expanded isoforms actually seen by the model. Enable it in YAML via the `geometry` block:
+It is disabled by default.
 
 ```yaml
 geometry:

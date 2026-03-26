@@ -2,6 +2,7 @@
 
 import csv
 import math
+from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
@@ -13,10 +14,13 @@ from golem.config import (
 )
 from golem.descriptors import NaNAwareStandardScaler
 from golem.geometry import (
+    _compute_geometry_batch,
     _compute_ecfp_fingerprints,
     _fingerprint_cache_path,
+    _forward_with_latent,
     _latent_distance_for_pairs,
     _load_or_compute_fingerprints,
+    _pair_rank_metrics,
     _pair_order_surrogate,
     _sample_batch_pairs,
     _tanimoto_distance_for_pairs,
@@ -33,6 +37,87 @@ from golem.pretrain import (
 )
 from golem.report import generate_report
 from golem.utils import load_smiles, seed_everything, split_data
+
+
+class _IdentityGraphLayer(torch.nn.Module):
+    """Minimal gt-layer stand-in for latent-forward tests."""
+
+    def forward(self, x, edge_index, edge_attr):
+        return x, edge_attr
+
+
+class _MeanPool(torch.nn.Module):
+    """Simple graph-level mean pooling over a batch vector."""
+
+    def forward(self, x, batch_index):
+        num_graphs = int(batch_index.max().item()) + 1
+        pooled = []
+        for graph_idx in range(num_graphs):
+            pooled.append(x[batch_index == graph_idx].mean(dim=0))
+        return torch.stack(pooled, dim=0)
+
+
+class _AddConstant(torch.nn.Module):
+    """Deterministic readout transform used to test pre-dropout z."""
+
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+    def forward(self, x):
+        return x + self.value
+
+
+class _ZeroLike(torch.nn.Module):
+    """Return zeros matching the input tensor shape."""
+
+    def forward(self, x):
+        return torch.zeros_like(x)
+
+
+class _ConstantLike(torch.nn.Module):
+    """Return a constant tensor matching the input tensor shape."""
+
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+    def forward(self, x):
+        return torch.full_like(x, self.value)
+
+
+def _make_latent_test_model(*, edge_emb=None, readout_dropout=None):
+    """Build a minimal model exposing the attributes geometry helpers need."""
+    return SimpleNamespace(
+        node_emb=torch.nn.Identity(),
+        input_norm=torch.nn.Identity(),
+        input_dropout=torch.nn.Identity(),
+        edge_emb=edge_emb,
+        gt_layers=torch.nn.ModuleList([_IdentityGraphLayer()]),
+        global_pool=_MeanPool(),
+        readout_norm=torch.nn.Identity(),
+        readout_dropout=readout_dropout or torch.nn.Identity(),
+        mu_mlp=torch.nn.Identity(),
+        log_var_mlp=_ZeroLike(),
+        training=True,
+    )
+
+
+def _make_latent_test_batch(*, edge_attr):
+    """Build a minimal batch object for latent-forward tests."""
+    return SimpleNamespace(
+        x=torch.tensor(
+            [
+                [1.0, 2.0],
+                [3.0, 4.0],
+                [10.0, 20.0],
+                [14.0, 24.0],
+            ]
+        ),
+        edge_index=torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+        edge_attr=edge_attr,
+        batch=torch.tensor([0, 0, 1, 1], dtype=torch.long),
+    )
 
 
 class TestConfig:
@@ -273,6 +358,19 @@ class TestGeometryHelpers:
         distances = _latent_distance_for_pairs(z, pair_i, pair_j, metric="cosine")
         assert distances.tolist() == pytest.approx([1.0, 0.0])
 
+    def test_latent_distance_for_pairs_l2_norm(self):
+        z = torch.tensor(
+            [
+                [3.0, 0.0],
+                [0.0, 4.0],
+                [6.0, 0.0],
+            ]
+        )
+        pair_i = torch.tensor([0, 0], dtype=torch.long)
+        pair_j = torch.tensor([1, 2], dtype=torch.long)
+        distances = _latent_distance_for_pairs(z, pair_i, pair_j, metric="l2_norm")
+        assert distances.tolist() == pytest.approx([2.0, 0.0])
+
     def test_pair_order_surrogate_ignores_ties(self):
         d_fp = torch.tensor([0.10, 0.11], dtype=torch.float32)
         d_z = torch.tensor([0.20, 0.40], dtype=torch.float32, requires_grad=True)
@@ -289,6 +387,202 @@ class TestGeometryHelpers:
         loss.backward()
         assert d_z.grad is not None
         assert torch.isfinite(d_z.grad).all()
+
+    def test_pair_rank_metrics_match_known_orderings(self):
+        spearman, kendall = _pair_rank_metrics(
+            torch.tensor([0.1, 0.5, 0.9]),
+            torch.tensor([1.0, 2.0, 3.0]),
+        )
+        assert spearman == pytest.approx(1.0)
+        assert kendall == pytest.approx(1.0)
+
+        spearman, kendall = _pair_rank_metrics(
+            torch.tensor([0.1, 0.5, 0.9]),
+            torch.tensor([3.0, 2.0, 1.0]),
+        )
+        assert spearman == pytest.approx(-1.0)
+        assert kendall == pytest.approx(-1.0)
+
+
+class TestForwardWithLatent:
+    """Tests for latent-forward helper mechanics."""
+
+    def test_forward_with_latent_returns_pre_dropout_embedding(self):
+        model = _make_latent_test_model(readout_dropout=_AddConstant(5.0))
+        batch = _make_latent_test_batch(edge_attr=None)
+
+        pred, log_var, z = _forward_with_latent(model, batch, zero_var=True)
+
+        expected_z = torch.tensor([[2.0, 3.0], [12.0, 22.0]])
+        assert pred.shape == (2, 2)
+        assert log_var.shape == (2, 2)
+        assert torch.allclose(z, expected_z)
+        assert torch.allclose(pred, expected_z + 5.0)
+        assert torch.allclose(log_var, torch.zeros_like(expected_z))
+
+    def test_forward_with_latent_raises_when_edge_attr_is_missing(self):
+        model = _make_latent_test_model(edge_emb=torch.nn.Identity())
+        batch = _make_latent_test_batch(edge_attr=None)
+
+        with pytest.raises(ValueError, match="edge_attr"):
+            _forward_with_latent(model, batch, zero_var=True)
+
+    def test_forward_with_latent_eval_mode_ignores_sampling(self):
+        model = _make_latent_test_model()
+        model.training = False
+        batch = _make_latent_test_batch(edge_attr=None)
+
+        pred, _log_var, z = _forward_with_latent(model, batch, zero_var=False)
+
+        assert torch.allclose(pred, z)
+
+    def test_forward_with_latent_train_mode_samples_when_zero_var_is_false(self):
+        model = _make_latent_test_model()
+        model.log_var_mlp = _ConstantLike(0.0)
+        batch = _make_latent_test_batch(edge_attr=None)
+
+        torch.manual_seed(0)
+        pred, log_var, z = _forward_with_latent(model, batch, zero_var=False)
+
+        assert torch.isfinite(pred).all()
+        assert torch.isfinite(log_var).all()
+        assert torch.isfinite(z).all()
+        assert not torch.allclose(pred, z)
+
+
+class TestComputeGeometryBatch:
+    """Tests for batch-level geometry regularizer mechanics."""
+
+    def test_compute_geometry_batch_without_ecfp_returns_zero_loss(self):
+        batch = SimpleNamespace()
+        z = torch.tensor([[1.0, 0.0], [0.0, 1.0]], requires_grad=True)
+        geometry = GeometryConfig(enabled=True, num_pairs=4)
+
+        result = _compute_geometry_batch(batch, z, geometry)
+
+        assert result.loss.item() == pytest.approx(0.0)
+        assert result.d_fp.numel() == 0
+        assert result.d_z.numel() == 0
+        result.loss.backward()
+        assert torch.allclose(z.grad, torch.zeros_like(z))
+
+    def test_compute_geometry_batch_small_batch_returns_zero_loss(self):
+        batch = SimpleNamespace(ecfp=torch.tensor([[True, False, True]], dtype=torch.bool))
+        z = torch.tensor([[1.0, 0.0]], requires_grad=True)
+        geometry = GeometryConfig(enabled=True, num_pairs=4)
+
+        result = _compute_geometry_batch(batch, z, geometry)
+
+        assert result.loss.item() == pytest.approx(0.0)
+        assert result.d_fp.numel() == 0
+        assert result.d_z.numel() == 0
+        result.loss.backward()
+        assert torch.allclose(z.grad, torch.zeros_like(z))
+
+    def test_compute_geometry_batch_produces_finite_loss_and_gradients(self, monkeypatch):
+        batch = SimpleNamespace(
+            ecfp=torch.tensor(
+                [
+                    [True, True, False, False],
+                    [True, False, True, False],
+                    [False, False, True, True],
+                ],
+                dtype=torch.bool,
+            )
+        )
+        z = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+            ],
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        geometry = GeometryConfig(enabled=True, num_pairs=3, latent_metric="cosine")
+
+        monkeypatch.setattr(
+            "golem.geometry._sample_batch_pairs",
+            lambda batch_size, num_pairs, device: (
+                torch.tensor([0, 0, 1], dtype=torch.long, device=device),
+                torch.tensor([1, 2, 2], dtype=torch.long, device=device),
+            ),
+        )
+
+        result = _compute_geometry_batch(batch, z, geometry)
+
+        assert result.d_fp.shape == (3,)
+        assert result.d_z.shape == (3,)
+        assert torch.isfinite(result.loss)
+        assert torch.isfinite(result.d_fp).all()
+        assert torch.isfinite(result.d_z).all()
+        result.loss.backward()
+        assert z.grad is not None
+        assert torch.isfinite(z.grad).all()
+
+    def test_compute_geometry_batch_respects_l2_norm_metric(self, monkeypatch):
+        batch = SimpleNamespace(
+            ecfp=torch.tensor(
+                [
+                    [True, False, False, False],
+                    [False, True, False, False],
+                ],
+                dtype=torch.bool,
+            )
+        )
+        z = torch.tensor([[3.0, 0.0], [0.0, 4.0]], dtype=torch.float32, requires_grad=True)
+        geometry = GeometryConfig(enabled=True, num_pairs=1, latent_metric="l2_norm")
+
+        monkeypatch.setattr(
+            "golem.geometry._sample_batch_pairs",
+            lambda batch_size, num_pairs, device: (
+                torch.tensor([0], dtype=torch.long, device=device),
+                torch.tensor([1], dtype=torch.long, device=device),
+            ),
+        )
+
+        result = _compute_geometry_batch(batch, z, geometry)
+
+        assert result.d_fp.tolist() == pytest.approx([1.0])
+        assert result.d_z.tolist() == pytest.approx([2.0])
+        assert result.loss.item() == pytest.approx(0.0)
+
+    def test_compute_geometry_batch_ignores_tie_only_distances(self, monkeypatch):
+        batch = SimpleNamespace(
+            ecfp=torch.tensor(
+                [
+                    [True, False, False, False],
+                    [True, False, False, False],
+                    [True, False, False, False],
+                ],
+                dtype=torch.bool,
+            )
+        )
+        z = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+            ],
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        geometry = GeometryConfig(enabled=True, num_pairs=3, tie_epsilon=0.01)
+
+        monkeypatch.setattr(
+            "golem.geometry._sample_batch_pairs",
+            lambda batch_size, num_pairs, device: (
+                torch.tensor([0, 0, 1], dtype=torch.long, device=device),
+                torch.tensor([1, 2, 2], dtype=torch.long, device=device),
+            ),
+        )
+
+        result = _compute_geometry_batch(batch, z, geometry)
+
+        assert result.d_fp.tolist() == pytest.approx([0.0, 0.0, 0.0])
+        assert result.loss.item() == pytest.approx(0.0)
+        result.loss.backward()
+        assert torch.allclose(z.grad, torch.zeros_like(z))
 
 
 class TestFingerprintPipeline:
