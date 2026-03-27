@@ -123,6 +123,24 @@ def _metrics_fieldnames(config: PretrainConfig) -> list[str]:
     return BASE_METRICS_FIELDNAMES
 
 
+def _epoch_alignment_configs(
+    alignment_cfg: ECFPLatentAlignmentConfig,
+    epoch: int,
+) -> tuple[ECFPLatentAlignmentConfig | None, ECFPLatentAlignmentConfig | None]:
+    """Return alignment configs for train and evaluation for a given epoch."""
+    if not alignment_cfg.enabled:
+        return None, None
+
+    train_alignment_cfg = alignment_cfg if epoch >= alignment_cfg.warmup_epochs else None
+    eval_alignment_cfg = alignment_cfg
+    return train_alignment_cfg, eval_alignment_cfg
+
+
+def _format_optional_metric(value: float) -> str:
+    """Format finite optional metrics and leave inactive ones blank."""
+    return f"{value:.6f}" if math.isfinite(value) else ""
+
+
 _INTEROP_THREADS_CONFIGURED = False
 
 
@@ -917,20 +935,17 @@ def pretrain(
 
         for epoch in range(start_epoch, config.max_epochs):
             lr = scheduler.get_last_lr()[0]
+            train_alignment_cfg, eval_alignment_cfg = _epoch_alignment_configs(
+                alignment_cfg,
+                epoch,
+            )
+            train_alignment_active = train_alignment_cfg is not None
             if plain_2d_mode:
                 train_loader = _legacy_train_loader()
                 train_loader.ecfp_latent_alignment = None
             else:
-                train_loader.ecfp_latent_alignment = (
-                    alignment_cfg
-                    if alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
-                    else None
-                )
-                val_loader.ecfp_latent_alignment = (
-                    alignment_cfg
-                    if alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
-                    else None
-                )
+                train_loader.ecfp_latent_alignment = train_alignment_cfg
+                val_loader.ecfp_latent_alignment = eval_alignment_cfg
 
             (
                 train_loss,
@@ -972,16 +987,24 @@ def pretrain(
                 f"{elapsed:.1f}",
             ]
             if alignment_cfg.enabled:
-                row.extend([
-                    f"{train_alignment_loss:.6f}",
-                    f"{val_alignment_loss:.6f}",
-                    f"{val_alignment_spearman:.6f}",
-                    f"{val_alignment_kendall:.6f}",
-                ])
+                if train_alignment_active:
+                    row.extend([
+                        _format_optional_metric(train_alignment_loss),
+                        _format_optional_metric(val_alignment_loss),
+                        _format_optional_metric(val_alignment_spearman),
+                        _format_optional_metric(val_alignment_kendall),
+                    ])
+                else:
+                    row.extend([
+                        "",
+                        _format_optional_metric(val_alignment_loss),
+                        _format_optional_metric(val_alignment_spearman),
+                        _format_optional_metric(val_alignment_kendall),
+                    ])
             metrics_writer.writerow(row)
             metrics_file.flush()
 
-            if alignment_cfg.enabled:
+            if alignment_cfg.enabled and train_alignment_active:
                 logger.info(
                     "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  "
                     "train_desc=%.4f  val_desc=%.4f  val_rmse=%.4f  "
@@ -994,6 +1017,27 @@ def pretrain(
                     val_descriptor_loss,
                     val_rmse,
                     train_alignment_loss,
+                    val_alignment_loss,
+                    lr,
+                )
+                if math.isfinite(val_alignment_spearman) or math.isfinite(val_alignment_kendall):
+                    logger.info(
+                        "           val_alignment_spearman=%.4f  val_alignment_kendall=%.4f",
+                        val_alignment_spearman,
+                        val_alignment_kendall,
+                    )
+            elif alignment_cfg.enabled:
+                logger.info(
+                    "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  "
+                    "train_desc=%.4f  val_desc=%.4f  val_rmse=%.4f  "
+                    "val_align=%.4f  lr=%.2e  (train alignment warmup inactive)",
+                    epoch + 1,
+                    config.max_epochs,
+                    train_loss,
+                    val_loss,
+                    train_descriptor_loss,
+                    val_descriptor_loss,
+                    val_rmse,
                     val_alignment_loss,
                     lr,
                 )
@@ -1106,11 +1150,15 @@ def pretrain(
         )
         if alignment_cfg.enabled:
             logger.info(
-                "Test alignment: loss=%.4f  spearman=%.4f  kendall=%.4f",
+                "Test alignment loss=%.4f",
                 test_alignment_loss,
-                test_alignment_spearman,
-                test_alignment_kendall,
             )
+            if math.isfinite(test_alignment_spearman) or math.isfinite(test_alignment_kendall):
+                logger.info(
+                    "Test alignment rank metrics: spearman=%.4f  kendall=%.4f",
+                    test_alignment_spearman,
+                    test_alignment_kendall,
+                )
 
     # ------------------------------------------------------------------
     # 13. Generate HTML report

@@ -13,6 +13,7 @@ from golem.descriptors import NaNAwareStandardScaler
 from golem.pretrain import (
     _artifact_config_dict,
     _checkpoint_library_versions,
+    _epoch_alignment_configs,
     _filter_target_rows,
     _make_warmup_cosine_scheduler,
     _metrics_fieldnames,
@@ -223,6 +224,26 @@ class TestCompatibilityArtifacts:
             "val_alignment_spearman",
             "val_alignment_kendall",
         ]
+
+    def test_epoch_alignment_configs_only_warms_up_training(self):
+        cfg = PretrainConfig()
+        cfg.ecfp_latent_alignment.enabled = True
+        cfg.ecfp_latent_alignment.warmup_epochs = 5
+
+        train_cfg, eval_cfg = _epoch_alignment_configs(cfg.ecfp_latent_alignment, epoch=0)
+
+        assert train_cfg is None
+        assert eval_cfg is cfg.ecfp_latent_alignment
+
+    def test_epoch_alignment_configs_enable_training_after_warmup(self):
+        cfg = PretrainConfig()
+        cfg.ecfp_latent_alignment.enabled = True
+        cfg.ecfp_latent_alignment.warmup_epochs = 5
+
+        train_cfg, eval_cfg = _epoch_alignment_configs(cfg.ecfp_latent_alignment, epoch=5)
+
+        assert train_cfg is cfg.ecfp_latent_alignment
+        assert eval_cfg is cfg.ecfp_latent_alignment
 
 
 class _DummyBatch:

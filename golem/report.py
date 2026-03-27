@@ -72,11 +72,14 @@ def _parse_optional_float(row: Dict[str, str], key: str) -> float:
 
 
 def _has_alignment_metrics(metrics: List[Dict[str, Any]]) -> bool:
-    return any(
-        math.isfinite(row.get(field, math.nan))
+    return any(math.isfinite(row.get("val_alignment_loss", math.nan)) for row in metrics)
+
+
+def _optional_series(metrics: List[Dict[str, Any]], key: str) -> List[float | None]:
+    return [
+        value if math.isfinite(value := row.get(key, math.nan)) else None
         for row in metrics
-        for field in OPTIONAL_ALIGNMENT_FIELDS
-    )
+    ]
 
 
 def _load_config(config_path: Path) -> Dict[str, Any]:
@@ -442,10 +445,10 @@ def generate_report(
   </div>
 """
         alignment_json = (
-            f"const trainAlignmentLoss = {json.dumps([r['train_alignment_loss'] for r in metrics])};\n"
-            f"const valAlignmentLoss = {json.dumps([r['val_alignment_loss'] for r in metrics])};\n"
-            f"const valAlignmentSpearman = {json.dumps([r['val_alignment_spearman'] for r in metrics])};\n"
-            f"const valAlignmentKendall = {json.dumps([r['val_alignment_kendall'] for r in metrics])};"
+            f"const trainAlignmentLoss = {json.dumps(_optional_series(metrics, 'train_alignment_loss'))};\n"
+            f"const valAlignmentLoss = {json.dumps(_optional_series(metrics, 'val_alignment_loss'))};\n"
+            f"const valAlignmentSpearman = {json.dumps(_optional_series(metrics, 'val_alignment_spearman'))};\n"
+            f"const valAlignmentKendall = {json.dumps(_optional_series(metrics, 'val_alignment_kendall'))};"
         )
         alignment_script = """
 new Chart(document.getElementById('alignmentChart'), {

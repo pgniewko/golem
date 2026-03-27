@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import logging
+import multiprocessing as mp
 import time
 from dataclasses import dataclass
+from queue import Empty
 
 import numpy as np
 from rdkit import Chem
@@ -14,6 +17,9 @@ from rdkit.Chem import AllChem, rdMolAlign
 from golem.config import ConformerConfig
 
 logger = logging.getLogger(__name__)
+_MP_CONTEXT = mp.get_context(
+    "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+)
 
 
 @dataclass
@@ -63,7 +69,102 @@ def _is_timeout_error(exc: Exception) -> bool:
     return "timed out" in message or "timeout" in message
 
 
-def generate_conformer_ensemble(
+def _call_by_name(
+    module_name: str,
+    qualname: str,
+    args: tuple,
+    kwargs: dict,
+):
+    target = importlib.import_module(module_name)
+    for part in qualname.split("."):
+        target = getattr(target, part)
+    return target(*args, **kwargs)
+
+
+def _timeout_worker(
+    result_queue,
+    module_name: str,
+    qualname: str,
+    args: tuple,
+    kwargs: dict,
+) -> None:
+    try:
+        result_queue.put(("ok", _call_by_name(module_name, qualname, args, kwargs)))
+    except BaseException as exc:  # pragma: no cover - defensive process boundary
+        result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _run_with_timeout(
+    module_name: str,
+    qualname: str,
+    *,
+    args: tuple = (),
+    kwargs: dict | None = None,
+    timeout_seconds: float,
+):
+    kwargs = kwargs or {}
+    if timeout_seconds <= 0:
+        return _call_by_name(module_name, qualname, args, kwargs)
+
+    result_queue = _MP_CONTEXT.Queue(maxsize=1)
+    process = _MP_CONTEXT.Process(
+        target=_timeout_worker,
+        args=(result_queue, module_name, qualname, args, kwargs),
+    )
+    process.daemon = True
+    process.start()
+    process.join(timeout_seconds)
+
+    try:
+        if process.is_alive():
+            process.terminate()
+            process.join(1.0)
+            if process.is_alive() and hasattr(process, "kill"):
+                process.kill()
+                process.join(1.0)
+            raise TimeoutError(f"{module_name}.{qualname} exceeded {timeout_seconds}s")
+
+        try:
+            status, payload = result_queue.get(timeout=1.0)
+        except Empty as exc:
+            raise RuntimeError(
+                f"{module_name}.{qualname} exited without returning a result"
+            ) from exc
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+
+    if status == "error":
+        raise RuntimeError(payload)
+    return payload
+
+
+def _serialise_ensemble(
+    ensemble: ConformerEnsemble | None,
+) -> tuple[bytes, list[int], list[float]] | None:
+    if ensemble is None:
+        return None
+    return (
+        ensemble.mol.ToBinary(),
+        list(ensemble.conformer_ids),
+        ensemble.relative_energies_kcal.tolist(),
+    )
+
+
+def _deserialise_ensemble(
+    payload: tuple[bytes, list[int], list[float]] | None,
+) -> ConformerEnsemble | None:
+    if payload is None:
+        return None
+    mol_binary, conformer_ids, relative_energies_kcal = payload
+    return ConformerEnsemble(
+        mol=Chem.Mol(mol_binary),
+        conformer_ids=list(conformer_ids),
+        relative_energies_kcal=np.asarray(relative_energies_kcal, dtype=np.float64),
+    )
+
+
+def _generate_conformer_ensemble_inline(
     smiles: str,
     config: ConformerConfig,
     *,
@@ -142,3 +243,48 @@ def generate_conformer_ensemble(
         ),
         None,
     )
+
+
+def _generate_conformer_ensemble_payload(
+    smiles: str,
+    config: ConformerConfig,
+    seed: int,
+) -> tuple[tuple[bytes, list[int], list[float]] | None, str | None]:
+    ensemble, failure_reason = _generate_conformer_ensemble_inline(
+        smiles,
+        config,
+        seed=seed,
+    )
+    return _serialise_ensemble(ensemble), failure_reason
+
+
+def generate_conformer_ensemble(
+    smiles: str,
+    config: ConformerConfig,
+    *,
+    seed: int,
+) -> tuple[ConformerEnsemble | None, str | None]:
+    """Generate a low-energy, RMS-pruned conformer ensemble."""
+    timeout_seconds = float(max(config.timeout_seconds, 0))
+    if timeout_seconds <= 0:
+        return _generate_conformer_ensemble_inline(smiles, config, seed=seed)
+
+    try:
+        payload, failure_reason = _run_with_timeout(
+            __name__,
+            "_generate_conformer_ensemble_payload",
+            args=(smiles, config, seed),
+            timeout_seconds=timeout_seconds,
+        )
+    except TimeoutError:
+        logger.debug(
+            "Conformer generation exceeded %.1fs for %s",
+            timeout_seconds,
+            smiles,
+        )
+        return None, "timeout"
+    except Exception:
+        logger.debug("Conformer generation worker failed for %s", smiles, exc_info=True)
+        return None, "worker_failed"
+
+    return _deserialise_ensemble(payload), failure_reason
