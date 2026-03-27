@@ -231,20 +231,19 @@ def _validate(
                 zero_var=True,
                 return_latent=True,
             )
-            if alignment_cfg is not None:
-                alignment_loss, d_fp, d_z = compute_alignment_batch(
-                    batch,
-                    z,
-                    alignment_cfg,
-                    deterministic_pairs=True,
-                )
-                alignment_losses.append(alignment_loss.item())
-                if alignment_cfg.log_rank_metrics:
-                    spearman, kendall = compute_alignment_metrics(d_fp, d_z)
-                    if math.isfinite(spearman):
-                        spearmans.append(spearman)
-                    if math.isfinite(kendall):
-                        kendalls.append(kendall)
+            alignment_loss, d_fp, d_z = compute_alignment_batch(
+                batch,
+                z,
+                alignment_cfg,
+                deterministic_pairs=True,
+            )
+            alignment_losses.append(alignment_loss.item())
+            if alignment_cfg.log_rank_metrics:
+                spearman, kendall = compute_alignment_metrics(d_fp, d_z)
+                if math.isfinite(spearman):
+                    spearmans.append(spearman)
+                if math.isfinite(kendall):
+                    kendalls.append(kendall)
         else:
             pred, _ = model(
                 batch.x, batch.edge_index, batch.edge_attr,
