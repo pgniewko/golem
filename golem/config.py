@@ -48,7 +48,7 @@ class IsoformConfig:
 
 @dataclass
 class RankAlignmentConfig:
-    """Optional pair-distance rank-alignment regularizer config."""
+    """Optional pair-distance rank-alignment loss config."""
 
     enabled: bool = False
     weight: float = 0.01

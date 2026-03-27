@@ -650,7 +650,7 @@ def pretrain(
         forward_params = inspect.signature(model.forward).parameters
         if "return_latent" not in forward_params:
             raise RuntimeError(
-                "Rank-alignment regularizer requires gt-pyg with "
+                "Rank-alignment loss requires gt-pyg with "
                 "GraphTransformerNet.forward(..., return_latent=True)."
             )
 

@@ -79,9 +79,9 @@ golem pretrain \
   --output experiments/pretrain
 ```
 
-### Optional rank-alignment regularizer
+### Optional rank-alignment loss
 
-Pretraining can also add a weak rank-based regularizer that encourages graph-level latent distances to respect ECFP4/Tanimoto distance ordering on the expanded isoforms actually seen by the model. Enable it in YAML via the `rank_alignment` block:
+Pretraining can also add an auxiliary rank-alignment loss that encourages graph-level latent distances to respect ECFP4/Tanimoto distance ordering on the expanded isoforms actually seen by the model. Enable it in YAML via the `rank_alignment` block:
 It is disabled by default.
 
 ```yaml
@@ -136,7 +136,7 @@ This reads `metrics.csv` and `resolved_config.yaml` from the experiment director
 - Validation RMSE curve
 - Learning rate schedule
 - Train vs val loss gap
-- Rank-alignment loss and rank-agreement charts when the regularizer is enabled
+- Rank-alignment loss and rank-agreement charts when the rank-alignment loss is enabled
 - Summary cards (best epoch, best val loss, elapsed time, architecture)
 - Epoch-by-epoch table with the best row highlighted
 

@@ -1,4 +1,4 @@
-"""Rank-alignment regularizer helpers for pretraining."""
+"""Rank-alignment loss helpers for pretraining."""
 
 from __future__ import annotations
 

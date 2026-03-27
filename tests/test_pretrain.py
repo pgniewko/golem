@@ -285,7 +285,7 @@ class TestSmilesCacheKey:
 
 
 class TestRankAlignmentHelpers:
-    """Tests for rank-alignment regularizer helpers."""
+    """Tests for rank-alignment loss helpers."""
 
     def test_sample_batch_pairs_are_unique_and_unordered(self):
         pair_i, pair_j = _sample_batch_pairs(batch_size=4, num_pairs=10, device=torch.device("cpu"))
@@ -384,7 +384,7 @@ class TestRankAlignmentHelpers:
         assert kendall == pytest.approx(-1.0)
 
 class TestComputeRankAlignmentBatch:
-    """Tests for batch-level rank-alignment regularizer mechanics."""
+    """Tests for batch-level rank-alignment loss mechanics."""
 
     def test_compute_rank_alignment_batch_without_ecfp_returns_zero_loss(self):
         batch = SimpleNamespace()
