@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 import random
 from pathlib import Path
-from typing import List, Tuple
+from typing import Callable, Iterator, List, Sized, Tuple
 
 import numpy as np
 import torch
+from torch.utils.data import Sampler
 from torch_geometric.loader import DataLoader
 
 
@@ -56,11 +57,42 @@ def split_data(
     return tuple(splits)
 
 
+class EpochSeededRandomSampler(Sampler[int]):
+    """Match DataLoader shuffle order from the legacy global-RNG path.
+
+    Each iterator draw consumes one int64 from ``seed_source`` to seed a fresh
+    epoch-local generator, mirroring PyTorch's ``RandomSampler(generator=None)``
+    behavior without depending on the process-global RNG state.
+    """
+
+    def __init__(self, data_source: Sized, seed_source: torch.Generator):
+        self.data_source = data_source
+        self.seed_source = seed_source
+
+    def __iter__(self) -> Iterator[int]:
+        n = len(self.data_source)
+        if n <= 0:
+            return iter(())
+
+        seed = int(
+            torch.empty((), dtype=torch.int64).random_(generator=self.seed_source).item()
+        )
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        return iter(torch.randperm(n, generator=generator).tolist())
+
+    def __len__(self) -> int:
+        return len(self.data_source)
+
+
 def make_loader(
     dataset: list,
     batch_size: int,
     shuffle: bool = False,
     num_workers: int = 0,
+    sampler: Sampler | None = None,
+    generator: torch.Generator | None = None,
+    worker_init_fn: Callable[[int], None] | None = None,
 ) -> DataLoader:
     """Create a PyG DataLoader.
 
@@ -69,14 +101,29 @@ def make_loader(
         batch_size: Batch size.
         shuffle: Whether to shuffle.
         num_workers: Number of data loading workers.
+        sampler: Optional explicit sampler. When provided, ``shuffle`` is ignored.
+        generator: Optional generator for DataLoader worker seeding.
+        worker_init_fn: Optional worker initialiser.
     """
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         persistent_workers=num_workers > 0,
+        generator=generator,
+        worker_init_fn=worker_init_fn,
     )
+
+
+def seed_loader_worker(worker_id: int) -> None:
+    """Seed Python, NumPy, and Torch RNGs inside a DataLoader worker."""
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 
 def load_smiles(path: str) -> List[str]:

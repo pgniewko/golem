@@ -33,6 +33,7 @@ import numpy as np
 import torch
 from rdkit import Chem
 import torch.nn.functional as F
+from torch.utils.data import RandomSampler
 import yaml
 from golem.config import ECFPLatentAlignmentConfig, PretrainConfig
 from golem.descriptors import (
@@ -47,17 +48,25 @@ from golem.ecfp_latent_alignment import (
 )
 from golem.isoforms import enumerate_isoforms_batch
 from golem.report import generate_report
-from golem.utils import load_smiles, make_loader, seed_everything, split_data
+from golem.utils import (
+    load_smiles,
+    make_loader,
+    seed_everything,
+    seed_loader_worker,
+    split_data,
+)
 
 logger = logging.getLogger(__name__)
 
-METRICS_FIELDNAMES = [
+BASE_METRICS_FIELDNAMES = [
     "epoch",
     "train_loss",
     "val_loss",
     "val_rmse",
     "learning_rate",
     "elapsed_seconds",
+]
+ALIGNMENT_METRICS_FIELDNAMES = BASE_METRICS_FIELDNAMES + [
     "train_alignment_loss",
     "val_alignment_loss",
     "val_alignment_spearman",
@@ -78,6 +87,59 @@ def _checkpoint_library_versions() -> dict[str, str]:
         "golem": golem.__version__,
         "gt_pyg": gt_pyg.__version__,
     }
+
+
+def _is_plain_2d_mode(config: PretrainConfig) -> bool:
+    """Return True for the legacy 2D-only path."""
+    return (
+        config.descriptors.include_2d_targets
+        and not config.descriptors.include_3d_targets
+        and not config.ecfp_latent_alignment.enabled
+    )
+
+
+def _artifact_config_dict(config: PretrainConfig) -> dict:
+    """Serialise config for checkpoint metadata."""
+    config_dict = asdict(config)
+    if _is_plain_2d_mode(config):
+        config_dict.pop("descriptors", None)
+        config_dict.pop("conformers", None)
+        config_dict.pop("ecfp_latent_alignment", None)
+    return config_dict
+
+
+def _resolved_config_dict(config: PretrainConfig) -> dict:
+    """Serialise config for resolved_config.yaml."""
+    return json.loads(json.dumps(_artifact_config_dict(config)))
+
+
+def _metrics_fieldnames(config: PretrainConfig) -> list[str]:
+    """Return the metrics schema for the active training mode."""
+    if config.ecfp_latent_alignment.enabled:
+        return ALIGNMENT_METRICS_FIELDNAMES
+    return BASE_METRICS_FIELDNAMES
+
+
+_INTEROP_THREADS_CONFIGURED = False
+
+
+def _enforce_plain_2d_determinism(config: PretrainConfig, device: torch.device) -> None:
+    """Clamp known nondeterministic sources in legacy plain 2D mode."""
+    global _INTEROP_THREADS_CONFIGURED
+
+    if not _is_plain_2d_mode(config):
+        return
+
+    if device.type != "cpu":
+        return
+
+    torch.set_num_threads(1)
+    if not _INTEROP_THREADS_CONFIGURED:
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+        _INTEROP_THREADS_CONFIGURED = True
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +215,6 @@ def _train_one_epoch(
     alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
         loader, "ecfp_latent_alignment", None
     )
-
     for batch in loader:
         batch = batch.to(device)
         targets = batch.y  # [B, D]
@@ -176,8 +237,7 @@ def _train_one_epoch(
             z = None
 
         # Random 15% mask ∩ validity mask
-        rand_mask = (torch.rand_like(targets) < masking_ratio).bool()
-        final_mask = rand_mask & valid_mask
+        final_mask = (torch.rand_like(targets) < masking_ratio).bool() & valid_mask
 
         if final_mask.sum() == 0:
             # Extremely rare fallback: use all valid positions
@@ -492,6 +552,7 @@ def pretrain(
     logger.info("Device: %s", device)
 
     seed_everything(config.seed)
+    _enforce_plain_2d_determinism(config, device)
 
     if config.max_epochs > 0 and config.warmup_epochs >= config.max_epochs:
         logger.warning(
@@ -500,7 +561,7 @@ def pretrain(
         )
 
     # Save resolved config (convert tuples to lists for safe_load compatibility)
-    config_dict = json.loads(json.dumps(asdict(config)))
+    config_dict = _resolved_config_dict(config)
     with open(output_dir / "resolved_config.yaml", "w") as f:
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
@@ -571,24 +632,28 @@ def pretrain(
             else np.ones(len(desc_values), dtype=np.bool_)
         )
     else:
-        logger.info(
-            "Computing descriptor targets (2D=%s, 3D=%s) …",
-            config.descriptors.include_2d_targets,
-            config.descriptors.include_3d_targets,
-        )
+        if _is_plain_2d_mode(config):
+            logger.info("Computing Mordred descriptors …")
+        else:
+            logger.info(
+                "Computing descriptor targets (2D=%s, 3D=%s) …",
+                config.descriptors.include_2d_targets,
+                config.descriptors.include_3d_targets,
+            )
         desc_values, desc_valid, descriptor_names, keep_rows = compute_descriptor_targets(
             smiles_list,
             config.descriptors,
             config.conformers,
             seed=config.seed,
         )
-        np.savez(
-            cache_path,
-            values=desc_values,
-            valid=desc_valid,
-            names=np.array(descriptor_names),
-            keep=keep_rows,
-        )
+        cache_payload = {
+            "values": desc_values,
+            "valid": desc_valid,
+            "names": np.array(descriptor_names),
+        }
+        if config.descriptors.include_3d_targets:
+            cache_payload["keep"] = keep_rows
+        np.savez(cache_path, **cache_payload)
         logger.info("Saved descriptor cache to %s", cache_path.name)
 
     if config.descriptors.include_3d_targets:
@@ -666,11 +731,6 @@ def pretrain(
             fingerprint_bits=test_fp,
         )
 
-    train_loader = make_loader(train_data, config.batch_size, shuffle=True, num_workers=config.num_workers)
-    val_loader = make_loader(val_data, config.batch_size, shuffle=False, num_workers=config.num_workers)
-    train_loader.ecfp_latent_alignment = None
-    val_loader.ecfp_latent_alignment = None
-
     # ------------------------------------------------------------------
     # 8. Create model
     # ------------------------------------------------------------------
@@ -742,6 +802,58 @@ def pretrain(
             best_epoch = ckpt.get("epoch", 0)
         logger.info("Resumed at epoch %d (best_val_loss=%.4f)", start_epoch, best_val_loss)
 
+    def _legacy_base_seed() -> int:
+        return int(torch.empty((), dtype=torch.int64).random_().item())
+
+    def _legacy_train_loader():
+        loader_seed = _legacy_base_seed()
+        sampler_seed = _legacy_base_seed()
+        loader = make_loader(
+            train_data,
+            config.batch_size,
+            num_workers=config.num_workers,
+            sampler=RandomSampler(
+                train_data,
+                generator=torch.Generator().manual_seed(sampler_seed),
+            ),
+            generator=torch.Generator().manual_seed(loader_seed),
+            worker_init_fn=seed_loader_worker,
+        )
+        loader.ecfp_latent_alignment = None
+        return loader
+
+    def _legacy_eval_loader(dataset: list):
+        loader_seed = _legacy_base_seed()
+        loader = make_loader(
+            dataset,
+            config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            generator=torch.Generator().manual_seed(loader_seed),
+            worker_init_fn=seed_loader_worker,
+        )
+        loader.ecfp_latent_alignment = None
+        return loader
+
+    train_loader = None
+    val_loader = None
+    plain_2d_mode = _is_plain_2d_mode(config)
+    if not plain_2d_mode:
+        train_loader = make_loader(
+            train_data,
+            config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+        )
+        val_loader = make_loader(
+            val_data,
+            config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+        )
+        train_loader.ecfp_latent_alignment = None
+        val_loader.ecfp_latent_alignment = None
+
     # ------------------------------------------------------------------
     # 10. Metrics CSV + Training loop
     # ------------------------------------------------------------------
@@ -757,10 +869,11 @@ def pretrain(
 
     epoch = start_epoch
     csv_mode = "a" if resume_from is not None and metrics_path.exists() else "w"
+    metrics_fieldnames = _metrics_fieldnames(config)
     if csv_mode == "a":
         with open(metrics_path, newline="") as existing_metrics:
             header = next(csv.reader(existing_metrics), [])
-        if header != METRICS_FIELDNAMES:
+        if header != metrics_fieldnames:
             raise ValueError(
                 "Cannot resume with a metrics.csv written by an older schema. "
                 "Start from a fresh output directory."
@@ -768,20 +881,24 @@ def pretrain(
     with open(metrics_path, csv_mode, newline="") as metrics_file:
         metrics_writer = csv.writer(metrics_file)
         if csv_mode == "w":
-            metrics_writer.writerow(METRICS_FIELDNAMES)
+            metrics_writer.writerow(metrics_fieldnames)
 
         for epoch in range(start_epoch, config.max_epochs):
             lr = scheduler.get_last_lr()[0]
-            train_loader.ecfp_latent_alignment = (
-                alignment_cfg
-                if alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
-                else None
-            )
-            val_loader.ecfp_latent_alignment = (
-                alignment_cfg
-                if alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
-                else None
-            )
+            if plain_2d_mode:
+                train_loader = _legacy_train_loader()
+                train_loader.ecfp_latent_alignment = None
+            else:
+                train_loader.ecfp_latent_alignment = (
+                    alignment_cfg
+                    if alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
+                    else None
+                )
+                val_loader.ecfp_latent_alignment = (
+                    alignment_cfg
+                    if alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
+                    else None
+                )
 
             train_loss, train_alignment_loss = _train_one_epoch(
                 model,
@@ -790,6 +907,8 @@ def pretrain(
                 config.masking_ratio,
                 device,
             )
+            if plain_2d_mode:
+                val_loader = _legacy_eval_loader(val_data)
             (
                 val_loss,
                 val_rmse,
@@ -799,37 +918,52 @@ def pretrain(
             ) = _validate(model, val_loader, device)
 
             elapsed = time.time() - start_time
-            metrics_writer.writerow([
+            row = [
                 epoch,
                 f"{train_loss:.6f}",
                 f"{val_loss:.6f}",
                 f"{val_rmse:.6f}",
                 f"{lr:.2e}",
                 f"{elapsed:.1f}",
-                f"{train_alignment_loss:.6f}",
-                f"{val_alignment_loss:.6f}",
-                f"{val_alignment_spearman:.6f}",
-                f"{val_alignment_kendall:.6f}",
-            ])
+            ]
+            if alignment_cfg.enabled:
+                row.extend([
+                    f"{train_alignment_loss:.6f}",
+                    f"{val_alignment_loss:.6f}",
+                    f"{val_alignment_spearman:.6f}",
+                    f"{val_alignment_kendall:.6f}",
+                ])
+            metrics_writer.writerow(row)
             metrics_file.flush()
 
-            logger.info(
-                "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  "
-                "train_align=%.4f  val_align=%.4f  lr=%.2e",
-                epoch + 1,
-                config.max_epochs,
-                train_loss,
-                val_loss,
-                val_rmse,
-                train_alignment_loss,
-                val_alignment_loss,
-                lr,
-            )
-            if math.isfinite(val_alignment_spearman) or math.isfinite(val_alignment_kendall):
+            if alignment_cfg.enabled:
                 logger.info(
-                    "           val_alignment_spearman=%.4f  val_alignment_kendall=%.4f",
-                    val_alignment_spearman,
-                    val_alignment_kendall,
+                    "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  "
+                    "train_align=%.4f  val_align=%.4f  lr=%.2e",
+                    epoch + 1,
+                    config.max_epochs,
+                    train_loss,
+                    val_loss,
+                    val_rmse,
+                    train_alignment_loss,
+                    val_alignment_loss,
+                    lr,
+                )
+                if math.isfinite(val_alignment_spearman) or math.isfinite(val_alignment_kendall):
+                    logger.info(
+                        "           val_alignment_spearman=%.4f  val_alignment_kendall=%.4f",
+                        val_alignment_spearman,
+                        val_alignment_kendall,
+                    )
+            else:
+                logger.info(
+                    "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  lr=%.2e",
+                    epoch + 1,
+                    config.max_epochs,
+                    train_loss,
+                    val_loss,
+                    val_rmse,
+                    lr,
                 )
 
             # Early stopping
@@ -885,7 +1019,15 @@ def pretrain(
     # 12. Test RMSE (if test split exists)
     # ------------------------------------------------------------------
     if test_data is not None and best_ckpt_path.exists():
-        test_loader = make_loader(test_data, config.batch_size, shuffle=False, num_workers=config.num_workers)
+        if _is_plain_2d_mode(config):
+            test_loader = _legacy_eval_loader(test_data)
+        else:
+            test_loader = make_loader(
+                test_data,
+                config.batch_size,
+                shuffle=False,
+                num_workers=config.num_workers,
+            )
         test_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
 
         # Load best checkpoint for test evaluation
@@ -950,7 +1092,7 @@ def _save_checkpoint(
             "scaler_state": scaler.state_dict(),
             "descriptor_names": descriptor_names,
             "descriptor_count": num_descriptors,
-            "config": asdict(config),
+            "config": _artifact_config_dict(config),
             "library_versions": _checkpoint_library_versions(),
             "split_indices": {
                 "train": train_idx.tolist(),

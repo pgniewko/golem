@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 import torch
+from torch_geometric.loader import DataLoader
 
 from golem.config import (
     PretrainConfig,
@@ -10,14 +11,17 @@ from golem.config import (
 )
 from golem.descriptors import NaNAwareStandardScaler
 from golem.pretrain import (
+    _artifact_config_dict,
     _checkpoint_library_versions,
     _filter_target_rows,
     _make_warmup_cosine_scheduler,
+    _metrics_fieldnames,
     _prepare_split_smiles,
+    _resolved_config_dict,
     _save_checkpoint,
     _smiles_cache_key,
 )
-from golem.utils import load_smiles, seed_everything, split_data
+from golem.utils import EpochSeededRandomSampler, load_smiles, seed_everything, split_data
 
 
 class TestConfig:
@@ -97,6 +101,118 @@ class TestSeedEverything:
         seed_everything(42)
         b = np.random.rand(5)
         np.testing.assert_array_equal(a, b)
+
+
+class TestCompatibilityArtifacts:
+    def test_artifact_config_dict_drops_additive_disabled_blocks_in_plain_2d_mode(self):
+        cfg = PretrainConfig()
+        cfg_dict = _artifact_config_dict(cfg)
+
+        assert "descriptors" not in cfg_dict
+        assert "conformers" not in cfg_dict
+        assert "ecfp_latent_alignment" not in cfg_dict
+
+    def test_artifact_config_dict_keeps_new_blocks_when_extended_modes_are_enabled(self):
+        cfg = PretrainConfig()
+        cfg.descriptors.include_3d_targets = True
+        cfg.ecfp_latent_alignment.enabled = True
+        cfg_dict = _artifact_config_dict(cfg)
+
+        assert cfg_dict["descriptors"]["include_3d_targets"] is True
+        assert cfg_dict["conformers"]["n_generate"] == cfg.conformers.n_generate
+        assert cfg_dict["ecfp_latent_alignment"]["enabled"] is True
+
+    def test_artifact_config_dict_preserves_tuple_fields_for_checkpoint_metadata(self):
+        cfg = PretrainConfig()
+        cfg_dict = _artifact_config_dict(cfg)
+
+        assert cfg_dict["winsorize_range"] == (-6.0, 6.0)
+        assert cfg_dict["isoforms"]["ph_range"] == (6.4, 8.4)
+
+    def test_resolved_config_dict_normalises_tuple_fields_for_yaml(self):
+        cfg = PretrainConfig()
+        cfg_dict = _resolved_config_dict(cfg)
+
+        assert cfg_dict["winsorize_range"] == [-6.0, 6.0]
+        assert cfg_dict["isoforms"]["ph_range"] == [6.4, 8.4]
+
+    def test_metrics_fieldnames_match_legacy_schema_without_alignment(self):
+        cfg = PretrainConfig()
+
+        assert _metrics_fieldnames(cfg) == [
+            "epoch",
+            "train_loss",
+            "val_loss",
+            "val_rmse",
+            "learning_rate",
+            "elapsed_seconds",
+        ]
+
+    def test_metrics_fieldnames_include_alignment_columns_when_enabled(self):
+        cfg = PretrainConfig()
+        cfg.ecfp_latent_alignment.enabled = True
+
+        assert _metrics_fieldnames(cfg) == [
+            "epoch",
+            "train_loss",
+            "val_loss",
+            "val_rmse",
+            "learning_rate",
+            "elapsed_seconds",
+            "train_alignment_loss",
+            "val_alignment_loss",
+            "val_alignment_spearman",
+            "val_alignment_kendall",
+        ]
+
+
+class TestEpochSeededRandomSampler:
+    def test_matches_legacy_shuffle_and_mask_rng_contract_across_epochs(self):
+        data = list(range(11))
+
+        seed_everything(123)
+        _ = torch.rand(17)
+
+        baseline_batches = []
+        baseline_masks = []
+        for _ in range(2):
+            train_loader = DataLoader(data, batch_size=4, shuffle=True, num_workers=0)
+            val_loader = DataLoader(data, batch_size=5, shuffle=False, num_workers=0)
+            baseline_batches.append([batch.tolist() for batch in train_loader])
+            baseline_masks.append(torch.rand(3, 4))
+            _ = list(val_loader)
+
+        seed_everything(123)
+        _ = torch.rand(17)
+
+        shared_rng = torch.Generator()
+        shared_rng.set_state(torch.get_rng_state())
+        train_loader = DataLoader(
+            data,
+            batch_size=4,
+            shuffle=False,
+            sampler=EpochSeededRandomSampler(data, shared_rng),
+            num_workers=0,
+            generator=shared_rng,
+        )
+        val_loader = DataLoader(
+            data,
+            batch_size=5,
+            shuffle=False,
+            num_workers=0,
+            generator=shared_rng,
+        )
+
+        actual_batches = []
+        actual_masks = []
+        for _ in range(2):
+            actual_batches.append([batch.tolist() for batch in train_loader])
+            actual_masks.append(torch.rand((3, 4), generator=shared_rng))
+            _ = list(val_loader)
+
+        assert actual_batches == baseline_batches
+        for actual, expected in zip(actual_masks, baseline_masks):
+            torch.testing.assert_close(actual, expected)
 
 
 class TestSplitData:
