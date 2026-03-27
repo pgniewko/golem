@@ -55,7 +55,15 @@ def compute_mordred_descriptors(
         mols.append(mol)
 
     logger.info("Computing Mordred 2D descriptors for %d molecules …", len(mols))
-    df = calc.pandas(mols, quiet=False)
+    try:
+        df = calc.pandas(mols, quiet=False)
+    except (EOFError, OSError, PermissionError):
+        logger.warning(
+            "Falling back to single-process Mordred computation after "
+            "multiprocessing setup failed",
+            exc_info=True,
+        )
+        df = calc.pandas(mols, nproc=1, quiet=False)
 
     # Force numeric — non-numeric entries become NaN
     df = df.apply(lambda col: col.map(lambda v: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else np.nan))

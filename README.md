@@ -132,6 +132,7 @@ This reads `metrics.csv` and `resolved_config.yaml` from the experiment director
 - Validation RMSE curve
 - Learning rate schedule
 - Train vs val loss gap
+- Optional ECFP-latent alignment chart when those metrics are present
 - Summary cards (best epoch, best val loss, elapsed time, architecture)
 - Epoch-by-epoch table with the best row highlighted
 

@@ -27,6 +27,13 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+OPTIONAL_ALIGNMENT_FIELDS = [
+    "train_alignment_loss",
+    "val_alignment_loss",
+    "val_alignment_spearman",
+    "val_alignment_kendall",
+]
+
 
 # ---------------------------------------------------------------------------
 # Data loading helpers
@@ -38,15 +45,36 @@ def _load_metrics(metrics_path: Path) -> List[Dict[str, Any]]:
     with open(metrics_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            rows.append({
+            parsed = {
                 "epoch": int(row["epoch"]),
                 "train_loss": float(row["train_loss"]),
                 "val_loss": float(row["val_loss"]),
                 "val_rmse": float(row["val_rmse"]),
                 "learning_rate": float(row["learning_rate"]),
                 "elapsed_seconds": float(row["elapsed_seconds"]),
-            })
+            }
+            for field in OPTIONAL_ALIGNMENT_FIELDS:
+                parsed[field] = _parse_optional_float(row, field)
+            rows.append(parsed)
     return rows
+
+
+def _parse_optional_float(row: Dict[str, str], key: str) -> float:
+    raw = row.get(key, "")
+    if raw in ("", None):
+        return math.nan
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _has_alignment_metrics(metrics: List[Dict[str, Any]]) -> bool:
+    return any(
+        math.isfinite(row.get(field, math.nan))
+        for row in metrics
+        for field in OPTIONAL_ALIGNMENT_FIELDS
+    )
 
 
 def _load_config(config_path: Path) -> Dict[str, Any]:
@@ -221,6 +249,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h3>Train vs Val Loss Gap</h3>
     <canvas id="gapChart"></canvas>
   </div>
+  {{ALIGNMENT_CHART}}
 </div>
 
 <!-- Config -->
@@ -256,6 +285,7 @@ const valLoss = {{VAL_LOSS_JSON}};
 const valRmse = {{VAL_RMSE_JSON}};
 const lr = {{LR_JSON}};
 const gap = trainLoss.map((t, i) => t - valLoss[i]);
+{{ALIGNMENT_JSON}}
 
 const gridColor = 'rgba(148,163,184,0.1)';
 const tickColor = '#94a3b8';
@@ -316,6 +346,7 @@ new Chart(document.getElementById('gapChart'), {
   },
   options: makeOpts('Loss Gap'),
 });
+{{ALIGNMENT_SCRIPT}}
 </script>
 </body>
 </html>
@@ -372,6 +403,47 @@ def generate_report(
     val_loss_json = json.dumps([r["val_loss"] for r in metrics])
     val_rmse_json = json.dumps([r["val_rmse"] for r in metrics])
     lr_json = json.dumps([r["learning_rate"] for r in metrics])
+    alignment_chart = ""
+    alignment_json = ""
+    alignment_script = ""
+
+    if _has_alignment_metrics(metrics):
+        alignment_chart = """
+  <div class="chart-card">
+    <h3>ECFP-Latent Alignment</h3>
+    <canvas id="alignmentChart"></canvas>
+  </div>
+"""
+        alignment_json = (
+            f"const trainAlignmentLoss = {json.dumps([r['train_alignment_loss'] for r in metrics])};\n"
+            f"const valAlignmentLoss = {json.dumps([r['val_alignment_loss'] for r in metrics])};\n"
+            f"const valAlignmentSpearman = {json.dumps([r['val_alignment_spearman'] for r in metrics])};\n"
+            f"const valAlignmentKendall = {json.dumps([r['val_alignment_kendall'] for r in metrics])};"
+        )
+        alignment_script = """
+new Chart(document.getElementById('alignmentChart'), {
+  type: 'line',
+  data: {
+    labels: epochs,
+    datasets: [
+      { label: 'Train Alignment Loss', data: trainAlignmentLoss, borderColor: '#f97316', backgroundColor: 'rgba(249,115,22,0.1)', tension: 0.3, pointRadius: 2, yAxisID: 'y' },
+      { label: 'Val Alignment Loss', data: valAlignmentLoss, borderColor: '#facc15', backgroundColor: 'rgba(250,204,21,0.1)', tension: 0.3, pointRadius: 2, yAxisID: 'y' },
+      { label: 'Val Spearman', data: valAlignmentSpearman, borderColor: '#a78bfa', backgroundColor: 'rgba(167,139,250,0.1)', tension: 0.3, pointRadius: 2, yAxisID: 'y1' },
+      { label: 'Val Kendall', data: valAlignmentKendall, borderColor: '#fb7185', backgroundColor: 'rgba(251,113,133,0.1)', tension: 0.3, pointRadius: 2, yAxisID: 'y1' },
+    ],
+  },
+  options: {
+    responsive: true,
+    interaction: { mode: 'index', intersect: false },
+    plugins: { legend: { labels: { color: tickColor, usePointStyle: true, pointStyle: 'circle' } } },
+    scales: {
+      x: { title: { display: true, text: 'Epoch', color: tickColor }, ticks: { color: tickColor }, grid: { color: gridColor } },
+      y: { title: { display: true, text: 'Alignment Loss', color: tickColor }, ticks: { color: tickColor }, grid: { color: gridColor } },
+      y1: { position: 'right', title: { display: true, text: 'Rank Correlation', color: tickColor }, ticks: { color: tickColor }, grid: { drawOnChartArea: false } },
+    },
+  },
+});
+"""
 
     # Build config items HTML
     flat_config = _flatten_config(config)
@@ -418,6 +490,9 @@ def generate_report(
         "{{VAL_LOSS_JSON}}": val_loss_json,
         "{{VAL_RMSE_JSON}}": val_rmse_json,
         "{{LR_JSON}}": lr_json,
+        "{{ALIGNMENT_CHART}}": alignment_chart,
+        "{{ALIGNMENT_JSON}}": alignment_json,
+        "{{ALIGNMENT_SCRIPT}}": alignment_script,
     }
     for placeholder, value in replacements.items():
         html = html.replace(placeholder, value)
