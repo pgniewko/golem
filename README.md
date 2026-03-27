@@ -84,7 +84,7 @@ Optional ECFP-latent alignment can be enabled in YAML:
 ```yaml
 ecfp_latent_alignment:
   enabled: true
-  weight: 0.01
+  weight: 0.05
   num_pairs: 128
 ```
 
