@@ -43,8 +43,8 @@ descriptors:
     electroshape_charge_model: gasteiger  # supported: gasteiger, mmff94
 
 conformers:
-  timeout_seconds: 10
-  n_generate: 12
+  timeout_seconds: 15
+  n_generate: 8
   n_keep: 4
   energy_window_kcal: 10.0
   prune_rms: 0.75
