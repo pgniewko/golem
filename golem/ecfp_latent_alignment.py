@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from pathlib import Path
 from typing import List
@@ -15,6 +16,8 @@ from rdkit.Chem import AllChem
 
 from golem.config import ECFPLatentAlignmentConfig
 
+logger = logging.getLogger(__name__)
+
 
 def _sample_pairs(
     batch_size: int,
@@ -23,7 +26,19 @@ def _sample_pairs(
     *,
     deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if batch_size < 2 or num_pairs <= 0:
+    if batch_size < 2:
+        logger.warning(
+            "Skipping ECFP-latent alignment for batch_size=%d: need at least 2 samples.",
+            batch_size,
+        )
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty
+
+    if num_pairs <= 0:
+        logger.warning(
+            "Skipping ECFP-latent alignment for num_pairs=%d: need a positive pair count.",
+            num_pairs,
+        )
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
 

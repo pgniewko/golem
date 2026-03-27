@@ -51,7 +51,7 @@ class ECFPLatentAlignmentConfig:
     """Optional ECFP-to-latent metric alignment config."""
 
     enabled: bool = False
-    weight: float = 0.01
+    weight: float = 0.05
     fp_bits: int = 2048
     fp_radius: int = 2
     num_pairs: int = 128
