@@ -776,12 +776,26 @@ def pretrain(
     # ------------------------------------------------------------------
     if test_data is not None and best_ckpt_path.exists():
         test_loader = make_loader(test_data, config.batch_size, shuffle=False, num_workers=config.num_workers)
+        test_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
 
         # Load best checkpoint for test evaluation
         model.load_weights(best_ckpt_path, map_location=device)
 
-        test_mse, test_rmse, _, _, _ = _validate(model, test_loader, device)
+        (
+            test_mse,
+            test_rmse,
+            test_alignment_loss,
+            test_alignment_spearman,
+            test_alignment_kendall,
+        ) = _validate(model, test_loader, device)
         logger.info("Test RMSE (best model): %.4f", test_rmse)
+        if alignment_cfg.enabled:
+            logger.info(
+                "Test alignment: loss=%.4f  spearman=%.4f  kendall=%.4f",
+                test_alignment_loss,
+                test_alignment_spearman,
+                test_alignment_kendall,
+            )
 
     # ------------------------------------------------------------------
     # 13. Generate HTML report
