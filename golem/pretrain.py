@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -33,13 +34,31 @@ import torch
 from rdkit import Chem
 import torch.nn.functional as F
 import yaml
-from golem.config import PretrainConfig
+from golem.config import ECFPLatentAlignmentConfig, PretrainConfig
 from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
+from golem.ecfp_latent_alignment import (
+    compute_alignment_batch,
+    compute_alignment_metrics,
+    load_or_compute_fingerprints,
+)
 from golem.isoforms import enumerate_isoforms_batch
 from golem.report import generate_report
 from golem.utils import load_smiles, make_loader, seed_everything, split_data
 
 logger = logging.getLogger(__name__)
+
+METRICS_FIELDNAMES = [
+    "epoch",
+    "train_loss",
+    "val_loss",
+    "val_rmse",
+    "learning_rate",
+    "elapsed_seconds",
+    "train_alignment_loss",
+    "val_alignment_loss",
+    "val_alignment_spearman",
+    "val_alignment_kendall",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -121,21 +140,36 @@ def _train_one_epoch(
     optimizer: torch.optim.Optimizer,
     masking_ratio: float,
     device: torch.device,
-) -> float:
-    """Run one training epoch.  Returns mean loss."""
+) -> tuple[float, float]:
+    """Run one training epoch. Returns descriptor and alignment losses."""
     model.train()
     total_loss = 0.0
+    total_alignment_loss = 0.0
     n_batches = 0
+    alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
+        loader, "ecfp_latent_alignment", None
+    )
 
     for batch in loader:
         batch = batch.to(device)
         targets = batch.y  # [B, D]
         valid_mask = batch.y_mask.bool()  # [B, D]
 
-        pred, _log_var = model(
-            batch.x, batch.edge_index, batch.edge_attr,
-            batch=batch.batch, zero_var=True,
-        )
+        if alignment_cfg is not None:
+            pred, _log_var, z = model(
+                batch.x,
+                batch.edge_index,
+                batch.edge_attr,
+                batch=batch.batch,
+                zero_var=True,
+                return_latent=True,
+            )
+        else:
+            pred, _log_var = model(
+                batch.x, batch.edge_index, batch.edge_attr,
+                batch=batch.batch, zero_var=True,
+            )
+            z = None
 
         # Random 15% mask ∩ validity mask
         rand_mask = (torch.rand_like(targets) < masking_ratio).bool()
@@ -149,16 +183,21 @@ def _train_one_epoch(
             continue  # skip batch if no valid positions at all
 
         loss = F.mse_loss(pred[final_mask], targets[final_mask])
+        alignment_loss = loss.new_zeros(())
+        if z is not None and alignment_cfg is not None:
+            alignment_loss, _, _ = compute_alignment_batch(batch, z, alignment_cfg)
+        total_step_loss = loss + alignment_loss * (alignment_cfg.weight if alignment_cfg is not None else 0.0)
 
         optimizer.zero_grad()
-        loss.backward()
+        total_step_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
         total_loss += loss.item()
+        total_alignment_loss += alignment_loss.item()
         n_batches += 1
 
-    return total_loss / max(n_batches, 1)
+    return total_loss / max(n_batches, 1), total_alignment_loss / max(n_batches, 1)
 
 
 @torch.no_grad()
@@ -166,21 +205,50 @@ def _validate(
     model: torch.nn.Module,
     loader,
     device: torch.device,
-) -> Tuple[float, float]:
-    """Validate.  Returns (mean_mse_loss, rmse) on valid positions (no random mask)."""
+) -> tuple[float, float, float, float, float]:
+    """Validate and optionally compute alignment metrics."""
     model.eval()
     total_se = 0.0
     total_count = 0
+    alignment_losses: List[float] = []
+    spearmans: List[float] = []
+    kendalls: List[float] = []
+    alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
+        loader, "ecfp_latent_alignment", None
+    )
 
     for batch in loader:
         batch = batch.to(device)
         targets = batch.y
         valid_mask = batch.y_mask.bool()
 
-        pred, _ = model(
-            batch.x, batch.edge_index, batch.edge_attr,
-            batch=batch.batch, zero_var=True,
-        )
+        if alignment_cfg is not None:
+            pred, _, z = model(
+                batch.x,
+                batch.edge_index,
+                batch.edge_attr,
+                batch=batch.batch,
+                zero_var=True,
+                return_latent=True,
+            )
+            alignment_loss, d_fp, d_z = compute_alignment_batch(
+                batch,
+                z,
+                alignment_cfg,
+                deterministic_pairs=True,
+            )
+            alignment_losses.append(alignment_loss.item())
+            if alignment_cfg.log_rank_metrics:
+                spearman, kendall = compute_alignment_metrics(d_fp, d_z)
+                if math.isfinite(spearman):
+                    spearmans.append(spearman)
+                if math.isfinite(kendall):
+                    kendalls.append(kendall)
+        else:
+            pred, _ = model(
+                batch.x, batch.edge_index, batch.edge_attr,
+                batch=batch.batch, zero_var=True,
+            )
 
         if valid_mask.sum() == 0:
             continue
@@ -191,7 +259,13 @@ def _validate(
 
     mse = total_se / max(total_count, 1)
     rmse = math.sqrt(mse)
-    return mse, rmse
+    return (
+        mse,
+        rmse,
+        float(np.mean(alignment_losses)) if alignment_losses else math.nan,
+        float(np.mean(spearmans)) if spearmans else math.nan,
+        float(np.mean(kendalls)) if kendalls else math.nan,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +276,7 @@ def _build_pyg_dataset(
     smiles_list: List[str],
     descriptor_values: np.ndarray,
     validity_mask: np.ndarray,
+    fingerprint_bits: Optional[np.ndarray] = None,
 ) -> list:
     """Build PyG Data objects with graph features + descriptor targets.
 
@@ -209,8 +284,6 @@ def _build_pyg_dataset(
     overwrites ``data.y`` and ``data.y_mask`` with descriptor targets.
     """
     from gt_pyg import get_tensor_data
-
-    num_descriptors = descriptor_values.shape[1]
 
     logger.info("Building PyG graph features for %d molecules …", len(smiles_list))
     data_list = get_tensor_data(smiles_list, y=None)
@@ -221,6 +294,8 @@ def _build_pyg_dataset(
     for i, data in enumerate(data_list):
         data.y = torch.tensor(descriptor_values[i], dtype=torch.float32).unsqueeze(0)
         data.y_mask = torch.tensor(validity_mask[i], dtype=torch.float32).unsqueeze(0)
+        if fingerprint_bits is not None:
+            data.ecfp = torch.tensor(fingerprint_bits[i], dtype=torch.bool).unsqueeze(0)
 
     return data_list
 
@@ -426,6 +501,16 @@ def pretrain(
     num_descriptors = desc_values.shape[1]
     logger.info("Descriptor matrix: %d molecules × %d descriptors", desc_values.shape[0], num_descriptors)
 
+    fp_bits = None
+    alignment_cfg = config.ecfp_latent_alignment
+    if alignment_cfg.enabled:
+        fp_bits = load_or_compute_fingerprints(output_dir, smiles_list, alignment_cfg)
+        logger.info(
+            "Fingerprint matrix: %d molecules × %d bits",
+            fp_bits.shape[0],
+            fp_bits.shape[1],
+        )
+
     # ------------------------------------------------------------------
     # 5. Fit scaler on TRAIN only
     # ------------------------------------------------------------------
@@ -443,17 +528,37 @@ def pretrain(
     # ------------------------------------------------------------------
     train_smiles = [smiles_list[i] for i in train_idx]
     val_smiles = [smiles_list[i] for i in val_idx]
+    train_fp = fp_bits[train_idx] if fp_bits is not None else None
+    val_fp = fp_bits[val_idx] if fp_bits is not None else None
 
-    train_data = _build_pyg_dataset(train_smiles, desc_values[train_idx], desc_valid[train_idx])
-    val_data = _build_pyg_dataset(val_smiles, desc_values[val_idx], desc_valid[val_idx])
+    train_data = _build_pyg_dataset(
+        train_smiles,
+        desc_values[train_idx],
+        desc_valid[train_idx],
+        fingerprint_bits=train_fp,
+    )
+    val_data = _build_pyg_dataset(
+        val_smiles,
+        desc_values[val_idx],
+        desc_valid[val_idx],
+        fingerprint_bits=val_fp,
+    )
 
     test_data = None
     if test_idx is not None:
         test_smiles = [smiles_list[i] for i in test_idx]
-        test_data = _build_pyg_dataset(test_smiles, desc_values[test_idx], desc_valid[test_idx])
+        test_fp = fp_bits[test_idx] if fp_bits is not None else None
+        test_data = _build_pyg_dataset(
+            test_smiles,
+            desc_values[test_idx],
+            desc_valid[test_idx],
+            fingerprint_bits=test_fp,
+        )
 
     train_loader = make_loader(train_data, config.batch_size, shuffle=True, num_workers=config.num_workers)
     val_loader = make_loader(val_data, config.batch_size, shuffle=False, num_workers=config.num_workers)
+    train_loader.ecfp_latent_alignment = None
+    val_loader.ecfp_latent_alignment = None
 
     # ------------------------------------------------------------------
     # 8. Create model
@@ -462,7 +567,6 @@ def pretrain(
     from gt_pyg.data import get_atom_feature_dim, get_bond_feature_dim
 
     mc = config.model
-    import inspect
     gt_params = inspect.signature(GraphTransformerNet.__init__).parameters
     model_kwargs = dict(
         node_dim_in=get_atom_feature_dim(),
@@ -485,6 +589,11 @@ def pretrain(
     if "head_dropout" in gt_params and mc.head_dropout is not None:
         model_kwargs["head_dropout"] = mc.head_dropout
     model = GraphTransformerNet(**model_kwargs).to(device)
+    if alignment_cfg.enabled and "return_latent" not in inspect.signature(model.forward).parameters:
+        raise RuntimeError(
+            "ECFP-latent alignment requires gt-pyg with "
+            "GraphTransformerNet.forward(..., return_latent=True)."
+        )
 
     n_params = model.num_parameters()
     logger.info("Model: %d trainable parameters, num_tasks=%d", n_params, num_descriptors)
@@ -537,25 +646,80 @@ def pretrain(
 
     epoch = start_epoch
     csv_mode = "a" if resume_from is not None and metrics_path.exists() else "w"
+    if csv_mode == "a":
+        with open(metrics_path, newline="") as existing_metrics:
+            header = next(csv.reader(existing_metrics), [])
+        if header != METRICS_FIELDNAMES:
+            raise ValueError(
+                "Cannot resume with a metrics.csv written by an older schema. "
+                "Start from a fresh output directory."
+            )
     with open(metrics_path, csv_mode, newline="") as metrics_file:
         metrics_writer = csv.writer(metrics_file)
         if csv_mode == "w":
-            metrics_writer.writerow(["epoch", "train_loss", "val_loss", "val_rmse", "learning_rate", "elapsed_seconds"])
+            metrics_writer.writerow(METRICS_FIELDNAMES)
 
         for epoch in range(start_epoch, config.max_epochs):
             lr = scheduler.get_last_lr()[0]
+            train_loader.ecfp_latent_alignment = (
+                alignment_cfg
+                if alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
+                else None
+            )
+            val_loader.ecfp_latent_alignment = (
+                alignment_cfg
+                if alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
+                else None
+            )
 
-            train_loss = _train_one_epoch(model, train_loader, optimizer, config.masking_ratio, device)
-            val_loss, val_rmse = _validate(model, val_loader, device)
+            train_loss, train_alignment_loss = _train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                config.masking_ratio,
+                device,
+            )
+            (
+                val_loss,
+                val_rmse,
+                val_alignment_loss,
+                val_alignment_spearman,
+                val_alignment_kendall,
+            ) = _validate(model, val_loader, device)
 
             elapsed = time.time() - start_time
-            metrics_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_rmse:.6f}", f"{lr:.2e}", f"{elapsed:.1f}"])
+            metrics_writer.writerow([
+                epoch,
+                f"{train_loss:.6f}",
+                f"{val_loss:.6f}",
+                f"{val_rmse:.6f}",
+                f"{lr:.2e}",
+                f"{elapsed:.1f}",
+                f"{train_alignment_loss:.6f}",
+                f"{val_alignment_loss:.6f}",
+                f"{val_alignment_spearman:.6f}",
+                f"{val_alignment_kendall:.6f}",
+            ])
             metrics_file.flush()
 
             logger.info(
-                "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  lr=%.2e",
-                epoch + 1, config.max_epochs, train_loss, val_loss, val_rmse, lr,
+                "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  "
+                "train_align=%.4f  val_align=%.4f  lr=%.2e",
+                epoch + 1,
+                config.max_epochs,
+                train_loss,
+                val_loss,
+                val_rmse,
+                train_alignment_loss,
+                val_alignment_loss,
+                lr,
             )
+            if math.isfinite(val_alignment_spearman) or math.isfinite(val_alignment_kendall):
+                logger.info(
+                    "           val_alignment_spearman=%.4f  val_alignment_kendall=%.4f",
+                    val_alignment_spearman,
+                    val_alignment_kendall,
+                )
 
             # Early stopping
             if val_loss < best_val_loss:
@@ -611,12 +775,26 @@ def pretrain(
     # ------------------------------------------------------------------
     if test_data is not None and best_ckpt_path.exists():
         test_loader = make_loader(test_data, config.batch_size, shuffle=False, num_workers=config.num_workers)
+        test_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
 
         # Load best checkpoint for test evaluation
         model.load_weights(best_ckpt_path, map_location=device)
 
-        test_mse, test_rmse = _validate(model, test_loader, device)
+        (
+            test_mse,
+            test_rmse,
+            test_alignment_loss,
+            test_alignment_spearman,
+            test_alignment_kendall,
+        ) = _validate(model, test_loader, device)
         logger.info("Test RMSE (best model): %.4f", test_rmse)
+        if alignment_cfg.enabled:
+            logger.info(
+                "Test alignment: loss=%.4f  spearman=%.4f  kendall=%.4f",
+                test_alignment_loss,
+                test_alignment_spearman,
+                test_alignment_kendall,
+            )
 
     # ------------------------------------------------------------------
     # 13. Generate HTML report

@@ -79,6 +79,15 @@ golem pretrain \
   --output experiments/pretrain
 ```
 
+Optional ECFP-latent alignment can be enabled in YAML:
+
+```yaml
+ecfp_latent_alignment:
+  enabled: true
+  weight: 0.05
+  num_pairs: 128
+```
+
 ### CLI options
 
 | Flag | Description | Default |
@@ -105,7 +114,7 @@ experiments/pretrain/
   resolved_config.yaml      # Full resolved config used for the run
   pretrain_report.html      # HTML dashboard with training curves and metrics (not tracked)
   last_checkpoint.pt        # Last epoch, for resuming (not tracked)
-  metrics.csv               # Per-epoch: train_loss, val_loss, val_rmse, lr (not tracked)
+  metrics.csv               # Per-epoch losses, RMSE, LR, and optional alignment metrics (not tracked)
   pretrain.log              # Full log output (not tracked)
 ```
 

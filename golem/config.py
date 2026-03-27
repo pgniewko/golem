@@ -47,11 +47,29 @@ class IsoformConfig:
 
 
 @dataclass
+class ECFPLatentAlignmentConfig:
+    """Optional ECFP-to-latent metric alignment config."""
+
+    enabled: bool = False
+    weight: float = 0.05
+    fp_bits: int = 2048
+    fp_radius: int = 2
+    num_pairs: int = 128
+    temperature: float = 0.1
+    tie_epsilon: float = 0.02
+    warmup_epochs: int = 5
+    log_rank_metrics: bool = True
+
+
+@dataclass
 class PretrainConfig:
     """Full pretraining pipeline config."""
 
     model: ModelConfig = field(default_factory=ModelConfig)
     isoforms: IsoformConfig = field(default_factory=IsoformConfig)
+    ecfp_latent_alignment: ECFPLatentAlignmentConfig = field(
+        default_factory=ECFPLatentAlignmentConfig
+    )
     masking_ratio: float = 0.15
     batch_size: int = 128
     max_epochs: int = 500
@@ -80,6 +98,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     """Build PretrainConfig from a flat/nested dict."""
     model_d = d.pop("model", {})
     isoform_d = d.pop("isoforms", {})
+    alignment_d = d.pop("ecfp_latent_alignment", {})
 
     # Handle nested YAML structures for isoforms
     if "tautomers" in isoform_d and isinstance(isoform_d["tautomers"], dict):
@@ -107,10 +126,12 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     # Remove keys not in dataclass (e.g. deduplication, tool, fallback)
     model_fields = {f.name for f in fields(ModelConfig)}
     isoform_fields = {f.name for f in fields(IsoformConfig)}
+    alignment_fields = {f.name for f in fields(ECFPLatentAlignmentConfig)}
     pretrain_fields = {f.name for f in fields(PretrainConfig)}
 
     model_d = {k: v for k, v in model_d.items() if k in model_fields}
     isoform_d = {k: v for k, v in isoform_d.items() if k in isoform_fields}
+    alignment_d = {k: v for k, v in alignment_d.items() if k in alignment_fields}
 
     # Handle residual "pretrain" sub-key (already flattened in load_config,
     # but handle gracefully if _dict_to_config is called directly)
@@ -131,6 +152,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     return PretrainConfig(
         model=ModelConfig(**model_d),
         isoforms=IsoformConfig(**isoform_d),
+        ecfp_latent_alignment=ECFPLatentAlignmentConfig(**alignment_d),
         **d,
     )
 
