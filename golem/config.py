@@ -83,9 +83,9 @@ class DescriptorConfig:
 class ConformerConfig:
     """Offline conformer generation settings for 3D descriptor targets."""
 
-    n_generate: int = 12
+    n_generate: int = 8
     n_keep: int = 4
-    timeout_seconds: int = 10
+    timeout_seconds: int = 15
     energy_window_kcal: float = 10.0
     prune_rms: float = 0.75
     optimize: str = "MMFF"

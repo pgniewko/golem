@@ -43,9 +43,9 @@ class TestConfig:
         assert cfg.descriptors.include_3d_targets is False
         assert cfg.descriptors.loss_weight == 1.0
         assert cfg.descriptors.three_d_settings.rdkit_include_getaway is False
-        assert cfg.conformers.n_generate == 12
+        assert cfg.conformers.n_generate == 8
         assert cfg.conformers.n_keep == 4
-        assert cfg.conformers.timeout_seconds == 10
+        assert cfg.conformers.timeout_seconds == 15
 
     def test_load_config_defaults_only(self):
         """load_config with no args should return defaults."""

@@ -193,7 +193,6 @@ def compute_alignment_metrics(
 
 
 def _fingerprint_cache_path(
-    _output_dir: Path,
     smiles_list: List[str],
     config: ECFPLatentAlignmentConfig,
 ) -> Path:
@@ -206,7 +205,8 @@ def load_or_compute_fingerprints(
     smiles_list: List[str],
     config: ECFPLatentAlignmentConfig,
 ) -> np.ndarray:
-    cache_path = _fingerprint_cache_path(output_dir, smiles_list, config)
+    del output_dir
+    cache_path = _fingerprint_cache_path(smiles_list, config)
     if cache_path.exists():
         logger.info("Loading shared fingerprint cache from %s", cache_path.name)
         cached = np.load(cache_path, allow_pickle=False)

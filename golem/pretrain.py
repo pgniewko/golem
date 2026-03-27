@@ -151,6 +151,39 @@ def _format_running_metric(total: float, count: int) -> str:
     return f"{total / count:.4f}"
 
 
+def _epoch_prefix(epoch: int | None, max_epochs: int | None) -> str:
+    """Return a formatted epoch prefix for progress logs."""
+    if epoch is None or max_epochs is None:
+        return ""
+    return f"Epoch {epoch:3d}/{max_epochs} — "
+
+
+def _log_stage_progress(
+    stage: str,
+    batch_idx: int,
+    total_batches: int,
+    stage_start: float,
+    *,
+    progress_interval: int,
+    epoch: int | None = None,
+    max_epochs: int | None = None,
+    **metrics: str,
+) -> None:
+    """Emit a lightweight progress heartbeat for train/validation loops."""
+    if batch_idx % progress_interval != 0 and batch_idx != total_batches:
+        return
+
+    logger.info(
+        "%s%s %d/%d batches — elapsed=%.1fs  %s",
+        _epoch_prefix(epoch, max_epochs),
+        stage,
+        batch_idx,
+        total_batches,
+        time.time() - stage_start,
+        "  ".join(f"{name}={value}" for name, value in metrics.items()),
+    )
+
+
 _INTEROP_THREADS_CONFIGURED = False
 
 
@@ -305,21 +338,18 @@ def _train_one_epoch(
         total_alignment_loss += alignment_loss.item()
         n_batches += 1
 
-        if batch_idx % progress_interval == 0 or batch_idx == total_batches:
-            prefix = ""
-            if epoch is not None and max_epochs is not None:
-                prefix = f"Epoch {epoch:3d}/{max_epochs} — "
-            logger.info(
-                "%strain %d/%d batches — elapsed=%.1fs  running_loss=%s  "
-                "running_desc=%s  running_align=%s",
-                prefix,
-                batch_idx,
-                total_batches,
-                time.time() - stage_start,
-                _format_running_metric(total_loss, n_batches),
-                _format_running_metric(total_descriptor_loss, n_batches),
-                _format_running_metric(total_alignment_loss, n_batches),
-            )
+        _log_stage_progress(
+            "train",
+            batch_idx,
+            total_batches,
+            stage_start,
+            progress_interval=progress_interval,
+            epoch=epoch,
+            max_epochs=max_epochs,
+            running_loss=_format_running_metric(total_loss, n_batches),
+            running_desc=_format_running_metric(total_descriptor_loss, n_batches),
+            running_align=_format_running_metric(total_alignment_loss, n_batches),
+        )
 
     return (
         total_loss / max(n_batches, 1),
@@ -392,24 +422,19 @@ def _validate(
         total_se += se
         total_count += valid_mask.sum().item()
 
-        if batch_idx % progress_interval == 0 or batch_idx == total_batches:
-            descriptor_loss = math.nan
-            if total_count > 0:
-                descriptor_loss = total_se / total_count
-            prefix = ""
-            if epoch is not None and max_epochs is not None:
-                prefix = f"Epoch {epoch:3d}/{max_epochs} — "
-            logger.info(
-                "%sval %d/%d batches — elapsed=%.1fs  running_desc=%s  "
-                "running_rmse=%s  running_align=%s",
-                prefix,
-                batch_idx,
-                total_batches,
-                time.time() - stage_start,
-                f"{descriptor_loss:.4f}" if math.isfinite(descriptor_loss) else "n/a",
-                f"{math.sqrt(descriptor_loss):.4f}" if math.isfinite(descriptor_loss) else "n/a",
-                _format_optional_metric(float(np.mean(alignment_losses))) if alignment_losses else "n/a",
-            )
+        descriptor_loss = total_se / total_count if total_count > 0 else math.nan
+        _log_stage_progress(
+            "val",
+            batch_idx,
+            total_batches,
+            stage_start,
+            progress_interval=progress_interval,
+            epoch=epoch,
+            max_epochs=max_epochs,
+            running_desc=f"{descriptor_loss:.4f}" if math.isfinite(descriptor_loss) else "n/a",
+            running_rmse=f"{math.sqrt(descriptor_loss):.4f}" if math.isfinite(descriptor_loss) else "n/a",
+            running_align=_format_optional_metric(float(np.mean(alignment_losses))) if alignment_losses else "n/a",
+        )
 
     descriptor_loss = math.nan
     rmse = math.nan
@@ -452,15 +477,7 @@ def _build_pyg_dataset(
     """
     from torch_geometric.data import Data
 
-    cache_path = _graph_cache_path(smiles_list)
-    if cache_path.exists():
-        logger.info("Loading shared graph cache from %s", cache_path.name)
-        graph_payloads = torch.load(cache_path, map_location="cpu", weights_only=False)
-    else:
-        logger.info("Shared graph cache miss for %d molecules", len(smiles_list))
-        graph_payloads = _build_graph_cache_payload(smiles_list)
-        torch.save(graph_payloads, cache_path)
-        logger.info("Saved shared graph cache to %s", cache_path.name)
+    graph_payloads = _load_or_build_graph_payloads(smiles_list)
 
     data_list = [
         Data(
@@ -495,6 +512,11 @@ def _smiles_cache_key(smiles_list: List[str]) -> str:
 
 def _descriptor_cache_path(smiles_list: List[str], config: PretrainConfig) -> Path:
     """Return the shared descriptor cache path for the current target configuration."""
+    return cache_dir("descriptors") / f"descriptors_{_descriptor_cache_key(smiles_list, config)}.npz"
+
+
+def _descriptor_cache_key(smiles_list: List[str], config: PretrainConfig) -> str:
+    """Return the shared descriptor cache key for the current target configuration."""
     if config.descriptors.include_3d_targets:
         payload = {
             "smiles": smiles_list,
@@ -503,12 +525,10 @@ def _descriptor_cache_path(smiles_list: List[str], config: PretrainConfig) -> Pa
             "descriptors": asdict(config.descriptors),
             "conformers": asdict(config.conformers),
         }
-        cache_key = hashlib.sha256(
+        return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()[:16]
-    else:
-        cache_key = _smiles_cache_key(smiles_list)
-    return cache_dir("descriptors") / f"descriptors_{cache_key}.npz"
+    return _smiles_cache_key(smiles_list)
 
 
 def _graph_cache_path(smiles_list: List[str]) -> Path:
@@ -540,6 +560,68 @@ def _build_graph_cache_payload(smiles_list: List[str]) -> list[dict[str, torch.T
         }
         for data in data_list
     ]
+
+
+def _load_or_build_graph_payloads(smiles_list: List[str]) -> list[dict[str, torch.Tensor]]:
+    """Load cached graph tensors or build and cache them on demand."""
+    cache_path = _graph_cache_path(smiles_list)
+    if cache_path.exists():
+        logger.info("Loading shared graph cache from %s", cache_path.name)
+        return torch.load(cache_path, map_location="cpu", weights_only=False)
+
+    logger.info("Shared graph cache miss for %d molecules", len(smiles_list))
+    graph_payloads = _build_graph_cache_payload(smiles_list)
+    torch.save(graph_payloads, cache_path)
+    logger.info("Saved shared graph cache to %s", cache_path.name)
+    return graph_payloads
+
+
+def _load_or_compute_descriptor_targets(
+    smiles_list: List[str],
+    config: PretrainConfig,
+) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
+    """Load cached descriptor targets or compute and cache them on demand."""
+    cache_path = _descriptor_cache_path(smiles_list, config)
+    if cache_path.exists():
+        logger.info("Loading shared descriptor cache from %s", cache_path.name)
+        cached = np.load(cache_path, allow_pickle=True)
+        keep_rows = (
+            cached["keep"].astype(np.bool_, copy=False)
+            if "keep" in cached.files
+            else np.ones(len(cached["values"]), dtype=np.bool_)
+        )
+        return (
+            cached["values"],
+            cached["valid"],
+            cached["names"].tolist(),
+            keep_rows,
+        )
+
+    logger.info("Shared descriptor cache miss for %d molecules", len(smiles_list))
+    if _is_plain_2d_mode(config):
+        logger.info("Computing Mordred descriptors …")
+    else:
+        logger.info(
+            "Computing descriptor targets (2D=%s, 3D=%s) …",
+            config.descriptors.include_2d_targets,
+            config.descriptors.include_3d_targets,
+        )
+    desc_values, desc_valid, descriptor_names, keep_rows = compute_descriptor_targets(
+        smiles_list,
+        config.descriptors,
+        config.conformers,
+        seed=config.seed,
+    )
+    cache_payload = {
+        "values": desc_values,
+        "valid": desc_valid,
+        "names": np.array(descriptor_names),
+    }
+    if config.descriptors.include_3d_targets:
+        cache_payload["keep"] = keep_rows
+    np.savez(cache_path, **cache_payload)
+    logger.info("Saved shared descriptor cache to %s", cache_path.name)
+    return desc_values, desc_valid, descriptor_names, keep_rows
 
 
 def _open_metrics_writer(
@@ -798,44 +880,10 @@ def pretrain(
     # ------------------------------------------------------------------
     # 4. Compute descriptor targets (with disk cache)
     # ------------------------------------------------------------------
-    cache_path = _descriptor_cache_path(smiles_list, config)
-
-    if cache_path.exists():
-        logger.info("Loading shared descriptor cache from %s", cache_path.name)
-        cached = np.load(cache_path, allow_pickle=True)
-        desc_values = cached["values"]
-        desc_valid = cached["valid"]
-        descriptor_names = cached["names"].tolist()
-        keep_rows = (
-            cached["keep"].astype(np.bool_, copy=False)
-            if "keep" in cached.files
-            else np.ones(len(desc_values), dtype=np.bool_)
-        )
-    else:
-        logger.info("Shared descriptor cache miss for %d molecules", len(smiles_list))
-        if _is_plain_2d_mode(config):
-            logger.info("Computing Mordred descriptors …")
-        else:
-            logger.info(
-                "Computing descriptor targets (2D=%s, 3D=%s) …",
-                config.descriptors.include_2d_targets,
-                config.descriptors.include_3d_targets,
-            )
-        desc_values, desc_valid, descriptor_names, keep_rows = compute_descriptor_targets(
-            smiles_list,
-            config.descriptors,
-            config.conformers,
-            seed=config.seed,
-        )
-        cache_payload = {
-            "values": desc_values,
-            "valid": desc_valid,
-            "names": np.array(descriptor_names),
-        }
-        if config.descriptors.include_3d_targets:
-            cache_payload["keep"] = keep_rows
-        np.savez(cache_path, **cache_payload)
-        logger.info("Saved shared descriptor cache to %s", cache_path.name)
+    desc_values, desc_valid, descriptor_names, keep_rows = _load_or_compute_descriptor_targets(
+        smiles_list,
+        config,
+    )
 
     if config.descriptors.include_3d_targets:
         (
