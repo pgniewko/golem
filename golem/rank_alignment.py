@@ -1,4 +1,4 @@
-"""Geometry regularizer helpers for pretraining."""
+"""Rank-alignment regularizer helpers for pretraining."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ import torch.nn.functional as F
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
 
-from golem.config import GeometryConfig
+from golem.config import RankAlignmentConfig
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class GeometryBatchResult:
-    """Loss and sampled distances for one geometry-regularizer batch."""
+class RankAlignmentBatchResult:
+    """Loss and sampled distances for one rank-alignment batch."""
 
     loss: torch.Tensor
     d_fp: torch.Tensor
@@ -43,7 +43,13 @@ def _sample_batch_pairs(
     *,
     deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Select unique unordered graph pairs from a batch."""
+    """Select unique unordered graph pairs from a batch.
+
+    We use uniform sampling of unordered pairs within each batch. More
+    sophisticated strategies (e.g., hard-pair mining or
+    similarity-stratified sampling) could improve the sample efficiency,
+    but are not explored at the moment.
+    """
     if batch_size < 2 or (num_pairs is not None and num_pairs <= 0):
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
@@ -200,47 +206,49 @@ def _pair_rank_metrics(d_fp: torch.Tensor, d_z: torch.Tensor) -> Tuple[float, fl
     return _spearman_correlation(fp_np, z_np), _kendall_tau(fp_np, z_np)
 
 
-def _compute_geometry_batch(
+def _compute_rank_alignment_batch(
     batch,
     z: torch.Tensor,
-    geometry: GeometryConfig,
+    rank_alignment: RankAlignmentConfig,
     *,
     deterministic_pairs: bool = False,
-) -> GeometryBatchResult:
-    """Return geometry loss and sampled primal/latent pair distances."""
+) -> RankAlignmentBatchResult:
+    """Return rank-alignment loss and sampled primal/latent pair distances."""
     if not hasattr(batch, "ecfp"):
         empty = z.new_empty(0)
-        return GeometryBatchResult(loss=z.sum() * 0.0, d_fp=empty, d_z=empty)
+        return RankAlignmentBatchResult(loss=z.sum() * 0.0, d_fp=empty, d_z=empty)
 
     pair_i, pair_j = _sample_batch_pairs(
         z.size(0),
-        geometry.num_pairs,
+        rank_alignment.num_pairs,
         z.device,
         deterministic=deterministic_pairs,
     )
     if pair_i.numel() == 0:
         empty = z.new_empty(0)
-        return GeometryBatchResult(loss=z.sum() * 0.0, d_fp=empty, d_z=empty)
+        return RankAlignmentBatchResult(loss=z.sum() * 0.0, d_fp=empty, d_z=empty)
 
     d_fp = _tanimoto_distance_for_pairs(batch.ecfp, pair_i, pair_j)
-    d_z = _latent_distance_for_pairs(z, pair_i, pair_j, geometry.latent_metric)
+    d_z = _latent_distance_for_pairs(
+        z, pair_i, pair_j, rank_alignment.latent_metric
+    )
     loss, _num_comparisons = _pair_order_surrogate(
         d_fp,
         d_z,
-        temperature=geometry.temperature,
-        tie_epsilon=geometry.tie_epsilon,
+        temperature=rank_alignment.temperature,
+        tie_epsilon=rank_alignment.tie_epsilon,
     )
-    return GeometryBatchResult(loss=loss, d_fp=d_fp, d_z=d_z)
+    return RankAlignmentBatchResult(loss=loss, d_fp=d_fp, d_z=d_z)
 
 
 def _fingerprint_cache_path(
     output_dir: Path,
     cache_key: str,
-    geometry: GeometryConfig,
+    rank_alignment: RankAlignmentConfig,
 ) -> Path:
-    """Return the fingerprint cache path for the current geometry settings."""
+    """Return the fingerprint cache path for the current rank-alignment settings."""
     return output_dir / (
-        f"ecfp_r{geometry.fp_radius}_b{geometry.fp_bits}_{cache_key}.npz"
+        f"ecfp_r{rank_alignment.fp_radius}_b{rank_alignment.fp_bits}_{cache_key}.npz"
     )
 
 
@@ -266,11 +274,11 @@ def _compute_ecfp_fingerprints(
 def _load_or_compute_fingerprints(
     output_dir: Path,
     smiles_list: List[str],
-    geometry: GeometryConfig,
+    rank_alignment: RankAlignmentConfig,
 ) -> np.ndarray:
     """Load cached ECFP bits or compute them from expanded isoform SMILES."""
     cache_key = _smiles_cache_key(smiles_list)
-    cache_path = _fingerprint_cache_path(output_dir, cache_key, geometry)
+    cache_path = _fingerprint_cache_path(output_dir, cache_key, rank_alignment)
 
     if cache_path.exists():
         logger.info("Loading cached ECFP bits from %s", cache_path.name)
@@ -280,13 +288,13 @@ def _load_or_compute_fingerprints(
     logger.info(
         "Computing ECFP fingerprints for %d molecules (radius=%d, bits=%d) …",
         len(smiles_list),
-        geometry.fp_radius,
-        geometry.fp_bits,
+        rank_alignment.fp_radius,
+        rank_alignment.fp_bits,
     )
     fp_bits = _compute_ecfp_fingerprints(
         smiles_list,
-        radius=geometry.fp_radius,
-        fp_bits=geometry.fp_bits,
+        radius=rank_alignment.fp_radius,
+        fp_bits=rank_alignment.fp_bits,
     )
     np.savez(cache_path, bits=fp_bits)
     logger.info("Saved fingerprint cache to %s", cache_path.name)

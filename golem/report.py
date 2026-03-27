@@ -137,9 +137,9 @@ def _best_optional_metric(metrics: List[Dict[str, Any]], key: str) -> float:
     return max(finite) if finite else math.nan
 
 
-def _has_geometry_metrics(metrics: List[Dict[str, Any]]) -> bool:
-    """Return True if any geometry-specific metric is finite."""
-    geometry_fields = [
+def _has_rank_alignment_metrics(metrics: List[Dict[str, Any]]) -> bool:
+    """Return True if any rank-alignment-specific metric is finite."""
+    rank_alignment_fields = [
         "val_rank_loss",
         "val_spearman",
         "val_kendall",
@@ -147,7 +147,7 @@ def _has_geometry_metrics(metrics: List[Dict[str, Any]]) -> bool:
     return any(
         math.isfinite(row.get(field, math.nan))
         for row in metrics
-        for field in geometry_fields
+        for field in rank_alignment_fields
     )
 
 
@@ -253,7 +253,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="value">GT-{{NUM_GT_LAYERS}}L</div>
     <div class="detail">{{HIDDEN_DIM}}d / {{NUM_HEADS}}h</div>
   </div>
-  {{GEOMETRY_CARDS}}
+  {{RANK_ALIGNMENT_CARDS}}
 </div>
 
 <!-- Charts -->
@@ -274,7 +274,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <h3>Train vs Val Loss Gap</h3>
     <canvas id="gapChart"></canvas>
   </div>
-  {{GEOMETRY_CHARTS}}
+  {{RANK_ALIGNMENT_CHARTS}}
 </div>
 
 <!-- Config -->
@@ -311,7 +311,7 @@ const valLoss = {{VAL_LOSS_JSON}};
 const valRmse = {{VAL_RMSE_JSON}};
 const lr = {{LR_JSON}};
 const gap = trainLoss.map((t, i) => t - valLoss[i]);
-{{GEOMETRY_JSON_DECLS}}
+{{RANK_ALIGNMENT_JSON_DECLS}}
 
 const gridColor = 'rgba(148,163,184,0.1)';
 const tickColor = '#94a3b8';
@@ -372,7 +372,7 @@ new Chart(document.getElementById('gapChart'), {
   },
   options: makeOpts('Loss Gap'),
 });
-{{GEOMETRY_CHART_SCRIPTS}}
+{{RANK_ALIGNMENT_CHART_SCRIPTS}}
 </script>
 </body>
 </html>
@@ -415,8 +415,9 @@ def generate_report(
         config = _load_config(config_path)
 
     summary = _compute_summary(metrics, config)
-    geometry_enabled = bool(config.get("geometry", {}).get("enabled", False))
-    has_geometry_metrics = geometry_enabled or _has_geometry_metrics(metrics)
+    rank_alignment_config = config.get("rank_alignment", {})
+    rank_alignment_enabled = bool(rank_alignment_config.get("enabled", False))
+    has_rank_alignment_metrics = rank_alignment_enabled or _has_rank_alignment_metrics(metrics)
 
     # Destination path
     if html_path is None:
@@ -431,27 +432,27 @@ def generate_report(
     val_loss_json = json.dumps([r["val_loss"] for r in metrics])
     val_rmse_json = json.dumps([r["val_rmse"] for r in metrics])
     lr_json = json.dumps([r["learning_rate"] for r in metrics])
-    geometry_json_decls = ""
-    geometry_chart_scripts = ""
-    geometry_cards = ""
-    geometry_charts = ""
+    rank_alignment_json_decls = ""
+    rank_alignment_chart_scripts = ""
+    rank_alignment_cards = ""
+    rank_alignment_charts = ""
     table_extra_headers = ""
 
-    if has_geometry_metrics:
+    if has_rank_alignment_metrics:
         train_rank_json = json.dumps([r["train_rank_loss"] for r in metrics])
         train_total_json = json.dumps([r["train_total_loss"] for r in metrics])
         val_rank_json = json.dumps([r["val_rank_loss"] for r in metrics])
         val_spearman_json = json.dumps([r["val_spearman"] for r in metrics])
         val_kendall_json = json.dumps([r["val_kendall"] for r in metrics])
-        geometry_json_decls = (
+        rank_alignment_json_decls = (
             f"const trainRankLoss = {train_rank_json};\n"
             f"const trainTotalLoss = {train_total_json};\n"
             f"const valRankLoss = {val_rank_json};\n"
             f"const valSpearman = {val_spearman_json};\n"
             f"const valKendall = {val_kendall_json};"
         )
-        geometry_chart_scripts = """
-new Chart(document.getElementById('geometryLossChart'), {
+        rank_alignment_chart_scripts = """
+new Chart(document.getElementById('rankAlignmentLossChart'), {
   type: 'line',
   data: {
     labels: epochs,
@@ -464,7 +465,7 @@ new Chart(document.getElementById('geometryLossChart'), {
   options: makeOpts('Train Loss Components'),
 });
 
-new Chart(document.getElementById('geometryMetricChart'), {
+new Chart(document.getElementById('rankAlignmentMetricChart'), {
   type: 'line',
   data: {
     labels: epochs,
@@ -486,7 +487,7 @@ new Chart(document.getElementById('geometryMetricChart'), {
   },
 });
 """
-        geometry_cards = (
+        rank_alignment_cards = (
             '<div class="card info">'
             '<div class="label">Best Val Spearman</div>'
             f'<div class="value">{_format_metric(summary["best_val_spearman"], precision=4)}</div>'
@@ -498,14 +499,14 @@ new Chart(document.getElementById('geometryMetricChart'), {
             '<div class="detail">Pair-distance rank agreement</div>'
             '</div>'
         )
-        geometry_charts = """
+        rank_alignment_charts = """
   <div class="chart-card">
-    <h3>Geometry Loss Components</h3>
-    <canvas id="geometryLossChart"></canvas>
+    <h3>Rank Alignment Loss Components</h3>
+    <canvas id="rankAlignmentLossChart"></canvas>
   </div>
   <div class="chart-card">
-    <h3>Geometry Validation Metrics</h3>
-    <canvas id="geometryMetricChart"></canvas>
+    <h3>Rank Alignment Validation Metrics</h3>
+    <canvas id="rankAlignmentMetricChart"></canvas>
   </div>
 """
         table_extra_headers = (
@@ -527,7 +528,7 @@ new Chart(document.getElementById('geometryMetricChart'), {
     for r in metrics:
         cls = ' class="best-row"' if r["epoch"] == best_epoch else ""
         extra_cells = ""
-        if has_geometry_metrics:
+        if has_rank_alignment_metrics:
             extra_cells = (
                 f"<td>{_format_metric(r['train_rank_loss'])}</td>"
                 f"<td>{_format_metric(r['train_total_loss'])}</td>"
@@ -561,8 +562,8 @@ new Chart(document.getElementById('geometryMetricChart'), {
         "{{HIDDEN_DIM}}": str(summary["hidden_dim"]),
         "{{NUM_GT_LAYERS}}": str(summary["num_gt_layers"]),
         "{{NUM_HEADS}}": str(summary["num_heads"]),
-        "{{GEOMETRY_CARDS}}": geometry_cards,
-        "{{GEOMETRY_CHARTS}}": geometry_charts,
+        "{{RANK_ALIGNMENT_CARDS}}": rank_alignment_cards,
+        "{{RANK_ALIGNMENT_CHARTS}}": rank_alignment_charts,
         "{{TABLE_EXTRA_HEADERS}}": table_extra_headers,
         "{{CONFIG_ITEMS}}": config_items,
         "{{TABLE_ROWS}}": table_rows_html,
@@ -571,8 +572,8 @@ new Chart(document.getElementById('geometryMetricChart'), {
         "{{VAL_LOSS_JSON}}": val_loss_json,
         "{{VAL_RMSE_JSON}}": val_rmse_json,
         "{{LR_JSON}}": lr_json,
-        "{{GEOMETRY_JSON_DECLS}}": geometry_json_decls,
-        "{{GEOMETRY_CHART_SCRIPTS}}": geometry_chart_scripts,
+        "{{RANK_ALIGNMENT_JSON_DECLS}}": rank_alignment_json_decls,
+        "{{RANK_ALIGNMENT_CHART_SCRIPTS}}": rank_alignment_chart_scripts,
     }
     for placeholder, value in replacements.items():
         html = html.replace(placeholder, value)

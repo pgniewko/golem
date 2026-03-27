@@ -47,8 +47,8 @@ class IsoformConfig:
 
 
 @dataclass
-class GeometryConfig:
-    """Optional latent-geometry regularizer config."""
+class RankAlignmentConfig:
+    """Optional pair-distance rank-alignment regularizer config."""
 
     enabled: bool = False
     weight: float = 0.01
@@ -68,7 +68,7 @@ class PretrainConfig:
 
     model: ModelConfig = field(default_factory=ModelConfig)
     isoforms: IsoformConfig = field(default_factory=IsoformConfig)
-    geometry: GeometryConfig = field(default_factory=GeometryConfig)
+    rank_alignment: RankAlignmentConfig = field(default_factory=RankAlignmentConfig)
     masking_ratio: float = 0.15
     batch_size: int = 128
     max_epochs: int = 500
@@ -97,7 +97,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     """Build PretrainConfig from a flat/nested dict."""
     model_d = d.pop("model", {})
     isoform_d = d.pop("isoforms", {})
-    geometry_d = d.pop("geometry", {})
+    rank_alignment_d = d.pop("rank_alignment", {})
 
     # Handle nested YAML structures for isoforms
     if "tautomers" in isoform_d and isinstance(isoform_d["tautomers"], dict):
@@ -125,12 +125,14 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     # Remove keys not in dataclass (e.g. deduplication, tool, fallback)
     model_fields = {f.name for f in fields(ModelConfig)}
     isoform_fields = {f.name for f in fields(IsoformConfig)}
-    geometry_fields = {f.name for f in fields(GeometryConfig)}
+    rank_alignment_fields = {f.name for f in fields(RankAlignmentConfig)}
     pretrain_fields = {f.name for f in fields(PretrainConfig)}
 
     model_d = {k: v for k, v in model_d.items() if k in model_fields}
     isoform_d = {k: v for k, v in isoform_d.items() if k in isoform_fields}
-    geometry_d = {k: v for k, v in geometry_d.items() if k in geometry_fields}
+    rank_alignment_d = {
+        k: v for k, v in rank_alignment_d.items() if k in rank_alignment_fields
+    }
 
     # Handle residual "pretrain" sub-key (already flattened in load_config,
     # but handle gracefully if _dict_to_config is called directly)
@@ -151,7 +153,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     return PretrainConfig(
         model=ModelConfig(**model_d),
         isoforms=IsoformConfig(**isoform_d),
-        geometry=GeometryConfig(**geometry_d),
+        rank_alignment=RankAlignmentConfig(**rank_alignment_d),
         **d,
     )
 

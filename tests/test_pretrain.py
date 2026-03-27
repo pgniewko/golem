@@ -8,13 +8,13 @@ import pytest
 import torch
 
 from golem.config import (
-    GeometryConfig,
     PretrainConfig,
+    RankAlignmentConfig,
     load_config,
 )
 from golem.descriptors import NaNAwareStandardScaler
-from golem.geometry import (
-    _compute_geometry_batch,
+from golem.rank_alignment import (
+    _compute_rank_alignment_batch,
     _compute_ecfp_fingerprints,
     _fingerprint_cache_path,
     _latent_distance_for_pairs,
@@ -63,7 +63,7 @@ class _DummyBatch:
         return self
 
 
-class _DummyGeometryModel(torch.nn.Module):
+class _DummyRankAlignmentModel(torch.nn.Module):
     """Minimal model that can optionally return latent embeddings."""
 
     def __init__(self, pred: torch.Tensor, z: torch.Tensor):
@@ -99,8 +99,8 @@ class TestConfig:
         assert cfg.batch_size == 128
         assert cfg.model.hidden_dim == 128
         assert cfg.isoforms.enabled is True
-        assert cfg.geometry.enabled is False
-        assert cfg.geometry.latent_metric == "cosine"
+        assert cfg.rank_alignment.enabled is False
+        assert cfg.rank_alignment.latent_metric == "cosine"
 
     def test_load_config_defaults_only(self):
         """load_config with no args should return defaults."""
@@ -132,21 +132,21 @@ class TestConfig:
         cfg = load_config(yaml_path=str(yaml_file), max_epochs=3)
         assert cfg.max_epochs == 3
 
-    def test_load_config_geometry_block(self, tmp_path):
-        """Geometry config should round-trip from YAML."""
+    def test_load_config_rank_alignment_block(self, tmp_path):
+        """Rank-alignment config should round-trip from YAML."""
         yaml_file = tmp_path / "test.yaml"
         yaml_file.write_text(
-            "geometry:\n"
+            "rank_alignment:\n"
             "  enabled: true\n"
             "  weight: 0.05\n"
             "  num_pairs: 32\n"
             "  latent_metric: l2_norm\n"
         )
         cfg = load_config(yaml_path=str(yaml_file))
-        assert cfg.geometry.enabled is True
-        assert cfg.geometry.weight == pytest.approx(0.05)
-        assert cfg.geometry.num_pairs == 32
-        assert cfg.geometry.latent_metric == "l2_norm"
+        assert cfg.rank_alignment.enabled is True
+        assert cfg.rank_alignment.weight == pytest.approx(0.05)
+        assert cfg.rank_alignment.num_pairs == 32
+        assert cfg.rank_alignment.latent_metric == "l2_norm"
 
 
 class TestSeedEverything:
@@ -284,8 +284,8 @@ class TestSmilesCacheKey:
         assert cached["names"].tolist() == names
 
 
-class TestGeometryHelpers:
-    """Tests for geometry regularizer helpers."""
+class TestRankAlignmentHelpers:
+    """Tests for rank-alignment regularizer helpers."""
 
     def test_sample_batch_pairs_are_unique_and_unordered(self):
         pair_i, pair_j = _sample_batch_pairs(batch_size=4, num_pairs=10, device=torch.device("cpu"))
@@ -383,15 +383,15 @@ class TestGeometryHelpers:
         assert spearman == pytest.approx(-1.0)
         assert kendall == pytest.approx(-1.0)
 
-class TestComputeGeometryBatch:
-    """Tests for batch-level geometry regularizer mechanics."""
+class TestComputeRankAlignmentBatch:
+    """Tests for batch-level rank-alignment regularizer mechanics."""
 
-    def test_compute_geometry_batch_without_ecfp_returns_zero_loss(self):
+    def test_compute_rank_alignment_batch_without_ecfp_returns_zero_loss(self):
         batch = SimpleNamespace()
         z = torch.tensor([[1.0, 0.0], [0.0, 1.0]], requires_grad=True)
-        geometry = GeometryConfig(enabled=True, num_pairs=4)
+        rank_alignment = RankAlignmentConfig(enabled=True, num_pairs=4)
 
-        result = _compute_geometry_batch(batch, z, geometry)
+        result = _compute_rank_alignment_batch(batch, z, rank_alignment)
 
         assert result.loss.item() == pytest.approx(0.0)
         assert result.d_fp.numel() == 0
@@ -399,7 +399,7 @@ class TestComputeGeometryBatch:
         result.loss.backward()
         assert torch.allclose(z.grad, torch.zeros_like(z))
 
-    def test_compute_geometry_batch_produces_finite_loss_and_gradients(self, monkeypatch):
+    def test_compute_rank_alignment_batch_produces_finite_loss_and_gradients(self, monkeypatch):
         batch = SimpleNamespace(
             ecfp=torch.tensor(
                 [
@@ -419,17 +419,19 @@ class TestComputeGeometryBatch:
             dtype=torch.float32,
             requires_grad=True,
         )
-        geometry = GeometryConfig(enabled=True, num_pairs=3, latent_metric="cosine")
+        rank_alignment = RankAlignmentConfig(
+            enabled=True, num_pairs=3, latent_metric="cosine"
+        )
 
         monkeypatch.setattr(
-            "golem.geometry._sample_batch_pairs",
+            "golem.rank_alignment._sample_batch_pairs",
             lambda batch_size, num_pairs, device, deterministic=False: (
                 torch.tensor([0, 0, 1], dtype=torch.long, device=device),
                 torch.tensor([1, 2, 2], dtype=torch.long, device=device),
             ),
         )
 
-        result = _compute_geometry_batch(batch, z, geometry)
+        result = _compute_rank_alignment_batch(batch, z, rank_alignment)
 
         assert result.d_fp.shape == (3,)
         assert result.d_z.shape == (3,)
@@ -440,10 +442,10 @@ class TestComputeGeometryBatch:
         assert z.grad is not None
         assert torch.isfinite(z.grad).all()
 
-class TestValidationGeometryMetrics:
-    """Validation should report stable, warmup-aware geometry metrics."""
+class TestValidationRankAlignmentMetrics:
+    """Validation should report stable, warmup-aware rank-alignment metrics."""
 
-    def test_validate_skips_geometry_metrics_during_warmup(self):
+    def test_validate_skips_rank_alignment_metrics_during_warmup(self):
         batch = _DummyBatch(
             y=torch.zeros((3, 1), dtype=torch.float32),
             y_mask=torch.ones((3, 1), dtype=torch.bool),
@@ -456,7 +458,7 @@ class TestValidationGeometryMetrics:
                 dtype=torch.bool,
             ),
         )
-        model = _DummyGeometryModel(
+        model = _DummyRankAlignmentModel(
             pred=torch.zeros((3, 1), dtype=torch.float32),
             z=torch.tensor(
                 [
@@ -467,13 +469,13 @@ class TestValidationGeometryMetrics:
                 dtype=torch.float32,
             ),
         )
-        geometry = GeometryConfig(enabled=True, num_pairs=3, warmup_epochs=2)
+        rank_alignment = RankAlignmentConfig(enabled=True, num_pairs=3, warmup_epochs=2)
 
         metrics = _validate(
             model,
             [batch],
             torch.device("cpu"),
-            geometry=geometry,
+            rank_alignment=rank_alignment,
             epoch=0,
         )
 
@@ -483,7 +485,7 @@ class TestValidationGeometryMetrics:
         assert np.isnan(metrics.kendall)
         assert model.return_latent_calls == [False]
 
-    def test_validate_geometry_metrics_are_deterministic(self):
+    def test_validate_rank_alignment_metrics_are_deterministic(self):
         batch = _DummyBatch(
             y=torch.zeros((4, 1), dtype=torch.float32),
             y_mask=torch.ones((4, 1), dtype=torch.bool),
@@ -507,22 +509,22 @@ class TestValidationGeometryMetrics:
             ],
             dtype=torch.float32,
         )
-        geometry = GeometryConfig(enabled=True, num_pairs=3, warmup_epochs=0)
+        rank_alignment = RankAlignmentConfig(enabled=True, num_pairs=3, warmup_epochs=0)
 
         torch.manual_seed(0)
         first = _validate(
-            _DummyGeometryModel(pred, z),
+            _DummyRankAlignmentModel(pred, z),
             [batch],
             torch.device("cpu"),
-            geometry=geometry,
+            rank_alignment=rank_alignment,
             epoch=0,
         )
         torch.manual_seed(999)
         second = _validate(
-            _DummyGeometryModel(pred, z),
+            _DummyRankAlignmentModel(pred, z),
             [batch],
             torch.device("cpu"),
-            geometry=geometry,
+            rank_alignment=rank_alignment,
             epoch=0,
         )
 
@@ -544,12 +546,14 @@ class TestFingerprintPipeline:
         np.testing.assert_array_equal(fps[0], fps[1])
 
     def test_load_or_compute_fingerprints_roundtrip(self, tmp_path):
-        geometry = GeometryConfig(enabled=True, fp_bits=128, fp_radius=2)
+        rank_alignment = RankAlignmentConfig(enabled=True, fp_bits=128, fp_radius=2)
         smiles = ["CCO", "c1ccccc1"]
-        fps_first = _load_or_compute_fingerprints(tmp_path, smiles, geometry)
-        cache_path = _fingerprint_cache_path(tmp_path, _smiles_cache_key(smiles), geometry)
+        fps_first = _load_or_compute_fingerprints(tmp_path, smiles, rank_alignment)
+        cache_path = _fingerprint_cache_path(
+            tmp_path, _smiles_cache_key(smiles), rank_alignment
+        )
         assert cache_path.exists()
-        fps_second = _load_or_compute_fingerprints(tmp_path, smiles, geometry)
+        fps_second = _load_or_compute_fingerprints(tmp_path, smiles, rank_alignment)
         np.testing.assert_array_equal(fps_first, fps_second)
 
     def test_build_pyg_dataset_attaches_ecfp_bits(self):
@@ -713,10 +717,10 @@ class TestMetricsAndReport:
         html = html_path.read_text()
 
         assert html_path.exists()
-        assert "Geometry Loss Components" not in html
+        assert "Rank Alignment Loss Components" not in html
         assert "Best Val Loss" in html
 
-    def test_generate_report_includes_geometry_sections(self, tmp_path):
+    def test_generate_report_includes_rank_alignment_sections(self, tmp_path):
         metrics_path = tmp_path / "metrics.csv"
         config_path = tmp_path / "resolved_config.yaml"
         with open(metrics_path, "w", newline="") as f:
@@ -741,13 +745,13 @@ class TestMetricsAndReport:
             "  hidden_dim: 64\n"
             "  num_gt_layers: 2\n"
             "  num_heads: 4\n"
-            "geometry:\n"
+            "rank_alignment:\n"
             "  enabled: true\n"
         )
 
         html_path = generate_report(tmp_path)
         html = html_path.read_text()
 
-        assert "Geometry Loss Components" in html
-        assert "Geometry Validation Metrics" in html
+        assert "Rank Alignment Loss Components" in html
+        assert "Rank Alignment Validation Metrics" in html
         assert "Best Val Kendall" in html

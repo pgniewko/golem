@@ -34,10 +34,10 @@ import torch
 from rdkit import Chem
 import torch.nn.functional as F
 import yaml
-from golem.config import GeometryConfig, PretrainConfig
+from golem.config import PretrainConfig, RankAlignmentConfig
 from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
-from golem.geometry import (
-    _compute_geometry_batch,
+from golem.rank_alignment import (
+    _compute_rank_alignment_batch,
     _load_or_compute_fingerprints,
     _pair_rank_metrics,
 )
@@ -163,7 +163,7 @@ def _train_one_epoch(
     device: torch.device,
     *,
     epoch: int,
-    geometry: GeometryConfig,
+    rank_alignment: RankAlignmentConfig,
 ) -> TrainEpochMetrics:
     """Run one training epoch and return aggregated main/rank/total losses."""
     model.train()
@@ -171,14 +171,16 @@ def _train_one_epoch(
     total_rank_loss = 0.0
     total_total_loss = 0.0
     n_batches = 0
-    geometry_active = geometry.enabled and epoch >= geometry.warmup_epochs
+    rank_alignment_active = (
+        rank_alignment.enabled and epoch >= rank_alignment.warmup_epochs
+    )
 
     for batch in loader:
         batch = batch.to(device)
         targets = batch.y  # [B, D]
         valid_mask = batch.y_mask.bool()  # [B, D]
 
-        if geometry.enabled:
+        if rank_alignment_active:
             pred, _log_var, z = model(
                 batch.x,
                 batch.edge_index,
@@ -207,9 +209,9 @@ def _train_one_epoch(
 
         main_loss = F.mse_loss(pred[final_mask], targets[final_mask])
         rank_loss = main_loss.new_zeros(())
-        if geometry_active and z is not None:
-            rank_loss = _compute_geometry_batch(batch, z, geometry).loss
-        total_loss = main_loss + geometry.weight * rank_loss
+        if z is not None:
+            rank_loss = _compute_rank_alignment_batch(batch, z, rank_alignment).loss
+        total_loss = main_loss + rank_alignment.weight * rank_loss
 
         optimizer.zero_grad()
         total_loss.backward()
@@ -235,18 +237,18 @@ def _validate(
     loader,
     device: torch.device,
     *,
-    geometry: GeometryConfig,
+    rank_alignment: RankAlignmentConfig,
     epoch: Optional[int] = None,
 ) -> ValidationMetrics:
-    """Validate on valid positions and optionally track geometry metrics."""
+    """Validate on valid positions and optionally track rank-alignment metrics."""
     model.eval()
     total_se = 0.0
     total_count = 0
     rank_losses: List[float] = []
     spearmans: List[float] = []
     kendalls: List[float] = []
-    geometry_active = geometry.enabled and (
-        epoch is None or epoch >= geometry.warmup_epochs
+    rank_alignment_active = rank_alignment.enabled and (
+        epoch is None or epoch >= rank_alignment.warmup_epochs
     )
 
     for batch in loader:
@@ -254,7 +256,7 @@ def _validate(
         targets = batch.y
         valid_mask = batch.y_mask.bool()
 
-        if geometry_active:
+        if rank_alignment_active:
             pred, _log_var, z = model(
                 batch.x,
                 batch.edge_index,
@@ -263,15 +265,17 @@ def _validate(
                 zero_var=True,
                 return_latent=True,
             )
-            geometry_batch = _compute_geometry_batch(
+            rank_alignment_batch = _compute_rank_alignment_batch(
                 batch,
                 z,
-                geometry,
+                rank_alignment,
                 deterministic_pairs=True,
             )
-            rank_losses.append(geometry_batch.loss.item())
-            if geometry.log_rank_metrics:
-                spearman, kendall = _pair_rank_metrics(geometry_batch.d_fp, geometry_batch.d_z)
+            rank_losses.append(rank_alignment_batch.loss.item())
+            if rank_alignment.log_rank_metrics:
+                spearman, kendall = _pair_rank_metrics(
+                    rank_alignment_batch.d_fp, rank_alignment_batch.d_z
+                )
                 if math.isfinite(spearman):
                     spearmans.append(spearman)
                 if math.isfinite(kendall):
@@ -554,8 +558,10 @@ def pretrain(
     logger.info("Descriptor matrix: %d molecules × %d descriptors", desc_values.shape[0], num_descriptors)
 
     fp_bits = None
-    if config.geometry.enabled:
-        fp_bits = _load_or_compute_fingerprints(output_dir, smiles_list, config.geometry)
+    if config.rank_alignment.enabled:
+        fp_bits = _load_or_compute_fingerprints(
+            output_dir, smiles_list, config.rank_alignment
+        )
         logger.info(
             "Fingerprint matrix: %d molecules × %d bits",
             fp_bits.shape[0],
@@ -640,11 +646,11 @@ def pretrain(
         model_kwargs["head_dropout"] = mc.head_dropout
     model = GraphTransformerNet(**model_kwargs).to(device)
 
-    if config.geometry.enabled:
+    if config.rank_alignment.enabled:
         forward_params = inspect.signature(model.forward).parameters
         if "return_latent" not in forward_params:
             raise RuntimeError(
-                "Geometry regularizer requires gt-pyg with "
+                "Rank-alignment regularizer requires gt-pyg with "
                 "GraphTransformerNet.forward(..., return_latent=True)."
             )
 
@@ -717,13 +723,13 @@ def pretrain(
                 config.masking_ratio,
                 device,
                 epoch=epoch,
-                geometry=config.geometry,
+                rank_alignment=config.rank_alignment,
             )
             val_metrics = _validate(
                 model,
                 val_loader,
                 device,
-                geometry=config.geometry,
+                rank_alignment=config.rank_alignment,
                 epoch=epoch,
             )
 
@@ -758,7 +764,7 @@ def pretrain(
             )
             if math.isfinite(val_metrics.spearman) or math.isfinite(val_metrics.kendall):
                 logger.info(
-                    "           geometry metrics — val_spearman=%.4f  val_kendall=%.4f",
+                    "           rank-alignment metrics — val_spearman=%.4f  val_kendall=%.4f",
                     val_metrics.spearman,
                     val_metrics.kendall,
                 )
@@ -821,7 +827,12 @@ def pretrain(
         # Load best checkpoint for test evaluation
         model.load_weights(best_ckpt_path, map_location=device)
 
-        test_metrics = _validate(model, test_loader, device, geometry=config.geometry)
+        test_metrics = _validate(
+            model,
+            test_loader,
+            device,
+            rank_alignment=config.rank_alignment,
+        )
         logger.info("Test RMSE (best model): %.4f", test_metrics.rmse)
 
     # ------------------------------------------------------------------

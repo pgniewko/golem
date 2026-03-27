@@ -34,7 +34,7 @@ isoforms:
   neutralization: { enabled: true }
   deduplication: true
 
-geometry:
+rank_alignment:
   enabled: false
   weight: 0.01
   fp_bits: 2048
