@@ -8,7 +8,7 @@ Pipeline:
 2. Split into train / val / (test) at the parent-molecule level
 3. (Optional) Enumerate isoforms within each split only
 4. Fit ``NaNAwareStandardScaler`` on **train only**
-5. Compute Mordred 2D descriptors + validity masks
+5. Compute descriptor targets + validity masks
 6. Transform all splits + winsorise
 7. Build PyG datasets via ``get_tensor_data``
 8. Train with masked MSE (15% random mask ∩ validity mask)
@@ -35,7 +35,11 @@ from rdkit import Chem
 import torch.nn.functional as F
 import yaml
 from golem.config import ECFPLatentAlignmentConfig, PretrainConfig
-from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
+from golem.descriptors import (
+    DEFAULT_3D_PACK_ID,
+    NaNAwareStandardScaler,
+    compute_descriptor_targets,
+)
 from golem.ecfp_latent_alignment import (
     compute_alignment_batch,
     compute_alignment_metrics,
@@ -310,6 +314,63 @@ def _smiles_cache_key(smiles_list: List[str]) -> str:
     return h.hexdigest()[:16]
 
 
+def _filter_target_rows(
+    smiles_list: List[str],
+    descriptor_values: np.ndarray,
+    validity_mask: np.ndarray,
+    keep_mask: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: Optional[np.ndarray],
+) -> Tuple[List[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Drop rows excluded by target generation and remap split indices."""
+    if keep_mask.all():
+        return smiles_list, descriptor_values, validity_mask, train_idx, val_idx, test_idx
+
+    old_to_new = np.full(len(smiles_list), -1, dtype=np.int64)
+    old_to_new[keep_mask] = np.arange(int(keep_mask.sum()), dtype=np.int64)
+
+    def _remap(split_idx: np.ndarray) -> np.ndarray:
+        kept = split_idx[keep_mask[split_idx]]
+        return old_to_new[kept]
+
+    new_train_idx = _remap(train_idx)
+    new_val_idx = _remap(val_idx)
+    new_test_idx = _remap(test_idx) if test_idx is not None else None
+
+    if new_train_idx.size == 0 or new_val_idx.size == 0:
+        raise ValueError(
+            "Dropping molecules with failed 3D descriptor generation emptied the "
+            "train or validation split. Disable 3D targets or use a larger dataset."
+        )
+
+    logger.info(
+        "Dropped %d molecules with failed 3D descriptor generation (train=%d, val=%d, test=%d)",
+        int((~keep_mask).sum()),
+        int(train_idx.size - new_train_idx.size),
+        int(val_idx.size - new_val_idx.size),
+        int(test_idx.size - new_test_idx.size) if new_test_idx is not None else 0,
+    )
+
+    if new_test_idx is not None and new_test_idx.size == 0:
+        logger.warning("All test molecules were dropped due to failed 3D descriptor generation")
+        new_test_idx = None
+
+    filtered_smiles = [
+        smiles
+        for smiles, keep in zip(smiles_list, keep_mask, strict=False)
+        if keep
+    ]
+    return (
+        filtered_smiles,
+        descriptor_values[keep_mask],
+        validity_mask[keep_mask],
+        new_train_idx,
+        new_val_idx,
+        new_test_idx,
+    )
+
+
 def _expand_smiles_within_split(
     parent_smiles: List[str],
     config: PretrainConfig,
@@ -481,9 +542,21 @@ def pretrain(
     smiles_list, train_idx, val_idx, test_idx = _prepare_split_smiles(smiles_list, config)
 
     # ------------------------------------------------------------------
-    # 4. Compute Mordred descriptors (with disk cache)
+    # 4. Compute descriptor targets (with disk cache)
     # ------------------------------------------------------------------
-    cache_key = _smiles_cache_key(smiles_list)
+    if config.descriptors.use_3d_targets:
+        payload = {
+            "smiles": smiles_list,
+            "seed": config.seed,
+            "three_d_pack": DEFAULT_3D_PACK_ID,
+            "descriptors": asdict(config.descriptors),
+            "conformers": asdict(config.conformers),
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16]
+    else:
+        cache_key = _smiles_cache_key(smiles_list)
     cache_path = output_dir / f"descriptors_{cache_key}.npz"
 
     if cache_path.exists():
@@ -492,11 +565,49 @@ def pretrain(
         desc_values = cached["values"]
         desc_valid = cached["valid"]
         descriptor_names = cached["names"].tolist()
+        keep_rows = (
+            cached["keep"].astype(np.bool_, copy=False)
+            if "keep" in cached.files
+            else np.ones(len(desc_values), dtype=np.bool_)
+        )
     else:
-        logger.info("Computing Mordred descriptors …")
-        desc_values, desc_valid, descriptor_names = compute_mordred_descriptors(smiles_list)
-        np.savez(cache_path, values=desc_values, valid=desc_valid, names=np.array(descriptor_names))
+        logger.info(
+            "Computing descriptor targets (2D=%s, 3D=%s) …",
+            config.descriptors.include_2d_targets,
+            config.descriptors.use_3d_targets,
+        )
+        desc_values, desc_valid, descriptor_names, keep_rows = compute_descriptor_targets(
+            smiles_list,
+            config.descriptors,
+            config.conformers,
+            seed=config.seed,
+        )
+        np.savez(
+            cache_path,
+            values=desc_values,
+            valid=desc_valid,
+            names=np.array(descriptor_names),
+            keep=keep_rows,
+        )
         logger.info("Saved descriptor cache to %s", cache_path.name)
+
+    if config.descriptors.use_3d_targets:
+        (
+            smiles_list,
+            desc_values,
+            desc_valid,
+            train_idx,
+            val_idx,
+            test_idx,
+        ) = _filter_target_rows(
+            smiles_list,
+            desc_values,
+            desc_valid,
+            keep_rows,
+            train_idx,
+            val_idx,
+            test_idx,
+        )
 
     num_descriptors = desc_values.shape[1]
     logger.info("Descriptor matrix: %d molecules × %d descriptors", desc_values.shape[0], num_descriptors)

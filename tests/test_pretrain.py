@@ -11,6 +11,7 @@ from golem.config import (
 from golem.descriptors import NaNAwareStandardScaler
 from golem.pretrain import (
     _checkpoint_library_versions,
+    _filter_target_rows,
     _make_warmup_cosine_scheduler,
     _prepare_split_smiles,
     _save_checkpoint,
@@ -29,6 +30,9 @@ class TestConfig:
         assert cfg.batch_size == 128
         assert cfg.model.hidden_dim == 128
         assert cfg.isoforms.enabled is True
+        assert cfg.descriptors.include_2d_targets is True
+        assert cfg.descriptors.use_3d_targets is False
+        assert cfg.descriptors.three_d.rdkit_include_getaway is False
 
     def test_load_config_defaults_only(self):
         """load_config with no args should return defaults."""
@@ -59,6 +63,27 @@ class TestConfig:
         yaml_file.write_text("pretrain:\n  max_epochs: 7\n")
         cfg = load_config(yaml_path=str(yaml_file), max_epochs=3)
         assert cfg.max_epochs == 3
+
+    def test_load_config_descriptors_block(self, tmp_path):
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text(
+            "descriptors:\n"
+            "  include_2d_targets: false\n"
+            "  use_3d_targets: true\n"
+            "  three_d:\n"
+            "    rdkit_include_getaway: true\n"
+            "    electroshape_charge_model: mmff94\n"
+            "conformers:\n"
+            "  n_generate: 16\n"
+            "  n_keep: 4\n"
+        )
+        cfg = load_config(yaml_path=str(yaml_file))
+        assert cfg.descriptors.include_2d_targets is False
+        assert cfg.descriptors.use_3d_targets is True
+        assert cfg.descriptors.three_d.rdkit_include_getaway is True
+        assert cfg.descriptors.three_d.electroshape_charge_model == "mmff94"
+        assert cfg.conformers.n_generate == 16
+        assert cfg.conformers.n_keep == 4
 
 
 class TestSeedEverything:
@@ -235,6 +260,44 @@ class TestParentLevelSplit:
 
         with pytest.raises(ValueError, match="empty"):
             _prepare_split_smiles(parent_smiles, cfg)
+
+
+class TestTargetRowFiltering:
+    def test_filter_target_rows_drops_and_remaps_splits(self):
+        smiles = ["a", "b", "c", "d"]
+        values = np.arange(8, dtype=np.float32).reshape(4, 2)
+        mask = np.ones((4, 2), dtype=np.bool_)
+        keep = np.array([True, False, True, False], dtype=np.bool_)
+
+        out = _filter_target_rows(
+            smiles,
+            values,
+            mask,
+            keep,
+            train_idx=np.array([0, 1]),
+            val_idx=np.array([2]),
+            test_idx=np.array([3]),
+        )
+
+        filtered_smiles, filtered_values, filtered_mask, train_idx, val_idx, test_idx = out
+        assert filtered_smiles == ["a", "c"]
+        np.testing.assert_array_equal(filtered_values, values[[0, 2]])
+        np.testing.assert_array_equal(filtered_mask, mask[[0, 2]])
+        np.testing.assert_array_equal(train_idx, np.array([0]))
+        np.testing.assert_array_equal(val_idx, np.array([1]))
+        assert test_idx is None
+
+    def test_filter_target_rows_raises_when_train_or_val_emptied(self):
+        with pytest.raises(ValueError, match="emptied the train or validation split"):
+            _filter_target_rows(
+                ["a", "b"],
+                np.zeros((2, 1), dtype=np.float32),
+                np.ones((2, 1), dtype=np.bool_),
+                np.array([False, True], dtype=np.bool_),
+                train_idx=np.array([0]),
+                val_idx=np.array([1]),
+                test_idx=None,
+            )
 
 
 class TestCheckpointMetadata:

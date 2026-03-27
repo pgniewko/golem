@@ -88,6 +88,29 @@ ecfp_latent_alignment:
   num_pairs: 128
 ```
 
+Optional 3D descriptor targets can be enabled in YAML:
+
+```yaml
+descriptors:
+  include_2d_targets: true
+  use_3d_targets: true
+  three_d:
+    aggregation: boltz_mean
+    rdkit_include_getaway: false
+    electroshape_charge_model: gasteiger
+
+conformers:
+  n_generate: 32
+  n_keep: 8
+  energy_window_kcal: 10.0
+  prune_rms: 0.75
+  embedding: ETKDGv3
+  optimize: MMFF
+  fallback_optimize: UFF
+```
+
+Set `descriptors.include_2d_targets: false` together with `descriptors.use_3d_targets: true` to train on 3D descriptors only. If 3D targets are enabled and a molecule fails conformer generation, that molecule is removed from the train, validation, and test splits before training.
+
 ### CLI options
 
 | Flag | Description | Default |
@@ -150,7 +173,7 @@ golem report experiments/pretrain --output path/to/report.html
 pytest tests/ -v
 ```
 
-The tests cover isoform enumeration, Mordred descriptor computation, the NaN-aware scaler, config loading, data splitting, and SMILES file loading. Note: descriptor tests require `mordredcommunity` and may take a few seconds.
+The tests cover isoform enumeration, 2D/3D descriptor computation, the NaN-aware scaler, config loading, data splitting, and SMILES file loading. Note: descriptor tests require `mordredcommunity` and may take a few seconds.
 
 ### Key module responsibilities
 
@@ -158,8 +181,9 @@ The tests cover isoform enumeration, Mordred descriptor computation, the NaN-awa
 |--------|-------------|
 | `cli.py` | Parses CLI args, merges config, calls `pretrain()` |
 | `config.py` | Defines `PretrainConfig` dataclass tree; merges defaults / YAML / CLI |
+| `conformers.py` | Builds RDKit conformer ensembles for optional 3D descriptor targets |
 | `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
-| `descriptors.py` | Computes Mordred 2D descriptors; provides `NaNAwareStandardScaler` |
+| `descriptors.py` | Computes 2D/3D descriptor targets; provides `NaNAwareStandardScaler` |
 | `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; isoforms &rarr; descriptors &rarr; split &rarr; scale &rarr; train &rarr; checkpoint |
 | `utils.py` | Shared utilities: seeding, train/val/test splitting, PyG DataLoader creation, SMILES file loading |
 

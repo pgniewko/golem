@@ -62,11 +62,44 @@ class ECFPLatentAlignmentConfig:
 
 
 @dataclass
+class Descriptor3DConfig:
+    """Optional 3D descriptor-target settings."""
+
+    aggregation: str = "boltz_mean"
+    rdkit_include_getaway: bool = False
+    electroshape_charge_model: str = "gasteiger"
+
+
+@dataclass
+class DescriptorConfig:
+    """Descriptor target settings for pretraining."""
+
+    include_2d_targets: bool = True
+    use_3d_targets: bool = False
+    three_d: Descriptor3DConfig = field(default_factory=Descriptor3DConfig)
+
+
+@dataclass
+class ConformerConfig:
+    """Offline conformer generation settings for 3D descriptor targets."""
+
+    n_generate: int = 32
+    n_keep: int = 8
+    energy_window_kcal: float = 10.0
+    prune_rms: float = 0.75
+    embedding: str = "ETKDGv3"
+    optimize: str = "MMFF"
+    fallback_optimize: str = "UFF"
+
+
+@dataclass
 class PretrainConfig:
     """Full pretraining pipeline config."""
 
     model: ModelConfig = field(default_factory=ModelConfig)
     isoforms: IsoformConfig = field(default_factory=IsoformConfig)
+    descriptors: DescriptorConfig = field(default_factory=DescriptorConfig)
+    conformers: ConformerConfig = field(default_factory=ConformerConfig)
     ecfp_latent_alignment: ECFPLatentAlignmentConfig = field(
         default_factory=ECFPLatentAlignmentConfig
     )
@@ -98,7 +131,10 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     """Build PretrainConfig from a flat/nested dict."""
     model_d = d.pop("model", {})
     isoform_d = d.pop("isoforms", {})
+    descriptors_d = d.pop("descriptors", {})
+    conformers_d = d.pop("conformers", {})
     alignment_d = d.pop("ecfp_latent_alignment", {})
+    descriptor3d_d = descriptors_d.pop("three_d", {})
 
     # Handle nested YAML structures for isoforms
     if "tautomers" in isoform_d and isinstance(isoform_d["tautomers"], dict):
@@ -126,11 +162,19 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     # Remove keys not in dataclass (e.g. deduplication, tool, fallback)
     model_fields = {f.name for f in fields(ModelConfig)}
     isoform_fields = {f.name for f in fields(IsoformConfig)}
+    descriptor_fields = {f.name for f in fields(DescriptorConfig)}
+    descriptor3d_fields = {f.name for f in fields(Descriptor3DConfig)}
+    conformer_fields = {f.name for f in fields(ConformerConfig)}
     alignment_fields = {f.name for f in fields(ECFPLatentAlignmentConfig)}
     pretrain_fields = {f.name for f in fields(PretrainConfig)}
 
     model_d = {k: v for k, v in model_d.items() if k in model_fields}
     isoform_d = {k: v for k, v in isoform_d.items() if k in isoform_fields}
+    descriptors_d = {k: v for k, v in descriptors_d.items() if k in descriptor_fields}
+    descriptor3d_d = {
+        k: v for k, v in descriptor3d_d.items() if k in descriptor3d_fields
+    }
+    conformers_d = {k: v for k, v in conformers_d.items() if k in conformer_fields}
     alignment_d = {k: v for k, v in alignment_d.items() if k in alignment_fields}
 
     # Handle residual "pretrain" sub-key (already flattened in load_config,
@@ -152,6 +196,11 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     return PretrainConfig(
         model=ModelConfig(**model_d),
         isoforms=IsoformConfig(**isoform_d),
+        descriptors=DescriptorConfig(
+            three_d=Descriptor3DConfig(**descriptor3d_d),
+            **descriptors_d,
+        ),
+        conformers=ConformerConfig(**conformers_d),
         ecfp_latent_alignment=ECFPLatentAlignmentConfig(**alignment_d),
         **d,
     )

@@ -3,7 +3,26 @@
 import numpy as np
 import pytest
 
-from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
+from golem.config import ConformerConfig, DescriptorConfig
+from golem.conformers import ConformerEnsemble
+from golem.descriptors import (
+    NaNAwareStandardScaler,
+    compute_aggregated_3d_descriptors,
+    compute_descriptor_targets,
+    compute_mordred_descriptors,
+)
+
+
+class _FakeCalculator:
+    def __init__(self, columns, outputs):
+        self.columns = columns
+        self.outputs = outputs
+
+    def __call__(self, mol, conformer_id=-1):
+        value = self.outputs[(mol, conformer_id)]
+        if isinstance(value, Exception):
+            raise value
+        return np.asarray(value, dtype=np.float64)
 
 
 class TestComputeMordredDescriptors:
@@ -43,6 +62,213 @@ class TestComputeMordredDescriptors:
         # (which should have been dropped)
         all_invalid = ~mask.any(axis=0)
         assert not all_invalid.any(), "Found columns with all-invalid entries (should be dropped)"
+
+
+class TestDescriptorTargets:
+    def test_compute_descriptor_targets_returns_2d_only_when_3d_disabled(self, monkeypatch):
+        values_2d = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        mask_2d = np.array([[True, False], [True, True]], dtype=np.bool_)
+        names_2d = ["a", "b"]
+
+        monkeypatch.setattr(
+            "golem.descriptors.compute_mordred_descriptors",
+            lambda smiles_list: (values_2d, mask_2d, names_2d),
+        )
+        monkeypatch.setattr(
+            "golem.descriptors.compute_aggregated_3d_descriptors",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("3D path should not run")
+            ),
+        )
+
+        values, mask, names, keep = compute_descriptor_targets(
+            ["CCO", "c1ccccc1"],
+            DescriptorConfig(include_2d_targets=True, use_3d_targets=False),
+            ConformerConfig(),
+            seed=42,
+        )
+
+        np.testing.assert_array_equal(values, values_2d)
+        np.testing.assert_array_equal(mask, mask_2d)
+        np.testing.assert_array_equal(keep, np.array([True, True], dtype=np.bool_))
+        assert names == names_2d
+
+    def test_compute_descriptor_targets_returns_3d_only_when_2d_disabled(self, monkeypatch):
+        values_3d = np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32)
+        mask_3d = np.array([[True, True], [False, True]], dtype=np.bool_)
+        names_3d = ["rdkit3d:x", "usrcat:y"]
+        keep_3d = np.array([True, False], dtype=np.bool_)
+
+        monkeypatch.setattr(
+            "golem.descriptors.compute_mordred_descriptors",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("2D path should not run")
+            ),
+        )
+        monkeypatch.setattr(
+            "golem.descriptors.compute_aggregated_3d_descriptors",
+            lambda *args, **kwargs: (values_3d, mask_3d, names_3d, keep_3d),
+        )
+
+        values, mask, names, keep = compute_descriptor_targets(
+            ["CCO", "c1ccccc1"],
+            DescriptorConfig(include_2d_targets=False, use_3d_targets=True),
+            ConformerConfig(),
+            seed=42,
+        )
+
+        np.testing.assert_array_equal(values, values_3d)
+        np.testing.assert_array_equal(mask, mask_3d)
+        np.testing.assert_array_equal(keep, keep_3d)
+        assert names == names_3d
+
+    def test_compute_descriptor_targets_appends_3d_block_when_enabled(self, monkeypatch):
+        values_2d = np.array([[1.0], [2.0]], dtype=np.float32)
+        mask_2d = np.array([[True], [False]], dtype=np.bool_)
+        values_3d = np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32)
+        mask_3d = np.array([[True, True], [False, True]], dtype=np.bool_)
+
+        monkeypatch.setattr(
+            "golem.descriptors.compute_mordred_descriptors",
+            lambda smiles_list: (values_2d, mask_2d, ["mordred:a"]),
+        )
+        monkeypatch.setattr(
+            "golem.descriptors.compute_aggregated_3d_descriptors",
+            lambda *args, **kwargs: (
+                values_3d,
+                mask_3d,
+                ["rdkit3d:x", "usrcat:y"],
+                np.array([True, True], dtype=np.bool_),
+            ),
+        )
+
+        values, mask, names, keep = compute_descriptor_targets(
+            ["CCO", "c1ccccc1"],
+            DescriptorConfig(include_2d_targets=True, use_3d_targets=True),
+            ConformerConfig(),
+            seed=42,
+        )
+
+        np.testing.assert_array_equal(
+            values,
+            np.array([[1.0, 10.0, 11.0], [2.0, 12.0, 13.0]], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            mask,
+            np.array([[True, True, True], [False, False, True]], dtype=np.bool_),
+        )
+        np.testing.assert_array_equal(keep, np.array([True, True], dtype=np.bool_))
+        assert names == ["mordred:a", "rdkit3d:x", "usrcat:y"]
+
+    def test_compute_descriptor_targets_requires_at_least_one_target_family(self):
+        with pytest.raises(ValueError, match="At least one descriptor target family"):
+            compute_descriptor_targets(
+                ["CCO"],
+                DescriptorConfig(include_2d_targets=False, use_3d_targets=False),
+                ConformerConfig(),
+                seed=42,
+            )
+
+    def test_compute_aggregated_3d_descriptors_drops_missing_conformers_and_masks_failed_family(
+        self,
+        monkeypatch,
+    ):
+        decay = np.exp(-1.0)
+
+        def fake_generate(smiles, config, *, seed):
+            if smiles == "no_conf":
+                return None
+            return ConformerEnsemble(
+                mol=smiles,
+                conformer_ids=[0, 1],
+                relative_energies_kcal=np.array([0.0, 0.593], dtype=np.float64),
+            )
+
+        calculators = {
+            "rdkit3d": _FakeCalculator(
+                ["a", "b"],
+                {
+                    ("ok", 0): [1.0, np.nan],
+                    ("ok", 1): [3.0, 5.0],
+                    ("partial", 0): [2.0, 4.0],
+                    ("partial", 1): [4.0, 6.0],
+                },
+            ),
+            "usrcat": _FakeCalculator(
+                ["u"],
+                {
+                    ("ok", 0): [10.0],
+                    ("ok", 1): [20.0],
+                    ("partial", 0): RuntimeError("boom"),
+                    ("partial", 1): RuntimeError("boom"),
+                },
+            ),
+            "electroshape": _FakeCalculator(
+                ["e"],
+                {
+                    ("ok", 0): [7.0],
+                    ("ok", 1): [9.0],
+                    ("partial", 0): [1.0],
+                    ("partial", 1): [3.0],
+                },
+            ),
+        }
+
+        monkeypatch.setattr(
+            "golem.descriptors.generate_conformer_ensemble",
+            fake_generate,
+        )
+        monkeypatch.setattr(
+            "golem.descriptors._build_3d_calculators",
+            lambda three_d: calculators,
+        )
+
+        values, mask, names, keep = compute_aggregated_3d_descriptors(
+            ["ok", "partial", "no_conf"],
+            DescriptorConfig().three_d,
+            ConformerConfig(),
+            seed=42,
+        )
+
+        np.testing.assert_allclose(
+            values[0],
+            np.array(
+                [
+                    (1.0 + 3.0 * decay) / (1.0 + decay),
+                    5.0,
+                    (10.0 + 20.0 * decay) / (1.0 + decay),
+                    (7.0 + 9.0 * decay) / (1.0 + decay),
+                ],
+                dtype=np.float32,
+            ),
+            rtol=1e-6,
+        )
+        np.testing.assert_allclose(
+            values[1],
+            np.array(
+                [
+                    (2.0 + 4.0 * decay) / (1.0 + decay),
+                    (4.0 + 6.0 * decay) / (1.0 + decay),
+                    0.0,
+                    (1.0 + 3.0 * decay) / (1.0 + decay),
+                ],
+                dtype=np.float32,
+            ),
+            rtol=1e-6,
+        )
+        np.testing.assert_array_equal(
+            mask,
+            np.array(
+                [
+                    [True, True, True, True],
+                    [True, True, False, True],
+                    [False, False, False, False],
+                ],
+                dtype=np.bool_,
+            ),
+        )
+        np.testing.assert_array_equal(keep, np.array([True, True, False], dtype=np.bool_))
+        assert names == ["rdkit3d:a", "rdkit3d:b", "usrcat:u", "electroshape:e"]
 
 
 class TestNaNAwareStandardScaler:
