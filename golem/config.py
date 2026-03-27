@@ -62,7 +62,7 @@ class ECFPLatentAlignmentConfig:
 
 
 @dataclass
-class Descriptor3DConfig:
+class Descriptor3DSettings:
     """Optional 3D descriptor-target settings."""
 
     aggregation: str = "boltz_mean"
@@ -75,16 +75,16 @@ class DescriptorConfig:
     """Descriptor target settings for pretraining."""
 
     include_2d_targets: bool = True
-    use_3d_targets: bool = False
-    three_d: Descriptor3DConfig = field(default_factory=Descriptor3DConfig)
+    include_3d_targets: bool = False
+    three_d_settings: Descriptor3DSettings = field(default_factory=Descriptor3DSettings)
 
 
 @dataclass
 class ConformerConfig:
     """Offline conformer generation settings for 3D descriptor targets."""
 
-    n_generate: int = 32
-    n_keep: int = 8
+    n_generate: int = 12
+    n_keep: int = 4
     energy_window_kcal: float = 10.0
     prune_rms: float = 0.75
     embedding: str = "ETKDGv3"
@@ -134,7 +134,11 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     descriptors_d = d.pop("descriptors", {})
     conformers_d = d.pop("conformers", {})
     alignment_d = d.pop("ecfp_latent_alignment", {})
-    descriptor3d_d = descriptors_d.pop("three_d", {})
+    descriptor3d_d = descriptors_d.pop("three_d_settings", {})
+    if not descriptor3d_d:
+        descriptor3d_d = descriptors_d.pop("three_d", {})
+    if "use_3d_targets" in descriptors_d and "include_3d_targets" not in descriptors_d:
+        descriptors_d["include_3d_targets"] = descriptors_d.pop("use_3d_targets")
 
     # Handle nested YAML structures for isoforms
     if "tautomers" in isoform_d and isinstance(isoform_d["tautomers"], dict):
@@ -163,7 +167,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     model_fields = {f.name for f in fields(ModelConfig)}
     isoform_fields = {f.name for f in fields(IsoformConfig)}
     descriptor_fields = {f.name for f in fields(DescriptorConfig)}
-    descriptor3d_fields = {f.name for f in fields(Descriptor3DConfig)}
+    descriptor3d_fields = {f.name for f in fields(Descriptor3DSettings)}
     conformer_fields = {f.name for f in fields(ConformerConfig)}
     alignment_fields = {f.name for f in fields(ECFPLatentAlignmentConfig)}
     pretrain_fields = {f.name for f in fields(PretrainConfig)}
@@ -197,7 +201,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         model=ModelConfig(**model_d),
         isoforms=IsoformConfig(**isoform_d),
         descriptors=DescriptorConfig(
-            three_d=Descriptor3DConfig(**descriptor3d_d),
+            three_d_settings=Descriptor3DSettings(**descriptor3d_d),
             **descriptors_d,
         ),
         conformers=ConformerConfig(**conformers_d),

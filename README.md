@@ -93,15 +93,15 @@ Optional 3D descriptor targets can be enabled in YAML:
 ```yaml
 descriptors:
   include_2d_targets: true
-  use_3d_targets: true
-  three_d:
-    aggregation: boltz_mean
+  include_3d_targets: true
+  three_d_settings:
+    aggregation: boltz_mean  # only supported option; Boltzmann-weighted conformer average
     rdkit_include_getaway: false
-    electroshape_charge_model: gasteiger
+    electroshape_charge_model: gasteiger  # supported: gasteiger, mmff94
 
 conformers:
-  n_generate: 32
-  n_keep: 8
+  n_generate: 12
+  n_keep: 4
   energy_window_kcal: 10.0
   prune_rms: 0.75
   embedding: ETKDGv3
@@ -109,7 +109,7 @@ conformers:
   fallback_optimize: UFF
 ```
 
-Set `descriptors.include_2d_targets: false` together with `descriptors.use_3d_targets: true` to train on 3D descriptors only. If 3D targets are enabled and a molecule fails conformer generation, that molecule is removed from the train, validation, and test splits before training.
+Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If 3D targets are enabled and a molecule fails conformer generation or has an incomplete 3D descriptor ensemble, that molecule is skipped before training, validation, and test evaluation.
 
 ### CLI options
 

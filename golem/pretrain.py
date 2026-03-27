@@ -340,12 +340,12 @@ def _filter_target_rows(
 
     if new_train_idx.size == 0 or new_val_idx.size == 0:
         raise ValueError(
-            "Dropping molecules with failed 3D descriptor generation emptied the "
+            "Skipping molecules with failed 3D descriptor generation emptied the "
             "train or validation split. Disable 3D targets or use a larger dataset."
         )
 
     logger.info(
-        "Dropped %d molecules with failed 3D descriptor generation (train=%d, val=%d, test=%d)",
+        "Skipped %d molecules with failed 3D descriptor generation (train=%d, val=%d, test=%d)",
         int((~keep_mask).sum()),
         int(train_idx.size - new_train_idx.size),
         int(val_idx.size - new_val_idx.size),
@@ -353,7 +353,7 @@ def _filter_target_rows(
     )
 
     if new_test_idx is not None and new_test_idx.size == 0:
-        logger.warning("All test molecules were dropped due to failed 3D descriptor generation")
+        logger.warning("All test molecules were skipped due to failed 3D descriptor generation")
         new_test_idx = None
 
     filtered_smiles = [
@@ -544,7 +544,7 @@ def pretrain(
     # ------------------------------------------------------------------
     # 4. Compute descriptor targets (with disk cache)
     # ------------------------------------------------------------------
-    if config.descriptors.use_3d_targets:
+    if config.descriptors.include_3d_targets:
         payload = {
             "smiles": smiles_list,
             "seed": config.seed,
@@ -574,7 +574,7 @@ def pretrain(
         logger.info(
             "Computing descriptor targets (2D=%s, 3D=%s) …",
             config.descriptors.include_2d_targets,
-            config.descriptors.use_3d_targets,
+            config.descriptors.include_3d_targets,
         )
         desc_values, desc_valid, descriptor_names, keep_rows = compute_descriptor_targets(
             smiles_list,
@@ -591,7 +591,7 @@ def pretrain(
         )
         logger.info("Saved descriptor cache to %s", cache_path.name)
 
-    if config.descriptors.use_3d_targets:
+    if config.descriptors.include_3d_targets:
         (
             smiles_list,
             desc_values,

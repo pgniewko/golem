@@ -65,39 +65,11 @@ class TestComputeMordredDescriptors:
 
 
 class TestDescriptorTargets:
-    def test_compute_descriptor_targets_returns_2d_only_when_3d_disabled(self, monkeypatch):
-        values_2d = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-        mask_2d = np.array([[True, False], [True, True]], dtype=np.bool_)
-        names_2d = ["a", "b"]
-
-        monkeypatch.setattr(
-            "golem.descriptors.compute_mordred_descriptors",
-            lambda smiles_list: (values_2d, mask_2d, names_2d),
-        )
-        monkeypatch.setattr(
-            "golem.descriptors.compute_aggregated_3d_descriptors",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("3D path should not run")
-            ),
-        )
-
-        values, mask, names, keep = compute_descriptor_targets(
-            ["CCO", "c1ccccc1"],
-            DescriptorConfig(include_2d_targets=True, use_3d_targets=False),
-            ConformerConfig(),
-            seed=42,
-        )
-
-        np.testing.assert_array_equal(values, values_2d)
-        np.testing.assert_array_equal(mask, mask_2d)
-        np.testing.assert_array_equal(keep, np.array([True, True], dtype=np.bool_))
-        assert names == names_2d
-
-    def test_compute_descriptor_targets_returns_3d_only_when_2d_disabled(self, monkeypatch):
+    def test_compute_descriptor_targets_supports_3d_only_mode(self, monkeypatch):
         values_3d = np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32)
-        mask_3d = np.array([[True, True], [False, True]], dtype=np.bool_)
+        mask_3d = np.array([[True, True], [True, True]], dtype=np.bool_)
         names_3d = ["rdkit3d:x", "usrcat:y"]
-        keep_3d = np.array([True, False], dtype=np.bool_)
+        keep_3d = np.array([True, True], dtype=np.bool_)
 
         monkeypatch.setattr(
             "golem.descriptors.compute_mordred_descriptors",
@@ -112,7 +84,7 @@ class TestDescriptorTargets:
 
         values, mask, names, keep = compute_descriptor_targets(
             ["CCO", "c1ccccc1"],
-            DescriptorConfig(include_2d_targets=False, use_3d_targets=True),
+            DescriptorConfig(include_2d_targets=False, include_3d_targets=True),
             ConformerConfig(),
             seed=42,
         )
@@ -122,11 +94,15 @@ class TestDescriptorTargets:
         np.testing.assert_array_equal(keep, keep_3d)
         assert names == names_3d
 
-    def test_compute_descriptor_targets_appends_3d_block_when_enabled(self, monkeypatch):
+    def test_compute_descriptor_targets_concatenates_2d_and_3d_and_intersects_keep_mask(
+        self,
+        monkeypatch,
+    ):
         values_2d = np.array([[1.0], [2.0]], dtype=np.float32)
         mask_2d = np.array([[True], [False]], dtype=np.bool_)
         values_3d = np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32)
         mask_3d = np.array([[True, True], [False, True]], dtype=np.bool_)
+        keep_3d = np.array([True, False], dtype=np.bool_)
 
         monkeypatch.setattr(
             "golem.descriptors.compute_mordred_descriptors",
@@ -138,13 +114,13 @@ class TestDescriptorTargets:
                 values_3d,
                 mask_3d,
                 ["rdkit3d:x", "usrcat:y"],
-                np.array([True, True], dtype=np.bool_),
+                keep_3d,
             ),
         )
 
         values, mask, names, keep = compute_descriptor_targets(
             ["CCO", "c1ccccc1"],
-            DescriptorConfig(include_2d_targets=True, use_3d_targets=True),
+            DescriptorConfig(include_2d_targets=True, include_3d_targets=True),
             ConformerConfig(),
             seed=42,
         )
@@ -157,19 +133,19 @@ class TestDescriptorTargets:
             mask,
             np.array([[True, True, True], [False, False, True]], dtype=np.bool_),
         )
-        np.testing.assert_array_equal(keep, np.array([True, True], dtype=np.bool_))
+        np.testing.assert_array_equal(keep, keep_3d)
         assert names == ["mordred:a", "rdkit3d:x", "usrcat:y"]
 
     def test_compute_descriptor_targets_requires_at_least_one_target_family(self):
         with pytest.raises(ValueError, match="At least one descriptor target family"):
             compute_descriptor_targets(
                 ["CCO"],
-                DescriptorConfig(include_2d_targets=False, use_3d_targets=False),
+                DescriptorConfig(include_2d_targets=False, include_3d_targets=False),
                 ConformerConfig(),
                 seed=42,
             )
 
-    def test_compute_aggregated_3d_descriptors_drops_missing_conformers_and_masks_failed_family(
+    def test_compute_aggregated_3d_descriptors_skips_incomplete_ensembles(
         self,
         monkeypatch,
     ):
@@ -190,8 +166,10 @@ class TestDescriptorTargets:
                 {
                     ("ok", 0): [1.0, np.nan],
                     ("ok", 1): [3.0, 5.0],
-                    ("partial", 0): [2.0, 4.0],
-                    ("partial", 1): [4.0, 6.0],
+                    ("masked", 0): [2.0, np.nan],
+                    ("masked", 1): [4.0, np.nan],
+                    ("family_fail", 0): [2.0, 4.0],
+                    ("family_fail", 1): [4.0, 6.0],
                 },
             ),
             "usrcat": _FakeCalculator(
@@ -199,8 +177,10 @@ class TestDescriptorTargets:
                 {
                     ("ok", 0): [10.0],
                     ("ok", 1): [20.0],
-                    ("partial", 0): RuntimeError("boom"),
-                    ("partial", 1): RuntimeError("boom"),
+                    ("masked", 0): [11.0],
+                    ("masked", 1): [21.0],
+                    ("family_fail", 0): RuntimeError("boom"),
+                    ("family_fail", 1): RuntimeError("boom"),
                 },
             ),
             "electroshape": _FakeCalculator(
@@ -208,8 +188,10 @@ class TestDescriptorTargets:
                 {
                     ("ok", 0): [7.0],
                     ("ok", 1): [9.0],
-                    ("partial", 0): [1.0],
-                    ("partial", 1): [3.0],
+                    ("masked", 0): [1.0],
+                    ("masked", 1): [3.0],
+                    ("family_fail", 0): [1.0],
+                    ("family_fail", 1): [3.0],
                 },
             ),
         }
@@ -224,8 +206,8 @@ class TestDescriptorTargets:
         )
 
         values, mask, names, keep = compute_aggregated_3d_descriptors(
-            ["ok", "partial", "no_conf"],
-            DescriptorConfig().three_d,
+            ["ok", "masked", "family_fail", "no_conf"],
+            DescriptorConfig().three_d_settings,
             ConformerConfig(),
             seed=42,
         )
@@ -243,31 +225,22 @@ class TestDescriptorTargets:
             ),
             rtol=1e-6,
         )
-        np.testing.assert_allclose(
-            values[1],
-            np.array(
-                [
-                    (2.0 + 4.0 * decay) / (1.0 + decay),
-                    (4.0 + 6.0 * decay) / (1.0 + decay),
-                    0.0,
-                    (1.0 + 3.0 * decay) / (1.0 + decay),
-                ],
-                dtype=np.float32,
-            ),
-            rtol=1e-6,
-        )
         np.testing.assert_array_equal(
             mask,
             np.array(
                 [
                     [True, True, True, True],
+                    [True, False, True, True],
                     [True, True, False, True],
                     [False, False, False, False],
                 ],
                 dtype=np.bool_,
             ),
         )
-        np.testing.assert_array_equal(keep, np.array([True, True, False], dtype=np.bool_))
+        np.testing.assert_array_equal(
+            keep,
+            np.array([True, False, False, False], dtype=np.bool_),
+        )
         assert names == ["rdkit3d:a", "rdkit3d:b", "usrcat:u", "electroshape:e"]
 
 

@@ -31,8 +31,10 @@ class TestConfig:
         assert cfg.model.hidden_dim == 128
         assert cfg.isoforms.enabled is True
         assert cfg.descriptors.include_2d_targets is True
-        assert cfg.descriptors.use_3d_targets is False
-        assert cfg.descriptors.three_d.rdkit_include_getaway is False
+        assert cfg.descriptors.include_3d_targets is False
+        assert cfg.descriptors.three_d_settings.rdkit_include_getaway is False
+        assert cfg.conformers.n_generate == 12
+        assert cfg.conformers.n_keep == 4
 
     def test_load_config_defaults_only(self):
         """load_config with no args should return defaults."""
@@ -69,8 +71,8 @@ class TestConfig:
         yaml_file.write_text(
             "descriptors:\n"
             "  include_2d_targets: false\n"
-            "  use_3d_targets: true\n"
-            "  three_d:\n"
+            "  include_3d_targets: true\n"
+            "  three_d_settings:\n"
             "    rdkit_include_getaway: true\n"
             "    electroshape_charge_model: mmff94\n"
             "conformers:\n"
@@ -79,9 +81,9 @@ class TestConfig:
         )
         cfg = load_config(yaml_path=str(yaml_file))
         assert cfg.descriptors.include_2d_targets is False
-        assert cfg.descriptors.use_3d_targets is True
-        assert cfg.descriptors.three_d.rdkit_include_getaway is True
-        assert cfg.descriptors.three_d.electroshape_charge_model == "mmff94"
+        assert cfg.descriptors.include_3d_targets is True
+        assert cfg.descriptors.three_d_settings.rdkit_include_getaway is True
+        assert cfg.descriptors.three_d_settings.electroshape_charge_model == "mmff94"
         assert cfg.conformers.n_generate == 16
         assert cfg.conformers.n_keep == 4
 
@@ -263,29 +265,29 @@ class TestParentLevelSplit:
 
 
 class TestTargetRowFiltering:
-    def test_filter_target_rows_drops_and_remaps_splits(self):
-        smiles = ["a", "b", "c", "d"]
-        values = np.arange(8, dtype=np.float32).reshape(4, 2)
-        mask = np.ones((4, 2), dtype=np.bool_)
-        keep = np.array([True, False, True, False], dtype=np.bool_)
+    def test_filter_target_rows_remaps_nontrivial_three_way_split(self):
+        smiles = ["a", "b", "c", "d", "e", "f"]
+        values = np.arange(12, dtype=np.float32).reshape(6, 2)
+        mask = np.ones((6, 2), dtype=np.bool_)
+        keep = np.array([True, False, True, False, True, True], dtype=np.bool_)
 
         out = _filter_target_rows(
             smiles,
             values,
             mask,
             keep,
-            train_idx=np.array([0, 1]),
-            val_idx=np.array([2]),
-            test_idx=np.array([3]),
+            train_idx=np.array([0, 1, 2]),
+            val_idx=np.array([3, 4]),
+            test_idx=np.array([5]),
         )
 
         filtered_smiles, filtered_values, filtered_mask, train_idx, val_idx, test_idx = out
-        assert filtered_smiles == ["a", "c"]
-        np.testing.assert_array_equal(filtered_values, values[[0, 2]])
-        np.testing.assert_array_equal(filtered_mask, mask[[0, 2]])
-        np.testing.assert_array_equal(train_idx, np.array([0]))
-        np.testing.assert_array_equal(val_idx, np.array([1]))
-        assert test_idx is None
+        assert filtered_smiles == ["a", "c", "e", "f"]
+        np.testing.assert_array_equal(filtered_values, values[[0, 2, 4, 5]])
+        np.testing.assert_array_equal(filtered_mask, mask[[0, 2, 4, 5]])
+        np.testing.assert_array_equal(train_idx, np.array([0, 1]))
+        np.testing.assert_array_equal(val_idx, np.array([2]))
+        np.testing.assert_array_equal(test_idx, np.array([3]))
 
     def test_filter_target_rows_raises_when_train_or_val_emptied(self):
         with pytest.raises(ValueError, match="emptied the train or validation split"):
