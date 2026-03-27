@@ -1,5 +1,6 @@
 """Tests for golem.pretrain and golem.config."""
 
+import logging
 import numpy as np
 import pytest
 import torch
@@ -17,6 +18,7 @@ from golem.pretrain import (
     _filter_target_rows,
     _make_warmup_cosine_scheduler,
     _metrics_fieldnames,
+    _open_metrics_writer,
     _prepare_split_smiles,
     _resolved_config_dict,
     _save_checkpoint,
@@ -553,6 +555,78 @@ class TestSmilesCacheKey:
         np.testing.assert_array_equal(cached["values"], values)
         np.testing.assert_array_equal(cached["valid"], valid)
         assert cached["names"].tolist() == names
+
+
+class TestMetricsWriter:
+    def test_open_metrics_writer_flushes_header_immediately(self, tmp_path):
+        metrics_path = tmp_path / "metrics.csv"
+        metrics_file, _ = _open_metrics_writer(
+            metrics_path,
+            resume_from=None,
+            metrics_fieldnames=["epoch", "train_loss"],
+        )
+
+        try:
+            assert metrics_path.read_text().startswith("epoch,train_loss")
+        finally:
+            metrics_file.close()
+
+
+class TestProgressLogging:
+    def test_train_one_epoch_logs_periodic_batch_progress(self, caplog):
+        loader = _DummyLoader(
+            [
+                _DummyBatch(
+                    torch.tensor([[1.0]], dtype=torch.float32),
+                    torch.tensor([[1.0]], dtype=torch.float32),
+                )
+                for _ in range(5)
+            ]
+        )
+        model = _DummyModel(torch.tensor([[0.0]], dtype=torch.float32))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        caplog.set_level(logging.INFO, logger="golem.pretrain")
+        _train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            masking_ratio=1.0,
+            descriptor_loss_weight=1.0,
+            device=torch.device("cpu"),
+            epoch=1,
+            max_epochs=3,
+            progress_interval=2,
+        )
+
+        assert any("Epoch   1/3 — train 2/5 batches" in message for message in caplog.messages)
+        assert any("Epoch   1/3 — train 5/5 batches" in message for message in caplog.messages)
+
+    def test_validate_logs_periodic_batch_progress(self, caplog):
+        loader = _DummyLoader(
+            [
+                _DummyBatch(
+                    torch.tensor([[1.0]], dtype=torch.float32),
+                    torch.tensor([[1.0]], dtype=torch.float32),
+                )
+                for _ in range(5)
+            ]
+        )
+        model = _DummyModel(torch.tensor([[0.0]], dtype=torch.float32))
+
+        caplog.set_level(logging.INFO, logger="golem.pretrain")
+        _validate(
+            model,
+            loader,
+            descriptor_loss_weight=1.0,
+            device=torch.device("cpu"),
+            epoch=1,
+            max_epochs=3,
+            progress_interval=2,
+        )
+
+        assert any("Epoch   1/3 — val 2/5 batches" in message for message in caplog.messages)
+        assert any("Epoch   1/3 — val 5/5 batches" in message for message in caplog.messages)
 
 
 class TestParentLevelSplit:

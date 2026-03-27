@@ -27,7 +27,7 @@ import math
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import IO, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,7 @@ from rdkit import Chem
 import torch.nn.functional as F
 from torch.utils.data import RandomSampler
 import yaml
+from golem.cache import cache_dir
 from golem.config import ECFPLatentAlignmentConfig, PretrainConfig
 from golem.descriptors import (
     DEFAULT_3D_PACK_ID,
@@ -74,6 +75,8 @@ ALIGNMENT_METRICS_FIELDNAMES = BASE_METRICS_FIELDNAMES + [
     "val_alignment_spearman",
     "val_alignment_kendall",
 ]
+_GRAPH_CACHE_SCHEMA_VERSION = "v1"
+_PROGRESS_LOG_INTERVAL = 25
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +142,13 @@ def _epoch_alignment_configs(
 def _format_optional_metric(value: float) -> str:
     """Format finite optional metrics and leave inactive ones blank."""
     return f"{value:.6f}" if math.isfinite(value) else ""
+
+
+def _format_running_metric(total: float, count: int) -> str:
+    """Format a running mean metric or mark it unavailable."""
+    if count <= 0:
+        return "n/a"
+    return f"{total / count:.4f}"
 
 
 _INTEROP_THREADS_CONFIGURED = False
@@ -228,6 +238,10 @@ def _train_one_epoch(
     masking_ratio: float,
     descriptor_loss_weight: float,
     device: torch.device,
+    *,
+    epoch: int | None = None,
+    max_epochs: int | None = None,
+    progress_interval: int = _PROGRESS_LOG_INTERVAL,
 ) -> tuple[float, float, float]:
     """Run one training epoch. Returns objective, descriptor, and alignment losses."""
     model.train()
@@ -235,10 +249,12 @@ def _train_one_epoch(
     total_descriptor_loss = 0.0
     total_alignment_loss = 0.0
     n_batches = 0
+    total_batches = len(loader)
+    stage_start = time.time()
     alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
         loader, "ecfp_latent_alignment", None
     )
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader, start=1):
         batch = batch.to(device)
         targets = batch.y  # [B, D]
         valid_mask = batch.y_mask.bool()  # [B, D]
@@ -289,6 +305,22 @@ def _train_one_epoch(
         total_alignment_loss += alignment_loss.item()
         n_batches += 1
 
+        if batch_idx % progress_interval == 0 or batch_idx == total_batches:
+            prefix = ""
+            if epoch is not None and max_epochs is not None:
+                prefix = f"Epoch {epoch:3d}/{max_epochs} — "
+            logger.info(
+                "%strain %d/%d batches — elapsed=%.1fs  running_loss=%s  "
+                "running_desc=%s  running_align=%s",
+                prefix,
+                batch_idx,
+                total_batches,
+                time.time() - stage_start,
+                _format_running_metric(total_loss, n_batches),
+                _format_running_metric(total_descriptor_loss, n_batches),
+                _format_running_metric(total_alignment_loss, n_batches),
+            )
+
     return (
         total_loss / max(n_batches, 1),
         total_descriptor_loss / max(n_batches, 1),
@@ -302,6 +334,10 @@ def _validate(
     loader,
     descriptor_loss_weight: float,
     device: torch.device,
+    *,
+    epoch: int | None = None,
+    max_epochs: int | None = None,
+    progress_interval: int = _PROGRESS_LOG_INTERVAL,
 ) -> tuple[float, float, float, float, float, float]:
     """Validate and optionally compute alignment metrics."""
     model.eval()
@@ -310,11 +346,13 @@ def _validate(
     alignment_losses: List[float] = []
     spearmans: List[float] = []
     kendalls: List[float] = []
+    total_batches = len(loader)
+    stage_start = time.time()
     alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
         loader, "ecfp_latent_alignment", None
     )
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader, start=1):
         batch = batch.to(device)
         targets = batch.y
         valid_mask = batch.y_mask.bool()
@@ -353,6 +391,25 @@ def _validate(
         se = (pred[valid_mask] - targets[valid_mask]).pow(2).sum().item()
         total_se += se
         total_count += valid_mask.sum().item()
+
+        if batch_idx % progress_interval == 0 or batch_idx == total_batches:
+            descriptor_loss = math.nan
+            if total_count > 0:
+                descriptor_loss = total_se / total_count
+            prefix = ""
+            if epoch is not None and max_epochs is not None:
+                prefix = f"Epoch {epoch:3d}/{max_epochs} — "
+            logger.info(
+                "%sval %d/%d batches — elapsed=%.1fs  running_desc=%s  "
+                "running_rmse=%s  running_align=%s",
+                prefix,
+                batch_idx,
+                total_batches,
+                time.time() - stage_start,
+                f"{descriptor_loss:.4f}" if math.isfinite(descriptor_loss) else "n/a",
+                f"{math.sqrt(descriptor_loss):.4f}" if math.isfinite(descriptor_loss) else "n/a",
+                _format_optional_metric(float(np.mean(alignment_losses))) if alignment_losses else "n/a",
+            )
 
     descriptor_loss = math.nan
     rmse = math.nan
@@ -393,10 +450,26 @@ def _build_pyg_dataset(
     Uses ``get_tensor_data`` from gt-pyg for graph featurisation, then
     overwrites ``data.y`` and ``data.y_mask`` with descriptor targets.
     """
-    from gt_pyg import get_tensor_data
+    from torch_geometric.data import Data
 
-    logger.info("Building PyG graph features for %d molecules …", len(smiles_list))
-    data_list = get_tensor_data(smiles_list, y=None)
+    cache_path = _graph_cache_path(smiles_list)
+    if cache_path.exists():
+        logger.info("Loading shared graph cache from %s", cache_path.name)
+        graph_payloads = torch.load(cache_path, map_location="cpu", weights_only=False)
+    else:
+        logger.info("Shared graph cache miss for %d molecules", len(smiles_list))
+        graph_payloads = _build_graph_cache_payload(smiles_list)
+        torch.save(graph_payloads, cache_path)
+        logger.info("Saved shared graph cache to %s", cache_path.name)
+
+    data_list = [
+        Data(
+            x=payload["x"].clone(),
+            edge_index=payload["edge_index"].clone(),
+            edge_attr=payload["edge_attr"].clone(),
+        )
+        for payload in graph_payloads
+    ]
 
     # Overwrite y and y_mask with actual descriptor data.
     # Store as [1, D] so that PyG batching concatenates to [B, D]
@@ -418,6 +491,80 @@ def _smiles_cache_key(smiles_list: List[str]) -> str:
     """Return a 16-char hex SHA-256 hash of the SMILES list (order-sensitive)."""
     h = hashlib.sha256("\n".join(smiles_list).encode())
     return h.hexdigest()[:16]
+
+
+def _descriptor_cache_path(smiles_list: List[str], config: PretrainConfig) -> Path:
+    """Return the shared descriptor cache path for the current target configuration."""
+    if config.descriptors.include_3d_targets:
+        payload = {
+            "smiles": smiles_list,
+            "seed": config.seed,
+            "three_d_pack": DEFAULT_3D_PACK_ID,
+            "descriptors": asdict(config.descriptors),
+            "conformers": asdict(config.conformers),
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16]
+    else:
+        cache_key = _smiles_cache_key(smiles_list)
+    return cache_dir("descriptors") / f"descriptors_{cache_key}.npz"
+
+
+def _graph_cache_path(smiles_list: List[str]) -> Path:
+    """Return the shared graph-feature cache path for an ordered SMILES list."""
+    from gt_pyg import __version__ as gt_pyg_version
+
+    payload = {
+        "smiles": smiles_list,
+        "graph_schema": _GRAPH_CACHE_SCHEMA_VERSION,
+        "gt_pyg_version": gt_pyg_version,
+    }
+    cache_key = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+    return cache_dir("graphs") / f"pyg_graphs_{cache_key}.pt"
+
+
+def _build_graph_cache_payload(smiles_list: List[str]) -> list[dict[str, torch.Tensor]]:
+    """Compute bare graph tensors for caching and later dataset reconstruction."""
+    from gt_pyg import get_tensor_data
+
+    logger.info("Building PyG graph features for %d molecules …", len(smiles_list))
+    data_list = get_tensor_data(smiles_list, y=None)
+    return [
+        {
+            "x": data.x.detach().cpu(),
+            "edge_index": data.edge_index.detach().cpu(),
+            "edge_attr": data.edge_attr.detach().cpu(),
+        }
+        for data in data_list
+    ]
+
+
+def _open_metrics_writer(
+    metrics_path: Path,
+    *,
+    resume_from: Optional[str],
+    metrics_fieldnames: list[str],
+) -> tuple[IO[str], csv.writer]:
+    """Open metrics.csv and flush the header immediately for live observability."""
+    csv_mode = "a" if resume_from is not None and metrics_path.exists() else "w"
+    if csv_mode == "a":
+        with open(metrics_path, newline="") as existing_metrics:
+            header = next(csv.reader(existing_metrics), [])
+        if header != metrics_fieldnames:
+            raise ValueError(
+                "Cannot resume with a metrics.csv written by an older schema. "
+                "Start from a fresh output directory."
+            )
+
+    metrics_file = open(metrics_path, csv_mode, newline="")
+    metrics_writer = csv.writer(metrics_file)
+    if csv_mode == "w":
+        metrics_writer.writerow(metrics_fieldnames)
+        metrics_file.flush()
+    return metrics_file, metrics_writer
 
 
 def _filter_target_rows(
@@ -651,23 +798,10 @@ def pretrain(
     # ------------------------------------------------------------------
     # 4. Compute descriptor targets (with disk cache)
     # ------------------------------------------------------------------
-    if config.descriptors.include_3d_targets:
-        payload = {
-            "smiles": smiles_list,
-            "seed": config.seed,
-            "three_d_pack": DEFAULT_3D_PACK_ID,
-            "descriptors": asdict(config.descriptors),
-            "conformers": asdict(config.conformers),
-        }
-        cache_key = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()[:16]
-    else:
-        cache_key = _smiles_cache_key(smiles_list)
-    cache_path = output_dir / f"descriptors_{cache_key}.npz"
+    cache_path = _descriptor_cache_path(smiles_list, config)
 
     if cache_path.exists():
-        logger.info("Loading cached descriptors from %s", cache_path.name)
+        logger.info("Loading shared descriptor cache from %s", cache_path.name)
         cached = np.load(cache_path, allow_pickle=True)
         desc_values = cached["values"]
         desc_valid = cached["valid"]
@@ -678,6 +812,7 @@ def pretrain(
             else np.ones(len(desc_values), dtype=np.bool_)
         )
     else:
+        logger.info("Shared descriptor cache miss for %d molecules", len(smiles_list))
         if _is_plain_2d_mode(config):
             logger.info("Computing Mordred descriptors …")
         else:
@@ -700,7 +835,7 @@ def pretrain(
         if config.descriptors.include_3d_targets:
             cache_payload["keep"] = keep_rows
         np.savez(cache_path, **cache_payload)
-        logger.info("Saved descriptor cache to %s", cache_path.name)
+        logger.info("Saved shared descriptor cache to %s", cache_path.name)
 
     if config.descriptors.include_3d_targets:
         (
@@ -917,21 +1052,14 @@ def pretrain(
     logger.info("Starting training: max_epochs=%d  patience=%d  masking_ratio=%.2f",
                 config.max_epochs, config.patience, config.masking_ratio)
 
-    epoch = start_epoch
-    csv_mode = "a" if resume_from is not None and metrics_path.exists() else "w"
     metrics_fieldnames = _metrics_fieldnames(config)
-    if csv_mode == "a":
-        with open(metrics_path, newline="") as existing_metrics:
-            header = next(csv.reader(existing_metrics), [])
-        if header != metrics_fieldnames:
-            raise ValueError(
-                "Cannot resume with a metrics.csv written by an older schema. "
-                "Start from a fresh output directory."
-            )
-    with open(metrics_path, csv_mode, newline="") as metrics_file:
-        metrics_writer = csv.writer(metrics_file)
-        if csv_mode == "w":
-            metrics_writer.writerow(metrics_fieldnames)
+    metrics_file, metrics_writer = _open_metrics_writer(
+        metrics_path,
+        resume_from=resume_from,
+        metrics_fieldnames=metrics_fieldnames,
+    )
+    epoch = start_epoch
+    with metrics_file:
 
         for epoch in range(start_epoch, config.max_epochs):
             lr = scheduler.get_last_lr()[0]
@@ -947,6 +1075,13 @@ def pretrain(
                 train_loader.ecfp_latent_alignment = train_alignment_cfg
                 val_loader.ecfp_latent_alignment = eval_alignment_cfg
 
+            logger.info(
+                "Epoch %3d/%d — training started (lr=%.2e  batches=%d)",
+                epoch + 1,
+                config.max_epochs,
+                lr,
+                len(train_loader),
+            )
             (
                 train_loss,
                 train_descriptor_loss,
@@ -958,9 +1093,17 @@ def pretrain(
                 config.masking_ratio,
                 config.descriptors.loss_weight,
                 device,
+                epoch=epoch + 1,
+                max_epochs=config.max_epochs,
             )
             if plain_2d_mode:
                 val_loader = _legacy_eval_loader(val_data)
+            logger.info(
+                "Epoch %3d/%d — validation started (batches=%d)",
+                epoch + 1,
+                config.max_epochs,
+                len(val_loader),
+            )
             (
                 val_loss,
                 val_descriptor_loss,
@@ -973,6 +1116,8 @@ def pretrain(
                 val_loader,
                 config.descriptors.loss_weight,
                 device,
+                epoch=epoch + 1,
+                max_epochs=config.max_epochs,
             )
 
             elapsed = time.time() - start_time
