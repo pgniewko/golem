@@ -12,7 +12,7 @@ Pipeline:
 6. Transform all splits + winsorise
 7. Build PyG datasets via ``get_tensor_data``
 8. Train with masked MSE (15% random mask ∩ validity mask)
-9. Early stopping on validation loss
+9. Early stopping on validation objective
 10. Save checkpoint with scaler, descriptor names, config
 """
 
@@ -62,6 +62,8 @@ BASE_METRICS_FIELDNAMES = [
     "epoch",
     "train_loss",
     "val_loss",
+    "train_descriptor_loss",
+    "val_descriptor_loss",
     "val_rmse",
     "learning_rate",
     "elapsed_seconds",
@@ -94,6 +96,7 @@ def _is_plain_2d_mode(config: PretrainConfig) -> bool:
     return (
         config.descriptors.include_2d_targets
         and not config.descriptors.include_3d_targets
+        and config.descriptors.loss_weight == 1.0
         and not config.ecfp_latent_alignment.enabled
     )
 
@@ -205,11 +208,13 @@ def _train_one_epoch(
     loader,
     optimizer: torch.optim.Optimizer,
     masking_ratio: float,
+    descriptor_loss_weight: float,
     device: torch.device,
-) -> tuple[float, float]:
-    """Run one training epoch. Returns descriptor and alignment losses."""
+) -> tuple[float, float, float]:
+    """Run one training epoch. Returns objective, descriptor, and alignment losses."""
     model.train()
     total_loss = 0.0
+    total_descriptor_loss = 0.0
     total_alignment_loss = 0.0
     n_batches = 0
     alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
@@ -239,37 +244,47 @@ def _train_one_epoch(
         # Random 15% mask ∩ validity mask
         final_mask = (torch.rand_like(targets) < masking_ratio).bool() & valid_mask
 
-        if final_mask.sum() == 0:
-            # Extremely rare fallback: use all valid positions
+        if final_mask.sum() == 0 and valid_mask.sum() > 0:
             final_mask = valid_mask
 
-        if final_mask.sum() == 0:
-            continue  # skip batch if no valid positions at all
+        descriptor_loss = pred.sum() * 0.0
+        if final_mask.sum() > 0:
+            descriptor_loss = F.mse_loss(pred[final_mask], targets[final_mask])
 
-        loss = F.mse_loss(pred[final_mask], targets[final_mask])
-        alignment_loss = loss.new_zeros(())
+        alignment_loss = pred.sum() * 0.0
         if z is not None and alignment_cfg is not None:
             alignment_loss, _, _ = compute_alignment_batch(batch, z, alignment_cfg)
-        total_step_loss = loss + alignment_loss * (alignment_cfg.weight if alignment_cfg is not None else 0.0)
+        if final_mask.sum() == 0 and alignment_cfg is None:
+            continue
+
+        total_step_loss = descriptor_loss * descriptor_loss_weight + alignment_loss * (
+            alignment_cfg.weight if alignment_cfg is not None else 0.0
+        )
 
         optimizer.zero_grad()
         total_step_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += total_step_loss.item()
+        total_descriptor_loss += descriptor_loss.item()
         total_alignment_loss += alignment_loss.item()
         n_batches += 1
 
-    return total_loss / max(n_batches, 1), total_alignment_loss / max(n_batches, 1)
+    return (
+        total_loss / max(n_batches, 1),
+        total_descriptor_loss / max(n_batches, 1),
+        total_alignment_loss / max(n_batches, 1),
+    )
 
 
 @torch.no_grad()
 def _validate(
     model: torch.nn.Module,
     loader,
+    descriptor_loss_weight: float,
     device: torch.device,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float]:
     """Validate and optionally compute alignment metrics."""
     model.eval()
     total_se = 0.0
@@ -321,12 +336,25 @@ def _validate(
         total_se += se
         total_count += valid_mask.sum().item()
 
-    mse = total_se / max(total_count, 1)
-    rmse = math.sqrt(mse)
+    descriptor_loss = math.nan
+    rmse = math.nan
+    if total_count > 0:
+        descriptor_loss = total_se / total_count
+        rmse = math.sqrt(descriptor_loss)
+
+    alignment_loss = float(np.mean(alignment_losses)) if alignment_losses else math.nan
+    objective_terms: list[float] = []
+    if math.isfinite(descriptor_loss):
+        objective_terms.append(descriptor_loss * descriptor_loss_weight)
+    if math.isfinite(alignment_loss) and alignment_cfg is not None:
+        objective_terms.append(alignment_loss * alignment_cfg.weight)
+    objective_loss = float(sum(objective_terms)) if objective_terms else math.nan
+
     return (
-        mse,
+        objective_loss,
+        descriptor_loss,
         rmse,
-        float(np.mean(alignment_losses)) if alignment_losses else math.nan,
+        alignment_loss,
         float(np.mean(spearmans)) if spearmans else math.nan,
         float(np.mean(kendalls)) if kendalls else math.nan,
     )
@@ -781,7 +809,7 @@ def pretrain(
     # 9b. Resume from checkpoint (optional)
     # ------------------------------------------------------------------
     start_epoch = 0
-    best_val_loss = float("inf")
+    best_val_objective = float("inf")
     best_epoch = 0
 
     if resume_from is not None:
@@ -798,9 +826,13 @@ def pretrain(
         if "epoch" in ckpt and ckpt["epoch"] is not None:
             start_epoch = ckpt["epoch"] + 1
         if "best_metric" in ckpt and ckpt["best_metric"] is not None:
-            best_val_loss = ckpt["best_metric"]
+            best_val_objective = ckpt["best_metric"]
             best_epoch = ckpt.get("epoch", 0)
-        logger.info("Resumed at epoch %d (best_val_loss=%.4f)", start_epoch, best_val_loss)
+        logger.info(
+            "Resumed at epoch %d (best_val_objective=%.4f)",
+            start_epoch,
+            best_val_objective,
+        )
 
     def _legacy_base_seed() -> int:
         return int(torch.empty((), dtype=torch.int64).random_().item())
@@ -900,28 +932,41 @@ def pretrain(
                     else None
                 )
 
-            train_loss, train_alignment_loss = _train_one_epoch(
+            (
+                train_loss,
+                train_descriptor_loss,
+                train_alignment_loss,
+            ) = _train_one_epoch(
                 model,
                 train_loader,
                 optimizer,
                 config.masking_ratio,
+                config.descriptors.loss_weight,
                 device,
             )
             if plain_2d_mode:
                 val_loader = _legacy_eval_loader(val_data)
             (
                 val_loss,
+                val_descriptor_loss,
                 val_rmse,
                 val_alignment_loss,
                 val_alignment_spearman,
                 val_alignment_kendall,
-            ) = _validate(model, val_loader, device)
+            ) = _validate(
+                model,
+                val_loader,
+                config.descriptors.loss_weight,
+                device,
+            )
 
             elapsed = time.time() - start_time
             row = [
                 epoch,
                 f"{train_loss:.6f}",
                 f"{val_loss:.6f}",
+                f"{train_descriptor_loss:.6f}",
+                f"{val_descriptor_loss:.6f}",
                 f"{val_rmse:.6f}",
                 f"{lr:.2e}",
                 f"{elapsed:.1f}",
@@ -938,12 +983,15 @@ def pretrain(
 
             if alignment_cfg.enabled:
                 logger.info(
-                    "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  "
+                    "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  "
+                    "train_desc=%.4f  val_desc=%.4f  val_rmse=%.4f  "
                     "train_align=%.4f  val_align=%.4f  lr=%.2e",
                     epoch + 1,
                     config.max_epochs,
                     train_loss,
                     val_loss,
+                    train_descriptor_loss,
+                    val_descriptor_loss,
                     val_rmse,
                     train_alignment_loss,
                     val_alignment_loss,
@@ -957,18 +1005,21 @@ def pretrain(
                     )
             else:
                 logger.info(
-                    "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  lr=%.2e",
+                    "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  "
+                    "train_desc=%.4f  val_desc=%.4f  val_rmse=%.4f  lr=%.2e",
                     epoch + 1,
                     config.max_epochs,
                     train_loss,
                     val_loss,
+                    train_descriptor_loss,
+                    val_descriptor_loss,
                     val_rmse,
                     lr,
                 )
 
             # Early stopping
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_loss < best_val_objective:
+                best_val_objective = val_loss
                 best_epoch = epoch
                 patience_counter = 0
 
@@ -976,7 +1027,7 @@ def pretrain(
                 _save_checkpoint(
                     model, optimizer, best_ckpt_path,
                     epoch=epoch,
-                    best_metric=best_val_loss,
+                    best_metric=best_val_objective,
                     config=config,
                     scaler=scaler,
                     descriptor_names=descriptor_names,
@@ -999,7 +1050,7 @@ def pretrain(
     _save_checkpoint(
         model, optimizer, last_ckpt_path,
         epoch=epoch,
-        best_metric=best_val_loss,
+        best_metric=best_val_objective,
         config=config,
         scaler=scaler,
         descriptor_names=descriptor_names,
@@ -1011,8 +1062,9 @@ def pretrain(
     )
 
     logger.info(
-        "Training complete.  Best val_loss=%.4f at epoch %d",
-        best_val_loss, best_epoch + 1,
+        "Training complete.  Best val_objective=%.4f at epoch %d",
+        best_val_objective,
+        best_epoch + 1,
     )
 
     # ------------------------------------------------------------------
@@ -1034,13 +1086,24 @@ def pretrain(
         model.load_weights(best_ckpt_path, map_location=device)
 
         (
-            test_mse,
+            test_loss,
+            test_descriptor_loss,
             test_rmse,
             test_alignment_loss,
             test_alignment_spearman,
             test_alignment_kendall,
-        ) = _validate(model, test_loader, device)
-        logger.info("Test RMSE (best model): %.4f", test_rmse)
+        ) = _validate(
+            model,
+            test_loader,
+            config.descriptors.loss_weight,
+            device,
+        )
+        logger.info(
+            "Test objective loss=%.4f  descriptor_loss=%.4f  rmse=%.4f",
+            test_loss,
+            test_descriptor_loss,
+            test_rmse,
+        )
         if alignment_cfg.enabled:
             logger.info(
                 "Test alignment: loss=%.4f  spearman=%.4f  kendall=%.4f",

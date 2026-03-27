@@ -94,22 +94,22 @@ Optional 3D descriptor targets can be enabled in YAML:
 descriptors:
   include_2d_targets: true
   include_3d_targets: true
+  loss_weight: 1.0
   three_d_settings:
-    aggregation: boltz_mean  # only supported option; Boltzmann-weighted conformer average
     rdkit_include_getaway: false
     electroshape_charge_model: gasteiger  # supported: gasteiger, mmff94
 
 conformers:
+  timeout_seconds: 10
   n_generate: 12
   n_keep: 4
   energy_window_kcal: 10.0
   prune_rms: 0.75
-  embedding: ETKDGv3
   optimize: MMFF
   fallback_optimize: UFF
 ```
 
-Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If 3D targets are enabled and a molecule fails conformer generation or has an incomplete 3D descriptor ensemble, that molecule is skipped before training, validation, and test evaluation.
+Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. If 3D targets are enabled and a molecule times out during conformer generation or has an incomplete 3D descriptor ensemble, that molecule is skipped before training, validation, and test evaluation.
 
 ### CLI options
 
@@ -133,7 +133,7 @@ After a run completes, the output directory contains:
 
 ```
 experiments/pretrain/
-  best_checkpoint.pt.gz     # Best model by validation loss (gzip-compressed)
+  best_checkpoint.pt.gz     # Best model by validation objective (gzip-compressed)
   resolved_config.yaml      # Full resolved config used for the run
   pretrain_report.html      # HTML dashboard with training curves and metrics (not tracked)
   last_checkpoint.pt        # Last epoch, for resuming (not tracked)
@@ -151,7 +151,7 @@ golem report experiments/pretrain
 
 This reads `metrics.csv` and `resolved_config.yaml` from the experiment directory and produces a single-file HTML dashboard (`pretrain_report.html`) with:
 
-- Training & validation loss curves
+- Training & validation objective curves
 - Validation RMSE curve
 - Learning rate schedule
 - Train vs val loss gap

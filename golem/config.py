@@ -65,7 +65,6 @@ class ECFPLatentAlignmentConfig:
 class Descriptor3DSettings:
     """Optional 3D descriptor-target settings."""
 
-    aggregation: str = "boltz_mean"
     rdkit_include_getaway: bool = False
     electroshape_charge_model: str = "gasteiger"
 
@@ -76,6 +75,7 @@ class DescriptorConfig:
 
     include_2d_targets: bool = True
     include_3d_targets: bool = False
+    loss_weight: float = 1.0
     three_d_settings: Descriptor3DSettings = field(default_factory=Descriptor3DSettings)
 
 
@@ -85,9 +85,9 @@ class ConformerConfig:
 
     n_generate: int = 12
     n_keep: int = 4
+    timeout_seconds: int = 10
     energy_window_kcal: float = 10.0
     prune_rms: float = 0.75
-    embedding: str = "ETKDGv3"
     optimize: str = "MMFF"
     fallback_optimize: str = "UFF"
 
@@ -135,10 +135,24 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     conformers_d = d.pop("conformers", {})
     alignment_d = d.pop("ecfp_latent_alignment", {})
     descriptor3d_d = descriptors_d.pop("three_d_settings", {})
-    if not descriptor3d_d:
-        descriptor3d_d = descriptors_d.pop("three_d", {})
-    if "use_3d_targets" in descriptors_d and "include_3d_targets" not in descriptors_d:
-        descriptors_d["include_3d_targets"] = descriptors_d.pop("use_3d_targets")
+
+    if "three_d" in descriptors_d:
+        raise ValueError(
+            "descriptors.three_d was removed; use descriptors.three_d_settings."
+        )
+    if "use_3d_targets" in descriptors_d:
+        raise ValueError(
+            "descriptors.use_3d_targets was removed; use descriptors.include_3d_targets."
+        )
+    if "aggregation" in descriptor3d_d:
+        raise ValueError(
+            "descriptors.three_d_settings.aggregation was removed; "
+            "Boltzmann aggregation is now fixed."
+        )
+    if "embedding" in conformers_d:
+        raise ValueError(
+            "conformers.embedding was removed; ETKDGv3 is now the fixed embedder."
+        )
 
     # Handle nested YAML structures for isoforms
     if "tautomers" in isoform_d and isinstance(isoform_d["tautomers"], dict):
@@ -197,7 +211,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     # Filter to known fields
     d = {k: v for k, v in d.items() if k in pretrain_fields}
 
-    return PretrainConfig(
+    config = PretrainConfig(
         model=ModelConfig(**model_d),
         isoforms=IsoformConfig(**isoform_d),
         descriptors=DescriptorConfig(
@@ -208,6 +222,24 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         ecfp_latent_alignment=ECFPLatentAlignmentConfig(**alignment_d),
         **d,
     )
+    return _validate_config(config)
+
+
+def _validate_config(config: PretrainConfig) -> PretrainConfig:
+    """Validate user-facing config values."""
+    if config.descriptors.loss_weight < 0:
+        raise ValueError("descriptors.loss_weight must be >= 0.")
+    if config.conformers.timeout_seconds < 0:
+        raise ValueError("conformers.timeout_seconds must be >= 0.")
+    if config.descriptors.three_d_settings.electroshape_charge_model not in {
+        "gasteiger",
+        "mmff94",
+    }:
+        raise ValueError(
+            "descriptors.three_d_settings.electroshape_charge_model must be "
+            "one of: gasteiger, mmff94."
+        )
+    return config
 
 
 def load_config(

@@ -153,11 +153,14 @@ class TestDescriptorTargets:
 
         def fake_generate(smiles, config, *, seed):
             if smiles == "no_conf":
-                return None
-            return ConformerEnsemble(
-                mol=smiles,
-                conformer_ids=[0, 1],
-                relative_energies_kcal=np.array([0.0, 0.593], dtype=np.float64),
+                return None, "timeout"
+            return (
+                ConformerEnsemble(
+                    mol=smiles,
+                    conformer_ids=[0, 1],
+                    relative_energies_kcal=np.array([0.0, 0.593], dtype=np.float64),
+                ),
+                None,
             )
 
         calculators = {

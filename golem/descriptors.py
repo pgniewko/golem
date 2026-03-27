@@ -156,11 +156,6 @@ def compute_aggregated_3d_descriptors(
     seed: int,
 ) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray]:
     """Compute and aggregate the fixed 3D descriptor pack."""
-    if three_d_settings.aggregation != "boltz_mean":
-        raise ValueError(
-            f"Unsupported 3D aggregation mode: {three_d_settings.aggregation!r}"
-        )
-
     calculators = _build_3d_calculators(three_d_settings)
     columns_by_family = {
         family: _calculator_columns(calculators[family]) for family in _THREE_D_FAMILIES
@@ -174,14 +169,22 @@ def compute_aggregated_3d_descriptors(
     values = np.zeros((len(smiles_list), total_width), dtype=np.float32)
     validity_mask = np.zeros((len(smiles_list), total_width), dtype=np.bool_)
     keep_mask = np.ones(len(smiles_list), dtype=np.bool_)
-    dropped_no_conformers = 0
+    dropped_timeout = 0
+    dropped_conformer_failures = 0
     dropped_invalid_descriptors = 0
 
     for row_idx, smiles in enumerate(smiles_list):
-        ensemble = generate_conformer_ensemble(smiles, conformers, seed=seed)
+        ensemble, failure_reason = generate_conformer_ensemble(
+            smiles,
+            conformers,
+            seed=seed,
+        )
         if ensemble is None:
             keep_mask[row_idx] = False
-            dropped_no_conformers += 1
+            if failure_reason == "timeout":
+                dropped_timeout += 1
+            else:
+                dropped_conformer_failures += 1
             continue
 
         offset = 0
@@ -228,11 +231,13 @@ def compute_aggregated_3d_descriptors(
         values.shape[1],
         validity_mask.mean() * 100 if validity_mask.size else 0.0,
     )
-    if dropped_no_conformers or dropped_invalid_descriptors:
+    if dropped_timeout or dropped_conformer_failures or dropped_invalid_descriptors:
         logger.info(
-            "Dropped %d molecules during 3D target generation (%d no conformers, %d invalid descriptor ensembles)",
+            "Dropped %d molecules during 3D target generation "
+            "(%d timeouts, %d other conformer failures, %d invalid descriptor ensembles)",
             int((~keep_mask).sum()),
-            dropped_no_conformers,
+            dropped_timeout,
+            dropped_conformer_failures,
             dropped_invalid_descriptors,
         )
     return values, validity_mask, descriptor_names, keep_mask

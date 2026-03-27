@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -53,39 +54,52 @@ def _optimize_conformers(mol: Chem.Mol, method: str) -> dict[int, float] | None:
     return energies or None
 
 
+def _timed_out(started_at: float, timeout_seconds: int) -> bool:
+    return timeout_seconds > 0 and (time.monotonic() - started_at) >= timeout_seconds
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "timed out" in message or "timeout" in message
+
+
 def generate_conformer_ensemble(
     smiles: str,
     config: ConformerConfig,
     *,
     seed: int,
-) -> ConformerEnsemble | None:
+) -> tuple[ConformerEnsemble | None, str | None]:
     """Generate a low-energy, RMS-pruned conformer ensemble."""
+    started_at = time.monotonic()
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        return None
+        return None, "invalid_smiles"
 
     mol = Chem.AddHs(mol)
-    if config.embedding != "ETKDGv3":
-        raise ValueError(f"Unsupported embedding method: {config.embedding!r}")
     params = AllChem.ETKDGv3()
     params.randomSeed = _molecule_seed(smiles, seed)
     params.pruneRmsThresh = -1.0
+    params.timeout = max(int(config.timeout_seconds), 0)
 
     try:
         conf_ids = list(
             AllChem.EmbedMultipleConfs(mol, numConfs=config.n_generate, params=params)
         )
-    except Exception:
+    except Exception as exc:
         logger.debug("Conformer embedding failed for %s", smiles, exc_info=True)
-        return None
+        return None, "timeout" if _is_timeout_error(exc) else "embedding_failed"
     if not conf_ids:
-        return None
+        if _timed_out(started_at, config.timeout_seconds):
+            return None, "timeout"
+        return None, "no_conformers"
 
     energies = _optimize_conformers(mol, config.optimize)
     if energies is None:
         energies = _optimize_conformers(mol, config.fallback_optimize)
     if energies is None:
-        return None
+        if _timed_out(started_at, config.timeout_seconds):
+            return None, "timeout"
+        return None, "optimization_failed"
 
     min_energy = min(energies.values())
     candidates = [
@@ -113,13 +127,18 @@ def generate_conformer_ensemble(
             break
 
     if not kept:
-        return None
+        if _timed_out(started_at, config.timeout_seconds):
+            return None, "timeout"
+        return None, "rms_pruned"
 
-    return ConformerEnsemble(
-        mol=mol,
-        conformer_ids=[conf_id for conf_id, _ in kept],
-        relative_energies_kcal=np.array(
-            [rel_energy for _, rel_energy in kept],
-            dtype=np.float64,
+    return (
+        ConformerEnsemble(
+            mol=mol,
+            conformer_ids=[conf_id for conf_id, _ in kept],
+            relative_energies_kcal=np.array(
+                [rel_energy for _, rel_energy in kept],
+                dtype=np.float64,
+            ),
         ),
+        None,
     )

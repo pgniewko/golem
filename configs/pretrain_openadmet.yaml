@@ -37,17 +37,17 @@ isoforms:
 descriptors:
   include_2d_targets: true
   include_3d_targets: false
+  loss_weight: 1.0
   three_d_settings:
-    aggregation: boltz_mean  # only supported option; Boltzmann-weighted conformer average
     rdkit_include_getaway: false
     electroshape_charge_model: gasteiger  # supported: gasteiger, mmff94
 
 conformers:
+  timeout_seconds: 10
   n_generate: 12
   n_keep: 4
   energy_window_kcal: 10.0
   prune_rms: 0.75
-  embedding: ETKDGv3
   optimize: MMFF
   fallback_optimize: UFF
 

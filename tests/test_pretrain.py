@@ -20,6 +20,8 @@ from golem.pretrain import (
     _resolved_config_dict,
     _save_checkpoint,
     _smiles_cache_key,
+    _train_one_epoch,
+    _validate,
 )
 from golem.utils import EpochSeededRandomSampler, load_smiles, seed_everything, split_data
 
@@ -36,9 +38,11 @@ class TestConfig:
         assert cfg.isoforms.enabled is True
         assert cfg.descriptors.include_2d_targets is True
         assert cfg.descriptors.include_3d_targets is False
+        assert cfg.descriptors.loss_weight == 1.0
         assert cfg.descriptors.three_d_settings.rdkit_include_getaway is False
         assert cfg.conformers.n_generate == 12
         assert cfg.conformers.n_keep == 4
+        assert cfg.conformers.timeout_seconds == 10
 
     def test_load_config_defaults_only(self):
         """load_config with no args should return defaults."""
@@ -76,20 +80,63 @@ class TestConfig:
             "descriptors:\n"
             "  include_2d_targets: false\n"
             "  include_3d_targets: true\n"
+            "  loss_weight: 0.25\n"
             "  three_d_settings:\n"
             "    rdkit_include_getaway: true\n"
             "    electroshape_charge_model: mmff94\n"
             "conformers:\n"
+            "  timeout_seconds: 7\n"
             "  n_generate: 16\n"
             "  n_keep: 4\n"
         )
         cfg = load_config(yaml_path=str(yaml_file))
         assert cfg.descriptors.include_2d_targets is False
         assert cfg.descriptors.include_3d_targets is True
+        assert cfg.descriptors.loss_weight == pytest.approx(0.25)
         assert cfg.descriptors.three_d_settings.rdkit_include_getaway is True
         assert cfg.descriptors.three_d_settings.electroshape_charge_model == "mmff94"
+        assert cfg.conformers.timeout_seconds == 7
         assert cfg.conformers.n_generate == 16
         assert cfg.conformers.n_keep == 4
+
+    @pytest.mark.parametrize(
+        ("yaml_text", "message"),
+        [
+            (
+                "descriptors:\n  use_3d_targets: true\n",
+                "descriptors.use_3d_targets was removed",
+            ),
+            (
+                "descriptors:\n  three_d:\n    rdkit_include_getaway: true\n",
+                "descriptors.three_d was removed",
+            ),
+            (
+                "descriptors:\n  three_d_settings:\n    aggregation: boltz_mean\n",
+                "descriptors.three_d_settings.aggregation was removed",
+            ),
+            (
+                "conformers:\n  embedding: ETKDGv3\n",
+                "conformers.embedding was removed",
+            ),
+        ],
+    )
+    def test_load_config_rejects_removed_stale_keys(self, tmp_path, yaml_text, message):
+        yaml_file = tmp_path / "stale.yaml"
+        yaml_file.write_text(yaml_text)
+
+        with pytest.raises(ValueError, match=message):
+            load_config(yaml_path=str(yaml_file))
+
+    def test_load_config_rejects_invalid_charge_model(self, tmp_path):
+        yaml_file = tmp_path / "invalid_charge_model.yaml"
+        yaml_file.write_text(
+            "descriptors:\n"
+            "  three_d_settings:\n"
+            "    electroshape_charge_model: am1bcc\n"
+        )
+
+        with pytest.raises(ValueError, match="electroshape_charge_model"):
+            load_config(yaml_path=str(yaml_file))
 
 
 class TestSeedEverything:
@@ -122,6 +169,14 @@ class TestCompatibilityArtifacts:
         assert cfg_dict["conformers"]["n_generate"] == cfg.conformers.n_generate
         assert cfg_dict["ecfp_latent_alignment"]["enabled"] is True
 
+    def test_artifact_config_dict_keeps_descriptors_when_loss_weight_is_nondefault(self):
+        cfg = PretrainConfig()
+        cfg.descriptors.loss_weight = 0.0
+
+        cfg_dict = _artifact_config_dict(cfg)
+
+        assert cfg_dict["descriptors"]["loss_weight"] == 0.0
+
     def test_artifact_config_dict_preserves_tuple_fields_for_checkpoint_metadata(self):
         cfg = PretrainConfig()
         cfg_dict = _artifact_config_dict(cfg)
@@ -136,13 +191,15 @@ class TestCompatibilityArtifacts:
         assert cfg_dict["winsorize_range"] == [-6.0, 6.0]
         assert cfg_dict["isoforms"]["ph_range"] == [6.4, 8.4]
 
-    def test_metrics_fieldnames_match_legacy_schema_without_alignment(self):
+    def test_metrics_fieldnames_include_descriptor_columns_without_alignment(self):
         cfg = PretrainConfig()
 
         assert _metrics_fieldnames(cfg) == [
             "epoch",
             "train_loss",
             "val_loss",
+            "train_descriptor_loss",
+            "val_descriptor_loss",
             "val_rmse",
             "learning_rate",
             "elapsed_seconds",
@@ -156,6 +213,8 @@ class TestCompatibilityArtifacts:
             "epoch",
             "train_loss",
             "val_loss",
+            "train_descriptor_loss",
+            "val_descriptor_loss",
             "val_rmse",
             "learning_rate",
             "elapsed_seconds",
@@ -164,6 +223,142 @@ class TestCompatibilityArtifacts:
             "val_alignment_spearman",
             "val_alignment_kendall",
         ]
+
+
+class _DummyBatch:
+    def __init__(self, targets: torch.Tensor, mask: torch.Tensor):
+        self.y = targets
+        self.y_mask = mask
+        batch_size = targets.shape[0]
+        self.x = torch.zeros((batch_size, 1), dtype=torch.float32)
+        self.edge_index = torch.zeros((2, 0), dtype=torch.long)
+        self.edge_attr = torch.zeros((0, 1), dtype=torch.float32)
+        self.batch = torch.arange(batch_size, dtype=torch.long)
+
+    def to(self, device: torch.device):
+        self.y = self.y.to(device)
+        self.y_mask = self.y_mask.to(device)
+        self.x = self.x.to(device)
+        self.edge_index = self.edge_index.to(device)
+        self.edge_attr = self.edge_attr.to(device)
+        self.batch = self.batch.to(device)
+        return self
+
+
+class _DummyLoader(list):
+    ecfp_latent_alignment = None
+
+
+class _DummyModel(torch.nn.Module):
+    def __init__(self, prediction: torch.Tensor, latent_value: float = 2.0):
+        super().__init__()
+        self.prediction = torch.nn.Parameter(prediction.clone())
+        self.latent = torch.nn.Parameter(torch.tensor([[latent_value]], dtype=torch.float32))
+
+    def forward(self, x, edge_index, edge_attr, batch, zero_var=False, return_latent=False):
+        pred = self.prediction.expand(x.shape[0], -1)
+        log_var = torch.zeros_like(pred)
+        if return_latent:
+            z = self.latent.expand(x.shape[0], -1)
+            return pred, log_var, z
+        return pred, log_var
+
+
+class TestWeightedObjective:
+    def test_validate_uses_weighted_objective_and_preserves_descriptor_metrics(
+        self,
+        monkeypatch,
+    ):
+        cfg = PretrainConfig()
+        cfg.descriptors.loss_weight = 0.0
+        cfg.ecfp_latent_alignment.enabled = True
+        cfg.ecfp_latent_alignment.weight = 0.5
+        cfg.ecfp_latent_alignment.log_rank_metrics = False
+
+        loader = _DummyLoader(
+            [
+                _DummyBatch(
+                    torch.tensor([[1.0]], dtype=torch.float32),
+                    torch.tensor([[1.0]], dtype=torch.float32),
+                )
+            ]
+        )
+        loader.ecfp_latent_alignment = cfg.ecfp_latent_alignment
+        model = _DummyModel(torch.tensor([[0.0]], dtype=torch.float32))
+
+        monkeypatch.setattr(
+            "golem.pretrain.compute_alignment_batch",
+            lambda batch, z, alignment_cfg, deterministic_pairs=False: (
+                z.mean(),
+                None,
+                None,
+            ),
+        )
+
+        (
+            objective_loss,
+            descriptor_loss,
+            rmse,
+            alignment_loss,
+            alignment_spearman,
+            alignment_kendall,
+        ) = _validate(
+            model,
+            loader,
+            cfg.descriptors.loss_weight,
+            torch.device("cpu"),
+        )
+
+        assert objective_loss == pytest.approx(1.0)
+        assert descriptor_loss == pytest.approx(1.0)
+        assert rmse == pytest.approx(1.0)
+        assert alignment_loss == pytest.approx(2.0)
+        assert np.isnan(alignment_spearman)
+        assert np.isnan(alignment_kendall)
+
+    def test_train_one_epoch_can_optimize_alignment_with_empty_descriptor_mask(
+        self,
+        monkeypatch,
+    ):
+        cfg = PretrainConfig()
+        cfg.descriptors.loss_weight = 0.0
+        cfg.ecfp_latent_alignment.enabled = True
+        cfg.ecfp_latent_alignment.weight = 0.5
+        cfg.ecfp_latent_alignment.log_rank_metrics = False
+
+        loader = _DummyLoader(
+            [
+                _DummyBatch(
+                    torch.tensor([[0.0]], dtype=torch.float32),
+                    torch.tensor([[0.0]], dtype=torch.float32),
+                )
+            ]
+        )
+        loader.ecfp_latent_alignment = cfg.ecfp_latent_alignment
+        model = _DummyModel(torch.tensor([[0.0]], dtype=torch.float32))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        monkeypatch.setattr(
+            "golem.pretrain.compute_alignment_batch",
+            lambda batch, z, alignment_cfg, deterministic_pairs=False: (
+                z.mean(),
+                None,
+                None,
+            ),
+        )
+
+        train_loss, train_descriptor_loss, train_alignment_loss = _train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            masking_ratio=1.0,
+            descriptor_loss_weight=cfg.descriptors.loss_weight,
+            device=torch.device("cpu"),
+        )
+
+        assert train_loss == pytest.approx(1.0)
+        assert train_descriptor_loss == pytest.approx(0.0)
+        assert train_alignment_loss == pytest.approx(2.0)
 
 
 class TestEpochSeededRandomSampler:
