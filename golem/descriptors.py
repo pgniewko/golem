@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 
 _BOLTZMANN_KT_KCAL = 0.593
 _THREE_D_FAMILIES = ("rdkit3d", "usrcat", "electroshape")
-DEFAULT_3D_PACK_ID = "rdkit3d+usrcat+electroshape:v1"
 
 
 # ---------------------------------------------------------------------------
@@ -114,9 +113,7 @@ def _build_3d_calculators(config: Descriptor3DSettings) -> Dict[str, object]:
     return {
         "rdkit3d": RDKitDescriptors3D(ignore_descrs=ignore_descrs),
         "usrcat": USRDescriptors(method="USRCAT"),
-        "electroshape": ElectroShapeDescriptors(
-            charge_model=config.electroshape_charge_model
-        ),
+        "electroshape": ElectroShapeDescriptors(charge_model="gasteiger"),
     }
 
 

@@ -194,9 +194,9 @@ def _generate_conformer_ensemble_inline(
             return None, "timeout"
         return None, "no_conformers"
 
-    energies = _optimize_conformers(mol, config.optimize)
+    energies = _optimize_conformers(mol, "MMFF")
     if energies is None:
-        energies = _optimize_conformers(mol, config.fallback_optimize)
+        energies = _optimize_conformers(mol, "UFF")
     if energies is None:
         if _timed_out(started_at, config.timeout_seconds):
             return None, "timeout"

@@ -19,7 +19,6 @@ Pipeline:
 from __future__ import annotations
 
 import csv
-import hashlib
 import inspect
 import json
 import logging
@@ -35,17 +34,15 @@ from rdkit import Chem
 import torch.nn.functional as F
 from torch.utils.data import RandomSampler
 import yaml
-from golem.cache import cache_dir
 from golem.config import ECFPLatentAlignmentConfig, PretrainConfig
 from golem.descriptors import (
-    DEFAULT_3D_PACK_ID,
     NaNAwareStandardScaler,
     compute_descriptor_targets,
 )
 from golem.ecfp_latent_alignment import (
     compute_alignment_batch,
     compute_alignment_metrics,
-    load_or_compute_fingerprints,
+    compute_fingerprints,
 )
 from golem.isoforms import enumerate_isoforms_batch
 from golem.report import generate_report
@@ -75,7 +72,6 @@ ALIGNMENT_METRICS_FIELDNAMES = BASE_METRICS_FIELDNAMES + [
     "val_alignment_spearman",
     "val_alignment_kendall",
 ]
-_GRAPH_CACHE_SCHEMA_VERSION = "v1"
 _PROGRESS_LOG_INTERVAL = 25
 
 
@@ -477,7 +473,7 @@ def _build_pyg_dataset(
     """
     from torch_geometric.data import Data
 
-    graph_payloads = _load_or_build_graph_payloads(smiles_list)
+    graph_payloads = _build_graph_payload(smiles_list)
 
     data_list = [
         Data(
@@ -504,50 +500,8 @@ def _build_pyg_dataset(
 # Main pretrain function
 # ---------------------------------------------------------------------------
 
-def _smiles_cache_key(smiles_list: List[str]) -> str:
-    """Return a 16-char hex SHA-256 hash of the SMILES list (order-sensitive)."""
-    h = hashlib.sha256("\n".join(smiles_list).encode())
-    return h.hexdigest()[:16]
-
-
-def _descriptor_cache_path(smiles_list: List[str], config: PretrainConfig) -> Path:
-    """Return the shared descriptor cache path for the current target configuration."""
-    return cache_dir("descriptors") / f"descriptors_{_descriptor_cache_key(smiles_list, config)}.npz"
-
-
-def _descriptor_cache_key(smiles_list: List[str], config: PretrainConfig) -> str:
-    """Return the shared descriptor cache key for the current target configuration."""
-    if config.descriptors.include_3d_targets:
-        payload = {
-            "smiles": smiles_list,
-            "seed": config.seed,
-            "three_d_pack": DEFAULT_3D_PACK_ID,
-            "descriptors": asdict(config.descriptors),
-            "conformers": asdict(config.conformers),
-        }
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()[:16]
-    return _smiles_cache_key(smiles_list)
-
-
-def _graph_cache_path(smiles_list: List[str]) -> Path:
-    """Return the shared graph-feature cache path for an ordered SMILES list."""
-    from gt_pyg import __version__ as gt_pyg_version
-
-    payload = {
-        "smiles": smiles_list,
-        "graph_schema": _GRAPH_CACHE_SCHEMA_VERSION,
-        "gt_pyg_version": gt_pyg_version,
-    }
-    cache_key = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:16]
-    return cache_dir("graphs") / f"pyg_graphs_{cache_key}.pt"
-
-
-def _build_graph_cache_payload(smiles_list: List[str]) -> list[dict[str, torch.Tensor]]:
-    """Compute bare graph tensors for caching and later dataset reconstruction."""
+def _build_graph_payload(smiles_list: List[str]) -> list[dict[str, torch.Tensor]]:
+    """Compute bare graph tensors for dataset reconstruction."""
     from gt_pyg import get_tensor_data
 
     logger.info("Building PyG graph features for %d molecules …", len(smiles_list))
@@ -562,42 +516,11 @@ def _build_graph_cache_payload(smiles_list: List[str]) -> list[dict[str, torch.T
     ]
 
 
-def _load_or_build_graph_payloads(smiles_list: List[str]) -> list[dict[str, torch.Tensor]]:
-    """Load cached graph tensors or build and cache them on demand."""
-    cache_path = _graph_cache_path(smiles_list)
-    if cache_path.exists():
-        logger.info("Loading shared graph cache from %s", cache_path.name)
-        return torch.load(cache_path, map_location="cpu", weights_only=False)
-
-    logger.info("Shared graph cache miss for %d molecules", len(smiles_list))
-    graph_payloads = _build_graph_cache_payload(smiles_list)
-    torch.save(graph_payloads, cache_path)
-    logger.info("Saved shared graph cache to %s", cache_path.name)
-    return graph_payloads
-
-
-def _load_or_compute_descriptor_targets(
+def _compute_descriptor_targets(
     smiles_list: List[str],
     config: PretrainConfig,
 ) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
-    """Load cached descriptor targets or compute and cache them on demand."""
-    cache_path = _descriptor_cache_path(smiles_list, config)
-    if cache_path.exists():
-        logger.info("Loading shared descriptor cache from %s", cache_path.name)
-        cached = np.load(cache_path, allow_pickle=True)
-        keep_rows = (
-            cached["keep"].astype(np.bool_, copy=False)
-            if "keep" in cached.files
-            else np.ones(len(cached["values"]), dtype=np.bool_)
-        )
-        return (
-            cached["values"],
-            cached["valid"],
-            cached["names"].tolist(),
-            keep_rows,
-        )
-
-    logger.info("Shared descriptor cache miss for %d molecules", len(smiles_list))
+    """Compute descriptor targets for the current run."""
     if _is_plain_2d_mode(config):
         logger.info("Computing Mordred descriptors …")
     else:
@@ -612,15 +535,6 @@ def _load_or_compute_descriptor_targets(
         config.conformers,
         seed=config.seed,
     )
-    cache_payload = {
-        "values": desc_values,
-        "valid": desc_valid,
-        "names": np.array(descriptor_names),
-    }
-    if config.descriptors.include_3d_targets:
-        cache_payload["keep"] = keep_rows
-    np.savez(cache_path, **cache_payload)
-    logger.info("Saved shared descriptor cache to %s", cache_path.name)
     return desc_values, desc_valid, descriptor_names, keep_rows
 
 
@@ -878,9 +792,9 @@ def pretrain(
     smiles_list, train_idx, val_idx, test_idx = _prepare_split_smiles(smiles_list, config)
 
     # ------------------------------------------------------------------
-    # 4. Compute descriptor targets (with disk cache)
+    # 4. Compute descriptor targets
     # ------------------------------------------------------------------
-    desc_values, desc_valid, descriptor_names, keep_rows = _load_or_compute_descriptor_targets(
+    desc_values, desc_valid, descriptor_names, keep_rows = _compute_descriptor_targets(
         smiles_list,
         config,
     )
@@ -909,7 +823,7 @@ def pretrain(
     fp_bits = None
     alignment_cfg = config.ecfp_latent_alignment
     if alignment_cfg.enabled:
-        fp_bits = load_or_compute_fingerprints(output_dir, smiles_list, alignment_cfg)
+        fp_bits = compute_fingerprints(smiles_list, alignment_cfg)
         logger.info(
             "Fingerprint matrix: %d molecules × %d bits",
             fp_bits.shape[0],

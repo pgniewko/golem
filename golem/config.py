@@ -66,7 +66,6 @@ class Descriptor3DSettings:
     """Optional 3D descriptor-target settings."""
 
     rdkit_include_getaway: bool = False
-    electroshape_charge_model: str = "gasteiger"
 
 
 @dataclass
@@ -88,8 +87,6 @@ class ConformerConfig:
     timeout_seconds: int = 15
     energy_window_kcal: float = 10.0
     prune_rms: float = 0.75
-    optimize: str = "MMFF"
-    fallback_optimize: str = "UFF"
 
 
 @dataclass
@@ -149,9 +146,22 @@ def _dict_to_config(d: dict) -> PretrainConfig:
             "descriptors.three_d_settings.aggregation was removed; "
             "Boltzmann aggregation is now fixed."
         )
+    if "electroshape_charge_model" in descriptor3d_d:
+        raise ValueError(
+            "descriptors.three_d_settings.electroshape_charge_model was removed; "
+            "gasteiger is now the fixed charge model."
+        )
     if "embedding" in conformers_d:
         raise ValueError(
             "conformers.embedding was removed; ETKDGv3 is now the fixed embedder."
+        )
+    if "optimize" in conformers_d:
+        raise ValueError(
+            "conformers.optimize was removed; MMFF is now the fixed optimizer."
+        )
+    if "fallback_optimize" in conformers_d:
+        raise ValueError(
+            "conformers.fallback_optimize was removed; UFF is now the fixed fallback optimizer."
         )
 
     # Handle nested YAML structures for isoforms
@@ -177,7 +187,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         fb = isoform_d.pop("rdkit_fallback")
         isoform_d["rdkit_fallback"] = fb.get("enabled", False)
 
-    # Remove keys not in dataclass (e.g. deduplication, tool, fallback)
+    # Remove keys not in dataclass.
     model_fields = {f.name for f in fields(ModelConfig)}
     isoform_fields = {f.name for f in fields(IsoformConfig)}
     descriptor_fields = {f.name for f in fields(DescriptorConfig)}
@@ -231,14 +241,6 @@ def _validate_config(config: PretrainConfig) -> PretrainConfig:
         raise ValueError("descriptors.loss_weight must be >= 0.")
     if config.conformers.timeout_seconds < 0:
         raise ValueError("conformers.timeout_seconds must be >= 0.")
-    if config.descriptors.three_d_settings.electroshape_charge_model not in {
-        "gasteiger",
-        "mmff94",
-    }:
-        raise ValueError(
-            "descriptors.three_d_settings.electroshape_charge_model must be "
-            "one of: gasteiger, mmff94."
-        )
     return config
 
 

@@ -97,7 +97,6 @@ descriptors:
   loss_weight: 1.0
   three_d_settings:
     rdkit_include_getaway: false
-    electroshape_charge_model: gasteiger  # supported: gasteiger, mmff94
 
 conformers:
   timeout_seconds: 15
@@ -105,11 +104,9 @@ conformers:
   n_keep: 4
   energy_window_kcal: 10.0
   prune_rms: 0.75
-  optimize: MMFF
-  fallback_optimize: UFF
 ```
 
-Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. If 3D targets are enabled and a molecule times out during conformer generation or has an incomplete 3D descriptor ensemble, that molecule is skipped before training, validation, and test evaluation.
+Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. If 3D targets are enabled and a molecule times out during conformer generation or has an incomplete 3D descriptor ensemble, that molecule is skipped before training, validation, and test evaluation. ElectroShape uses fixed `gasteiger` charges, and conformer optimization uses fixed `MMFF` with `UFF` fallback.
 
 ### CLI options
 

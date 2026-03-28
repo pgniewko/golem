@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
-from pathlib import Path
 from typing import List
 
 import numpy as np
@@ -14,7 +12,6 @@ import torch.nn.functional as F
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
 
-from golem.cache import cache_dir
 from golem.config import ECFPLatentAlignmentConfig
 
 logger = logging.getLogger(__name__)
@@ -192,30 +189,11 @@ def compute_alignment_metrics(
     return spearman, _kendall_tau(fp_np, z_np)
 
 
-def _fingerprint_cache_path(
-    smiles_list: List[str],
-    config: ECFPLatentAlignmentConfig,
-) -> Path:
-    cache_key = hashlib.sha256("\n".join(smiles_list).encode()).hexdigest()[:16]
-    return cache_dir("fingerprints") / f"ecfp_r{config.fp_radius}_b{config.fp_bits}_{cache_key}.npz"
-
-
-def load_or_compute_fingerprints(
-    output_dir: Path,
+def compute_fingerprints(
     smiles_list: List[str],
     config: ECFPLatentAlignmentConfig,
 ) -> np.ndarray:
-    del output_dir
-    cache_path = _fingerprint_cache_path(smiles_list, config)
-    if cache_path.exists():
-        logger.info("Loading shared fingerprint cache from %s", cache_path.name)
-        cached = np.load(cache_path, allow_pickle=False)
-        return cached["bits"].astype(np.bool_, copy=False)
-
-    logger.info(
-        "Shared fingerprint cache miss for %d molecules; computing ECFP bits",
-        len(smiles_list),
-    )
+    logger.info("Computing ECFP bits for %d molecules", len(smiles_list))
     fps = np.zeros((len(smiles_list), config.fp_bits), dtype=np.bool_)
     for idx, smiles in enumerate(smiles_list):
         mol = Chem.MolFromSmiles(smiles)
@@ -229,7 +207,4 @@ def load_or_compute_fingerprints(
         fp_array = np.zeros((config.fp_bits,), dtype=np.int8)
         DataStructs.ConvertToNumpyArray(bit_vect, fp_array)
         fps[idx] = fp_array.astype(np.bool_)
-
-    np.savez(cache_path, bits=fps)
-    logger.info("Saved shared fingerprint cache to %s", cache_path.name)
     return fps
