@@ -79,34 +79,24 @@ golem pretrain \
   --output experiments/pretrain
 ```
 
+Config files in `configs/` are intended to contain overrides over the defaults in
+`golem.config.PretrainConfig`, not a full copy of every setting.
+
 Optional ECFP-latent alignment can be enabled in YAML:
 
 ```yaml
 ecfp_latent_alignment:
   enabled: true
-  weight: 0.05
-  num_pairs: 128
 ```
 
 Optional 3D descriptor targets can be enabled in YAML:
 
 ```yaml
 descriptors:
-  include_2d_targets: true
   include_3d_targets: true
-  loss_weight: 1.0
-  three_d_settings:
-    rdkit_include_getaway: false
-
-conformers:
-  timeout_seconds: 15
-  n_generate: 8
-  n_keep: 4
-  energy_window_kcal: 10.0
-  prune_rms: 0.75
 ```
 
-Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. If 3D targets are enabled and a molecule times out during conformer generation or has an incomplete 3D descriptor ensemble, that molecule is skipped before training, validation, and test evaluation. ElectroShape uses fixed `gasteiger` charges, and conformer optimization uses fixed `MMFF` with `UFF` fallback.
+Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. If 3D targets are enabled and a molecule times out during conformer generation or has an incomplete 3D descriptor ensemble, that molecule is skipped before training, validation, and test evaluation. ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ETKDGv3`, and conformer optimization uses fixed `MMFF` with `UFF` fallback.
 
 ### CLI options
 
@@ -130,7 +120,7 @@ After a run completes, the output directory contains:
 
 ```
 experiments/pretrain/
-  best_checkpoint.pt.gz     # Best model by validation objective (gzip-compressed)
+  best_checkpoint.pt        # Best model by validation objective
   resolved_config.yaml      # Full resolved config used for the run
   pretrain_report.html      # HTML dashboard with training curves and metrics (not tracked)
   last_checkpoint.pt        # Last epoch, for resuming (not tracked)
@@ -167,7 +157,7 @@ golem report experiments/pretrain --output path/to/report.html
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+pytest tests -q
 ```
 
 The tests cover isoform enumeration, 2D/3D descriptor computation, the NaN-aware scaler, config loading, data splitting, and SMILES file loading. Note: descriptor tests require `mordredcommunity` and may take a few seconds.
@@ -177,7 +167,7 @@ The tests cover isoform enumeration, 2D/3D descriptor computation, the NaN-aware
 | Module | What it does |
 |--------|-------------|
 | `cli.py` | Parses CLI args, merges config, calls `pretrain()` |
-| `config.py` | Defines `PretrainConfig` dataclass tree; merges defaults / YAML / CLI |
+| `config.py` | Defines `PretrainConfig` dataclass tree; merges defaults / YAML overrides / CLI |
 | `conformers.py` | Builds RDKit conformer ensembles for optional 3D descriptor targets |
 | `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
 | `descriptors.py` | Computes 2D/3D descriptor targets; provides `NaNAwareStandardScaler` |
@@ -193,5 +183,5 @@ The tests cover isoform enumeration, 2D/3D descriptor computation, the NaN-aware
 | NaN handling / validity masking | `descriptors.py:compute_mordred_descriptors()` |
 | Scaler fit (train-only, no leakage) | `pretrain.py:pretrain()` step 5 |
 | Config defaults | `config.py` dataclass definitions |
-| Production config | `configs/pretrain_openadmet.yaml` |
+| Production config overrides | `configs/pretrain_openadmet.yaml` |
 | Pretraining pipeline flow | `pretrain.py` module docstring |
