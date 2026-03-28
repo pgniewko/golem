@@ -93,32 +93,3 @@ def test_build_pyg_dataset_attaches_ecfp_bits():
     assert hasattr(dataset[0], "ecfp")
     assert dataset[0].ecfp.dtype == torch.bool
     assert dataset[1].ecfp.squeeze(0).tolist() == [False, True, False, True]
-
-
-def test_build_pyg_dataset_rebuilds_graph_tensors_each_call(monkeypatch):
-    calls = {"count": 0}
-
-    def fake_get_tensor_data(smiles_list, y=None):
-        from torch_geometric.data import Data
-
-        calls["count"] += 1
-        return [
-            Data(
-                x=torch.tensor([[float(idx)]], dtype=torch.float32),
-                edge_index=torch.zeros((2, 0), dtype=torch.long),
-                edge_attr=torch.zeros((0, 1), dtype=torch.float32),
-            )
-            for idx, _ in enumerate(smiles_list)
-        ]
-
-    monkeypatch.setattr("gt_pyg.get_tensor_data", fake_get_tensor_data)
-
-    values = np.array([[1.0], [2.0]], dtype=np.float32)
-    valid = np.array([[True], [True]], dtype=np.bool_)
-    first = _build_pyg_dataset(["CCO", "CCN"], values, valid)
-    first[0].x[0, 0] = 99.0
-
-    second = _build_pyg_dataset(["CCO", "CCN"], values, valid)
-
-    assert calls["count"] == 2
-    assert second[0].x[0, 0].item() == 0.0

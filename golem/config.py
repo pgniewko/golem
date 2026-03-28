@@ -133,37 +133,6 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     alignment_d = d.pop("ecfp_latent_alignment", {})
     descriptor3d_d = descriptors_d.pop("three_d_settings", {})
 
-    if "three_d" in descriptors_d:
-        raise ValueError(
-            "descriptors.three_d was removed; use descriptors.three_d_settings."
-        )
-    if "use_3d_targets" in descriptors_d:
-        raise ValueError(
-            "descriptors.use_3d_targets was removed; use descriptors.include_3d_targets."
-        )
-    if "aggregation" in descriptor3d_d:
-        raise ValueError(
-            "descriptors.three_d_settings.aggregation was removed; "
-            "Boltzmann aggregation is now fixed."
-        )
-    if "electroshape_charge_model" in descriptor3d_d:
-        raise ValueError(
-            "descriptors.three_d_settings.electroshape_charge_model was removed; "
-            "gasteiger is now the fixed charge model."
-        )
-    if "embedding" in conformers_d:
-        raise ValueError(
-            "conformers.embedding was removed; ETKDGv3 is now the fixed embedder."
-        )
-    if "optimize" in conformers_d:
-        raise ValueError(
-            "conformers.optimize was removed; MMFF is now the fixed optimizer."
-        )
-    if "fallback_optimize" in conformers_d:
-        raise ValueError(
-            "conformers.fallback_optimize was removed; UFF is now the fixed fallback optimizer."
-        )
-
     # Handle nested YAML structures for isoforms
     if "tautomers" in isoform_d and isinstance(isoform_d["tautomers"], dict):
         taut = isoform_d.pop("tautomers")
@@ -232,11 +201,6 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         ecfp_latent_alignment=ECFPLatentAlignmentConfig(**alignment_d),
         **d,
     )
-    return _validate_config(config)
-
-
-def _validate_config(config: PretrainConfig) -> PretrainConfig:
-    """Validate user-facing config values."""
     if config.descriptors.loss_weight < 0:
         raise ValueError("descriptors.loss_weight must be >= 0.")
     if config.conformers.timeout_seconds < 0:

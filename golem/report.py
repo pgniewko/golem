@@ -49,8 +49,6 @@ def _load_metrics(metrics_path: Path) -> List[Dict[str, Any]]:
                 "epoch": int(row["epoch"]),
                 "train_loss": float(row["train_loss"]),
                 "val_loss": float(row["val_loss"]),
-                "train_descriptor_loss": float(row["train_descriptor_loss"]),
-                "val_descriptor_loss": float(row["val_descriptor_loss"]),
                 "val_rmse": float(row["val_rmse"]),
                 "learning_rate": float(row["learning_rate"]),
                 "elapsed_seconds": float(row["elapsed_seconds"]),
@@ -73,13 +71,6 @@ def _parse_optional_float(row: Dict[str, str], key: str) -> float:
 
 def _has_alignment_metrics(metrics: List[Dict[str, Any]]) -> bool:
     return any(math.isfinite(row.get("val_alignment_loss", math.nan)) for row in metrics)
-
-
-def _optional_series(metrics: List[Dict[str, Any]], key: str) -> List[float | None]:
-    return [
-        value if math.isfinite(value := row.get(key, math.nan)) else None
-        for row in metrics
-    ]
 
 
 def _load_config(config_path: Path) -> Dict[str, Any]:
@@ -243,10 +234,6 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <canvas id="lossChart"></canvas>
   </div>
   <div class="chart-card">
-    <h3>Descriptor Loss</h3>
-    <canvas id="descriptorChart"></canvas>
-  </div>
-  <div class="chart-card">
     <h3>Validation RMSE</h3>
     <canvas id="rmseChart"></canvas>
   </div>
@@ -275,8 +262,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   <table>
     <thead>
       <tr>
-        <th>Epoch</th><th>Train Obj</th><th>Val Obj</th>
-        <th>Train Desc</th><th>Val Desc</th><th>Val RMSE</th>
+        <th>Epoch</th><th>Train Obj</th><th>Val Obj</th><th>Val RMSE</th>
         <th>LR</th><th>Elapsed</th>
       </tr>
     </thead>
@@ -292,8 +278,6 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 const epochs = {{EPOCHS_JSON}};
 const trainLoss = {{TRAIN_LOSS_JSON}};
 const valLoss = {{VAL_LOSS_JSON}};
-const trainDescriptorLoss = {{TRAIN_DESCRIPTOR_LOSS_JSON}};
-const valDescriptorLoss = {{VAL_DESCRIPTOR_LOSS_JSON}};
 const valRmse = {{VAL_RMSE_JSON}};
 const lr = {{LR_JSON}};
 const gap = trainLoss.map((t, i) => t - valLoss[i]);
@@ -324,18 +308,6 @@ new Chart(document.getElementById('lossChart'), {
     ],
   },
   options: makeOpts('Weighted Objective'),
-});
-
-new Chart(document.getElementById('descriptorChart'), {
-  type: 'line',
-  data: {
-    labels: epochs,
-    datasets: [
-      { label: 'Train Descriptor Loss', data: trainDescriptorLoss, borderColor: '#f97316', backgroundColor: 'rgba(249,115,22,0.1)', tension: 0.3, pointRadius: 2 },
-      { label: 'Val Descriptor Loss',   data: valDescriptorLoss,   borderColor: '#fb7185', backgroundColor: 'rgba(251,113,133,0.1)', tension: 0.3, pointRadius: 2 },
-    ],
-  },
-  options: makeOpts('Descriptor MSE'),
 });
 
 new Chart(document.getElementById('rmseChart'), {
@@ -425,12 +397,6 @@ def generate_report(
     epochs_json = json.dumps([r["epoch"] for r in metrics])
     train_loss_json = json.dumps([r["train_loss"] for r in metrics])
     val_loss_json = json.dumps([r["val_loss"] for r in metrics])
-    train_descriptor_loss_json = json.dumps(
-        [r["train_descriptor_loss"] for r in metrics]
-    )
-    val_descriptor_loss_json = json.dumps(
-        [r["val_descriptor_loss"] for r in metrics]
-    )
     val_rmse_json = json.dumps([r["val_rmse"] for r in metrics])
     lr_json = json.dumps([r["learning_rate"] for r in metrics])
     alignment_chart = ""
@@ -445,10 +411,10 @@ def generate_report(
   </div>
 """
         alignment_json = (
-            f"const trainAlignmentLoss = {json.dumps(_optional_series(metrics, 'train_alignment_loss'))};\n"
-            f"const valAlignmentLoss = {json.dumps(_optional_series(metrics, 'val_alignment_loss'))};\n"
-            f"const valAlignmentSpearman = {json.dumps(_optional_series(metrics, 'val_alignment_spearman'))};\n"
-            f"const valAlignmentKendall = {json.dumps(_optional_series(metrics, 'val_alignment_kendall'))};"
+            f"const trainAlignmentLoss = {json.dumps([row['train_alignment_loss'] if math.isfinite(row['train_alignment_loss']) else None for row in metrics])};\n"
+            f"const valAlignmentLoss = {json.dumps([row['val_alignment_loss'] if math.isfinite(row['val_alignment_loss']) else None for row in metrics])};\n"
+            f"const valAlignmentSpearman = {json.dumps([row['val_alignment_spearman'] if math.isfinite(row['val_alignment_spearman']) else None for row in metrics])};\n"
+            f"const valAlignmentKendall = {json.dumps([row['val_alignment_kendall'] if math.isfinite(row['val_alignment_kendall']) else None for row in metrics])};"
         )
         alignment_script = """
 new Chart(document.getElementById('alignmentChart'), {
@@ -493,8 +459,6 @@ new Chart(document.getElementById('alignmentChart'), {
             f"<td>{r['epoch']}</td>"
             f"<td>{r['train_loss']:.6f}</td>"
             f"<td>{r['val_loss']:.6f}</td>"
-            f"<td>{r['train_descriptor_loss']:.6f}</td>"
-            f"<td>{r['val_descriptor_loss']:.6f}</td>"
             f"<td>{r['val_rmse']:.6f}</td>"
             f"<td>{r['learning_rate']:.2e}</td>"
             f"<td>{_fmt_elapsed(r['elapsed_seconds'])}</td>"
@@ -520,8 +484,6 @@ new Chart(document.getElementById('alignmentChart'), {
         "{{EPOCHS_JSON}}": epochs_json,
         "{{TRAIN_LOSS_JSON}}": train_loss_json,
         "{{VAL_LOSS_JSON}}": val_loss_json,
-        "{{TRAIN_DESCRIPTOR_LOSS_JSON}}": train_descriptor_loss_json,
-        "{{VAL_DESCRIPTOR_LOSS_JSON}}": val_descriptor_loss_json,
         "{{VAL_RMSE_JSON}}": val_rmse_json,
         "{{LR_JSON}}": lr_json,
         "{{ALIGNMENT_CHART}}": alignment_chart,

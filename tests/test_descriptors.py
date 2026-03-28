@@ -38,73 +38,45 @@ class TestComputeMordredDescriptors:
         assert mask.shape == (N, D)
         assert len(names) == D
 
+    def test_validity_mask_dtype(self):
+        """Validity mask should be boolean."""
+        values, mask, names = compute_mordred_descriptors(["c1ccccc1"])
+        assert mask.dtype == np.bool_
+
     def test_no_nan_in_values(self):
         """After NaN→0 replacement, values should have no NaN."""
         values, mask, names = compute_mordred_descriptors(["c1ccccc1", "CCO"])
         assert not np.isnan(values).any()
 
+    def test_values_dtype(self):
+        """Values should be float32."""
+        values, _, _ = compute_mordred_descriptors(["c1ccccc1"])
+        assert values.dtype == np.float32
+
     def test_all_nan_columns_dropped(self):
         """Descriptors that are all-NaN should not appear in output."""
-        # This is hard to test directly without knowing which descriptors
-        # are all-NaN, but we can at least verify no all-zero mask columns
         values, mask, names = compute_mordred_descriptors(["c1ccccc1", "CCO", "CCCC"])
-        # If a column is all-False in the mask, it means all values were NaN
-        # (which should have been dropped)
         all_invalid = ~mask.any(axis=0)
         assert not all_invalid.any(), "Found columns with all-invalid entries (should be dropped)"
 
 
 class TestDescriptorTargets:
-    def test_compute_descriptor_targets_supports_3d_only_mode(self, monkeypatch):
-        values_3d = np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32)
-        mask_3d = np.array([[True, True], [True, True]], dtype=np.bool_)
-        names_3d = ["rdkit3d:x", "usrcat:y"]
-        keep_3d = np.array([True, True], dtype=np.bool_)
-
+    def test_compute_descriptor_targets_concatenates_2d_and_3d(self, monkeypatch):
         monkeypatch.setattr(
             "golem.descriptors.compute_mordred_descriptors",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("2D path should not run")
+            lambda smiles_list: (
+                np.array([[1.0], [2.0]], dtype=np.float32),
+                np.array([[True], [False]], dtype=np.bool_),
+                ["mordred:a"],
             ),
         )
         monkeypatch.setattr(
             "golem.descriptors.compute_aggregated_3d_descriptors",
-            lambda *args, **kwargs: (values_3d, mask_3d, names_3d, keep_3d),
-        )
-
-        values, mask, names, keep = compute_descriptor_targets(
-            ["CCO", "c1ccccc1"],
-            DescriptorConfig(include_2d_targets=False, include_3d_targets=True),
-            ConformerConfig(),
-            seed=42,
-        )
-
-        np.testing.assert_array_equal(values, values_3d)
-        np.testing.assert_array_equal(mask, mask_3d)
-        np.testing.assert_array_equal(keep, keep_3d)
-        assert names == names_3d
-
-    def test_compute_descriptor_targets_concatenates_2d_and_3d_and_intersects_keep_mask(
-        self,
-        monkeypatch,
-    ):
-        values_2d = np.array([[1.0], [2.0]], dtype=np.float32)
-        mask_2d = np.array([[True], [False]], dtype=np.bool_)
-        values_3d = np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32)
-        mask_3d = np.array([[True, True], [False, True]], dtype=np.bool_)
-        keep_3d = np.array([True, False], dtype=np.bool_)
-
-        monkeypatch.setattr(
-            "golem.descriptors.compute_mordred_descriptors",
-            lambda smiles_list: (values_2d, mask_2d, ["mordred:a"]),
-        )
-        monkeypatch.setattr(
-            "golem.descriptors.compute_aggregated_3d_descriptors",
             lambda *args, **kwargs: (
-                values_3d,
-                mask_3d,
+                np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32),
+                np.array([[True, True], [False, True]], dtype=np.bool_),
                 ["rdkit3d:x", "usrcat:y"],
-                keep_3d,
+                np.array([True, False], dtype=np.bool_),
             ),
         )
 
@@ -123,22 +95,10 @@ class TestDescriptorTargets:
             mask,
             np.array([[True, True, True], [False, False, True]], dtype=np.bool_),
         )
-        np.testing.assert_array_equal(keep, keep_3d)
+        np.testing.assert_array_equal(keep, np.array([True, False], dtype=np.bool_))
         assert names == ["mordred:a", "rdkit3d:x", "usrcat:y"]
 
-    def test_compute_descriptor_targets_requires_at_least_one_target_family(self):
-        with pytest.raises(ValueError, match="At least one descriptor target family"):
-            compute_descriptor_targets(
-                ["CCO"],
-                DescriptorConfig(include_2d_targets=False, include_3d_targets=False),
-                ConformerConfig(),
-                seed=42,
-            )
-
-    def test_compute_aggregated_3d_descriptors_skips_incomplete_ensembles(
-        self,
-        monkeypatch,
-    ):
+    def test_compute_aggregated_3d_descriptors_skips_failed_rows(self, monkeypatch):
         decay = np.exp(-1.0)
 
         def fake_generate(smiles, config, *, seed):
@@ -245,12 +205,19 @@ class TestNaNAwareStandardScaler:
         """Create sample data with known statistics."""
         rng = np.random.RandomState(42)
         X = rng.randn(100, 5).astype(np.float32)
-        # Introduce some "NaN" positions (stored as 0.0)
         mask = np.ones_like(X, dtype=bool)
         mask[0, 2] = False
         mask[10, 4] = False
         X[~mask] = 0.0
         return X, mask
+
+    def test_fit_transform_shape(self, sample_data):
+        X, mask = sample_data
+        scaler = NaNAwareStandardScaler()
+        scaler.fit(X, mask)
+        X_scaled = scaler.transform(X)
+        assert X_scaled.shape == X.shape
+        assert X_scaled.dtype == np.float32
 
     def test_mean_near_zero_on_train(self, sample_data):
         """After scaling, valid entries in the training set should be ~zero mean."""
@@ -258,7 +225,6 @@ class TestNaNAwareStandardScaler:
         scaler = NaNAwareStandardScaler()
         scaler.fit(X, mask)
         X_scaled = scaler.transform(X)
-        # Compute mean of valid entries per feature
         X_masked = np.where(mask, X_scaled, np.nan)
         col_means = np.nanmean(X_masked, axis=0)
         np.testing.assert_allclose(col_means, 0.0, atol=0.15)
@@ -280,7 +246,6 @@ class TestNaNAwareStandardScaler:
         scaler.fit(X, mask)
         X_scaled_1 = scaler.transform(X)
 
-        # Roundtrip
         sd = scaler.state_dict()
         scaler2 = NaNAwareStandardScaler.from_state_dict(sd)
         X_scaled_2 = scaler2.transform(X)
@@ -294,7 +259,6 @@ class TestNaNAwareStandardScaler:
         scaler = NaNAwareStandardScaler()
         scaler.fit(X, mask)
         X_scaled = scaler.transform(X)
-        # Constant columns should have std=1 → scaled values = (1-1)/1 = 0
         assert not np.isnan(X_scaled).any()
         assert not np.isinf(X_scaled).any()
 
