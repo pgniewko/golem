@@ -1,15 +1,13 @@
 """Focused tests for ECFP-latent alignment."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
-
 import numpy as np
 import torch
 
 from golem.config import ECFPLatentAlignmentConfig, load_config
 from golem.ecfp_latent_alignment import (
     compute_alignment_batch,
-    load_or_compute_fingerprints,
+    compute_fingerprints,
 )
 from golem.pretrain import _build_pyg_dataset
 
@@ -28,20 +26,12 @@ def test_load_config_reads_ecfp_latent_alignment_block(tmp_path):
     assert cfg.ecfp_latent_alignment.num_pairs == 32
 
 
-def test_load_or_compute_fingerprints_uses_disk_cache(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+def test_compute_fingerprints_returns_expected_shape_and_dtype():
     cfg = ECFPLatentAlignmentConfig(enabled=True, fp_bits=128, fp_radius=2)
     smiles = ["CCO", "c1ccccc1"]
-    first = load_or_compute_fingerprints(tmp_path / "run_a", smiles, cfg)
-
-    with patch(
-        "golem.ecfp_latent_alignment.AllChem.GetMorganFingerprintAsBitVect",
-        side_effect=AssertionError("cache miss"),
-    ):
-        second = load_or_compute_fingerprints(tmp_path / "run_b", smiles, cfg)
-
-    assert len(list((tmp_path / "golem" / "fingerprints").glob("ecfp_r2_b128_*.npz"))) == 1
-    np.testing.assert_array_equal(first, second)
+    fp_bits = compute_fingerprints(smiles, cfg)
+    assert fp_bits.shape == (2, 128)
+    assert fp_bits.dtype == np.bool_
 
 
 def test_compute_alignment_batch_matches_expected_pair_order_loss():
@@ -86,8 +76,7 @@ def test_compute_alignment_batch_matches_expected_pair_order_loss():
     assert torch.isfinite(z.grad).all()
 
 
-def test_build_pyg_dataset_attaches_ecfp_bits(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+def test_build_pyg_dataset_attaches_ecfp_bits():
     dataset = _build_pyg_dataset(
         ["CCO", "c1ccccc1"],
         np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
@@ -106,8 +95,7 @@ def test_build_pyg_dataset_attaches_ecfp_bits(tmp_path, monkeypatch):
     assert dataset[1].ecfp.squeeze(0).tolist() == [False, True, False, True]
 
 
-def test_build_pyg_dataset_reuses_shared_graph_cache(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+def test_build_pyg_dataset_rebuilds_graph_tensors_each_call(monkeypatch):
     calls = {"count": 0}
 
     def fake_get_tensor_data(smiles_list, y=None):
@@ -132,5 +120,5 @@ def test_build_pyg_dataset_reuses_shared_graph_cache(tmp_path, monkeypatch):
 
     second = _build_pyg_dataset(["CCO", "CCN"], values, valid)
 
-    assert calls["count"] == 1
+    assert calls["count"] == 2
     assert second[0].x[0, 0].item() == 0.0

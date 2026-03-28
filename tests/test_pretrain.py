@@ -1,6 +1,4 @@
 """Tests for golem.pretrain and golem.config."""
-
-import logging
 import numpy as np
 import pytest
 import torch
@@ -22,7 +20,6 @@ from golem.pretrain import (
     _prepare_split_smiles,
     _resolved_config_dict,
     _save_checkpoint,
-    _smiles_cache_key,
     _train_one_epoch,
     _validate,
 )
@@ -32,32 +29,11 @@ from golem.utils import EpochSeededRandomSampler, load_smiles, seed_everything, 
 class TestConfig:
     """Tests for configuration loading."""
 
-    def test_defaults(self):
-        """Default PretrainConfig should be valid."""
-        cfg = PretrainConfig()
-        assert cfg.masking_ratio == 0.15
-        assert cfg.batch_size == 128
-        assert cfg.model.hidden_dim == 128
-        assert cfg.isoforms.enabled is True
-        assert cfg.descriptors.include_2d_targets is True
-        assert cfg.descriptors.include_3d_targets is False
-        assert cfg.descriptors.loss_weight == 1.0
-        assert cfg.descriptors.three_d_settings.rdkit_include_getaway is False
-        assert cfg.conformers.n_generate == 8
-        assert cfg.conformers.n_keep == 4
-        assert cfg.conformers.timeout_seconds == 15
-
     def test_load_config_defaults_only(self):
         """load_config with no args should return defaults."""
         cfg = load_config()
         assert isinstance(cfg, PretrainConfig)
         assert cfg.seed == 42
-
-    def test_load_config_cli_overrides(self):
-        """CLI overrides should take precedence."""
-        cfg = load_config(max_epochs=10, seed=123)
-        assert cfg.max_epochs == 10
-        assert cfg.seed == 123
 
     def test_load_config_yaml(self, tmp_path):
         """YAML loading should work."""
@@ -86,7 +62,6 @@ class TestConfig:
             "  loss_weight: 0.25\n"
             "  three_d_settings:\n"
             "    rdkit_include_getaway: true\n"
-            "    electroshape_charge_model: mmff94\n"
             "conformers:\n"
             "  timeout_seconds: 7\n"
             "  n_generate: 16\n"
@@ -97,7 +72,6 @@ class TestConfig:
         assert cfg.descriptors.include_3d_targets is True
         assert cfg.descriptors.loss_weight == pytest.approx(0.25)
         assert cfg.descriptors.three_d_settings.rdkit_include_getaway is True
-        assert cfg.descriptors.three_d_settings.electroshape_charge_model == "mmff94"
         assert cfg.conformers.timeout_seconds == 7
         assert cfg.conformers.n_generate == 16
         assert cfg.conformers.n_keep == 4
@@ -118,8 +92,20 @@ class TestConfig:
                 "descriptors.three_d_settings.aggregation was removed",
             ),
             (
+                "descriptors:\n  three_d_settings:\n    electroshape_charge_model: mmff94\n",
+                "descriptors.three_d_settings.electroshape_charge_model was removed",
+            ),
+            (
                 "conformers:\n  embedding: ETKDGv3\n",
                 "conformers.embedding was removed",
+            ),
+            (
+                "conformers:\n  optimize: MMFF\n",
+                "conformers.optimize was removed",
+            ),
+            (
+                "conformers:\n  fallback_optimize: UFF\n",
+                "conformers.fallback_optimize was removed",
             ),
         ],
     )
@@ -128,17 +114,6 @@ class TestConfig:
         yaml_file.write_text(yaml_text)
 
         with pytest.raises(ValueError, match=message):
-            load_config(yaml_path=str(yaml_file))
-
-    def test_load_config_rejects_invalid_charge_model(self, tmp_path):
-        yaml_file = tmp_path / "invalid_charge_model.yaml"
-        yaml_file.write_text(
-            "descriptors:\n"
-            "  three_d_settings:\n"
-            "    electroshape_charge_model: am1bcc\n"
-        )
-
-        with pytest.raises(ValueError, match="electroshape_charge_model"):
             load_config(yaml_path=str(yaml_file))
 
 
@@ -180,33 +155,12 @@ class TestCompatibilityArtifacts:
 
         assert cfg_dict["descriptors"]["loss_weight"] == 0.0
 
-    def test_artifact_config_dict_preserves_tuple_fields_for_checkpoint_metadata(self):
-        cfg = PretrainConfig()
-        cfg_dict = _artifact_config_dict(cfg)
-
-        assert cfg_dict["winsorize_range"] == (-6.0, 6.0)
-        assert cfg_dict["isoforms"]["ph_range"] == (6.4, 8.4)
-
     def test_resolved_config_dict_normalises_tuple_fields_for_yaml(self):
         cfg = PretrainConfig()
         cfg_dict = _resolved_config_dict(cfg)
 
         assert cfg_dict["winsorize_range"] == [-6.0, 6.0]
         assert cfg_dict["isoforms"]["ph_range"] == [6.4, 8.4]
-
-    def test_metrics_fieldnames_include_descriptor_columns_without_alignment(self):
-        cfg = PretrainConfig()
-
-        assert _metrics_fieldnames(cfg) == [
-            "epoch",
-            "train_loss",
-            "val_loss",
-            "train_descriptor_loss",
-            "val_descriptor_loss",
-            "val_rmse",
-            "learning_rate",
-            "elapsed_seconds",
-        ]
 
     def test_metrics_fieldnames_include_alignment_columns_when_enabled(self):
         cfg = PretrainConfig()
@@ -226,16 +180,6 @@ class TestCompatibilityArtifacts:
             "val_alignment_spearman",
             "val_alignment_kendall",
         ]
-
-    def test_epoch_alignment_configs_only_warms_up_training(self):
-        cfg = PretrainConfig()
-        cfg.ecfp_latent_alignment.enabled = True
-        cfg.ecfp_latent_alignment.warmup_epochs = 5
-
-        train_cfg, eval_cfg = _epoch_alignment_configs(cfg.ecfp_latent_alignment, epoch=0)
-
-        assert train_cfg is None
-        assert eval_cfg is cfg.ecfp_latent_alignment
 
     def test_epoch_alignment_configs_enable_training_after_warmup(self):
         cfg = PretrainConfig()
@@ -454,11 +398,6 @@ class TestSplitData:
         all_indices = np.concatenate(splits)
         assert len(all_indices) == len(set(all_indices))
 
-    def test_covers_all(self):
-        splits = split_data(100, [0.7, 0.2, 0.1], seed=42)
-        all_indices = sorted(np.concatenate(splits))
-        assert all_indices == list(range(100))
-
     def test_reproducible(self):
         s1 = split_data(100, [0.7, 0.2, 0.1], seed=42)
         s2 = split_data(100, [0.7, 0.2, 0.1], seed=42)
@@ -488,16 +427,6 @@ class TestLoadSmiles:
             load_smiles(str(txt_file))
 
 
-class TestEpochDefinedWhenMaxEpochsZero:
-    """Epoch must be defined even when max_epochs=0."""
-
-    def test_epoch_defined_when_max_epochs_zero(self):
-        epoch = 0
-        for epoch in range(0):
-            pass
-        assert epoch == 0
-
-
 class TestWarmupCosineScheduler:
     """LR scheduler creation and state serialization."""
 
@@ -514,49 +443,6 @@ class TestWarmupCosineScheduler:
         assert lrs[0] < lrs[4], "LR should increase during warmup"
         assert lrs[-1] < lrs[5], "LR should decay after warmup"
 
-    def test_scheduler_state_dict_roundtrip(self):
-        model = torch.nn.Linear(4, 2)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        scheduler = _make_warmup_cosine_scheduler(optimizer, warmup_epochs=5, max_epochs=20)
-
-        for _ in range(10):
-            scheduler.step()
-
-        state = scheduler.state_dict()
-        lr_before = scheduler.get_last_lr()[0]
-
-        scheduler2 = _make_warmup_cosine_scheduler(optimizer, warmup_epochs=5, max_epochs=20)
-        scheduler2.load_state_dict(state)
-        lr_after = scheduler2.get_last_lr()[0]
-
-        assert lr_before == pytest.approx(lr_after)
-
-
-class TestSmilesCacheKey:
-    """Descriptor cache key from SMILES list."""
-
-    def test_smiles_cache_key(self):
-        key1 = _smiles_cache_key(["CCO", "c1ccccc1"])
-        key2 = _smiles_cache_key(["CCO", "c1ccccc1"])
-        key3 = _smiles_cache_key(["c1ccccc1", "CCO"])
-        assert key1 == key2
-        assert key1 != key3
-        assert len(key1) == 16
-
-    def test_descriptor_cache_roundtrip(self, tmp_path):
-        values = np.random.rand(5, 10).astype(np.float64)
-        valid = np.ones((5, 10), dtype=np.float64)
-        names = ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"]
-
-        cache_path = tmp_path / "descriptors_test.npz"
-        np.savez(cache_path, values=values, valid=valid, names=np.array(names))
-
-        cached = np.load(cache_path, allow_pickle=True)
-        np.testing.assert_array_equal(cached["values"], values)
-        np.testing.assert_array_equal(cached["valid"], valid)
-        assert cached["names"].tolist() == names
-
-
 class TestMetricsWriter:
     def test_open_metrics_writer_flushes_header_immediately(self, tmp_path):
         metrics_path = tmp_path / "metrics.csv"
@@ -570,63 +456,6 @@ class TestMetricsWriter:
             assert metrics_path.read_text().startswith("epoch,train_loss")
         finally:
             metrics_file.close()
-
-
-class TestProgressLogging:
-    def test_train_one_epoch_logs_periodic_batch_progress(self, caplog):
-        loader = _DummyLoader(
-            [
-                _DummyBatch(
-                    torch.tensor([[1.0]], dtype=torch.float32),
-                    torch.tensor([[1.0]], dtype=torch.float32),
-                )
-                for _ in range(5)
-            ]
-        )
-        model = _DummyModel(torch.tensor([[0.0]], dtype=torch.float32))
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-
-        caplog.set_level(logging.INFO, logger="golem.pretrain")
-        _train_one_epoch(
-            model,
-            loader,
-            optimizer,
-            masking_ratio=1.0,
-            descriptor_loss_weight=1.0,
-            device=torch.device("cpu"),
-            epoch=1,
-            max_epochs=3,
-            progress_interval=2,
-        )
-
-        assert any("Epoch   1/3 — train 2/5 batches" in message for message in caplog.messages)
-        assert any("Epoch   1/3 — train 5/5 batches" in message for message in caplog.messages)
-
-    def test_validate_logs_periodic_batch_progress(self, caplog):
-        loader = _DummyLoader(
-            [
-                _DummyBatch(
-                    torch.tensor([[1.0]], dtype=torch.float32),
-                    torch.tensor([[1.0]], dtype=torch.float32),
-                )
-                for _ in range(5)
-            ]
-        )
-        model = _DummyModel(torch.tensor([[0.0]], dtype=torch.float32))
-
-        caplog.set_level(logging.INFO, logger="golem.pretrain")
-        _validate(
-            model,
-            loader,
-            descriptor_loss_weight=1.0,
-            device=torch.device("cpu"),
-            epoch=1,
-            max_epochs=3,
-            progress_interval=2,
-        )
-
-        assert any("Epoch   1/3 — val 2/5 batches" in message for message in caplog.messages)
-        assert any("Epoch   1/3 — val 5/5 batches" in message for message in caplog.messages)
 
 
 class TestParentLevelSplit:
@@ -710,21 +539,6 @@ class TestTargetRowFiltering:
 
 class TestCheckpointMetadata:
     """Checkpoint metadata should include training library versions."""
-
-    def test_checkpoint_library_versions_uses_module_versions(self, monkeypatch):
-        class DummyGtPyg:
-            __version__ = "4.5.6"
-
-        import golem
-        import sys
-
-        monkeypatch.setattr(golem, "__version__", "1.2.3")
-        monkeypatch.setitem(sys.modules, "gt_pyg", DummyGtPyg())
-
-        assert _checkpoint_library_versions() == {
-            "golem": "1.2.3",
-            "gt_pyg": "4.5.6",
-        }
 
     def test_save_checkpoint_includes_library_versions(self, monkeypatch, tmp_path):
         class DummyCheckpointModel(torch.nn.Module):

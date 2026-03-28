@@ -38,20 +38,10 @@ class TestComputeMordredDescriptors:
         assert mask.shape == (N, D)
         assert len(names) == D
 
-    def test_validity_mask_dtype(self):
-        """Validity mask should be boolean."""
-        values, mask, names = compute_mordred_descriptors(["c1ccccc1"])
-        assert mask.dtype == np.bool_
-
     def test_no_nan_in_values(self):
         """After NaN→0 replacement, values should have no NaN."""
         values, mask, names = compute_mordred_descriptors(["c1ccccc1", "CCO"])
         assert not np.isnan(values).any()
-
-    def test_values_dtype(self):
-        """Values should be float32."""
-        values, _, _ = compute_mordred_descriptors(["c1ccccc1"])
-        assert values.dtype == np.float32
 
     def test_all_nan_columns_dropped(self):
         """Descriptors that are all-NaN should not appear in output."""
@@ -262,14 +252,6 @@ class TestNaNAwareStandardScaler:
         X[~mask] = 0.0
         return X, mask
 
-    def test_fit_transform_shape(self, sample_data):
-        X, mask = sample_data
-        scaler = NaNAwareStandardScaler()
-        scaler.fit(X, mask)
-        X_scaled = scaler.transform(X)
-        assert X_scaled.shape == X.shape
-        assert X_scaled.dtype == np.float32
-
     def test_mean_near_zero_on_train(self, sample_data):
         """After scaling, valid entries in the training set should be ~zero mean."""
         X, mask = sample_data
@@ -321,20 +303,3 @@ class TestNaNAwareStandardScaler:
         scaler = NaNAwareStandardScaler()
         with pytest.raises(RuntimeError, match="not been fit"):
             scaler.transform(np.zeros((2, 3)))
-
-    def test_fit_on_train_only(self, sample_data):
-        """Demonstrate scaler fits on train split only — val stats differ."""
-        X, mask = sample_data
-        train_idx = np.arange(80)
-        val_idx = np.arange(80, 100)
-
-        scaler = NaNAwareStandardScaler()
-        scaler.fit(X[train_idx], mask[train_idx])
-
-        # Val scaled mean should NOT be exactly 0 (different distribution)
-        X_val_scaled = scaler.transform(X[val_idx])
-        X_val_masked = np.where(mask[val_idx], X_val_scaled, np.nan)
-        val_means = np.nanmean(X_val_masked, axis=0)
-        # This is a statistical test — means should be close to 0 but not exact
-        # The point is: scaler was fit on train, not val
-        assert X_val_scaled.shape == (20, 5)

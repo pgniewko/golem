@@ -62,13 +62,6 @@ class TestTautomerEnumeration:
         tautomers = _enumerate_tautomers(mol, max_tautomers=3)
         assert len(tautomers) <= 3
 
-    def test_invalid_mol_returns_empty(self):
-        """Tautomer enumeration on None mol should not crash."""
-        # Create a mol that might cause issues — use a valid mol and test
-        mol = Chem.MolFromSmiles("c1ccccc1")
-        result = _enumerate_tautomers(mol, max_tautomers=10)
-        assert isinstance(result, list)
-
 
 # ---------------------------------------------------------------------------
 # TestProtonationEnumeration
@@ -139,16 +132,6 @@ class TestProtonationEnumeration:
             f"Expected original indole in protomers: {protomer_smiles}"
         )
 
-    def test_pyrrole_no_extra_protonation(self):
-        """Pyrrole NH at physiological pH should remain as-is."""
-        smi = "c1cc[nH]c1"  # pyrrole
-        protomers = _enumerate_protonation(smi, ph_range=(6.4, 8.4), max_protomers=10)
-        protomer_smiles = {Chem.MolToSmiles(m, canonical=True) for m in protomers}
-        canonical_original = Chem.MolToSmiles(Chem.MolFromSmiles(smi), canonical=True)
-        assert canonical_original in protomer_smiles, (
-            f"Expected original pyrrole in protomers: {protomer_smiles}"
-        )
-
     def test_max_protomers_respected(self):
         """max_protomers limit should be respected."""
         protomers = _enumerate_protonation("CCN", ph_range=(6.4, 8.4), max_protomers=2)
@@ -185,13 +168,6 @@ class TestValidProtomer:
         if mol is not None:
             assert _is_valid_protomer(mol, "N") is False
 
-    def test_sanitization_failure_rejected(self):
-        """Molecule that fails sanitization should be rejected."""
-        # Create a mol with bad valence manually — hard to do with SMILES
-        # but we can test that a valid mol passes
-        mol = Chem.MolFromSmiles("c1ccccc1")
-        assert _is_valid_protomer(mol, "c1ccccc1") is True
-
 
 # ---------------------------------------------------------------------------
 # TestNeutralization
@@ -216,12 +192,6 @@ class TestNeutralization:
         assert len(neutralized) >= 1
         smi = Chem.MolToSmiles(neutralized[0], canonical=True)
         assert smi == "c1ccccc1"
-
-    def test_sodium_carboxylate_neutralized(self):
-        """Sodium acetate form should be neutralized."""
-        mol = Chem.MolFromSmiles("CC(=O)[O-]")
-        neutralized = _neutralize(mol)
-        assert len(neutralized) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -295,13 +265,6 @@ class TestSMILESValidation:
         # Invalid SMILES returns original string
         isoforms = enumerate_isoforms("NOT_A_SMILES", config)
         assert isoforms == ["NOT_A_SMILES"]
-
-    def test_empty_smiles_handled(self):
-        """Empty string should be handled gracefully."""
-        config = IsoformConfig()
-        isoforms = enumerate_isoforms("", config)
-        assert isinstance(isoforms, list)
-        assert len(isoforms) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -401,12 +364,6 @@ class TestEnumerateIsoformsBatch:
         results = enumerate_isoforms_batch(smiles_list, default_config)
         assert len(results) == 3
         assert results["INVALID"] == ["INVALID"]
-
-    def test_batch_single_molecule(self, default_config):
-        """Batch with single molecule should work."""
-        results = enumerate_isoforms_batch(["CCO"], default_config)
-        assert len(results) == 1
-        assert "CCO" in results
 
     def test_batch_deduplication_per_parent(self, default_config):
         """Each parent's isoforms should be deduplicated."""

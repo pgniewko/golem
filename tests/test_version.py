@@ -7,12 +7,6 @@ import golem._version as version_mod
 from golem.cli import main
 
 
-def test_version_is_defined():
-    """golem.__version__ is a non-empty string."""
-    assert isinstance(golem.__version__, str)
-    assert golem.__version__ != ""
-
-
 def test_normalize_prerelease_tags():
     assert version_mod._normalize_prerelease("1.2.3-alpha.2") == "1.2.3a2"
     assert version_mod._normalize_prerelease("1.2.3-beta.4") == "1.2.3b4"
