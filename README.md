@@ -63,7 +63,7 @@ python -c "from golem.config import PretrainConfig; print('golem OK')"
 
 ```bash
 golem pretrain \
-  --smiles data/openadmet/train_test_smiles.smi \
+  --smiles data/openadmet/expansion_rx/train_test_smiles.smi \
   --output experiments/test_pretrain \
   --max-epochs 10 \
   --subsample 0.1 \
@@ -74,8 +74,8 @@ golem pretrain \
 
 ```bash
 golem pretrain \
-  --smiles data/openadmet/train_test_smiles.smi \
-  --config configs/pretrain_openadmet.yaml \
+  --smiles data/openadmet/expansion_rx/train_test_smiles.smi \
+  --config configs/golem-2d.yaml \
   --output experiments/pretrain
 ```
 
@@ -112,7 +112,6 @@ Set `descriptors.include_2d_targets: false` together with `descriptors.include_3
 | `--seed` | Override random seed | 42 |
 | `--no-isoforms` | Disable isoform enumeration | Enabled |
 | `--verbose` | Show DEBUG-level logs on console | Disabled |
-| `--resume` | Path to checkpoint to resume training from | None |
 
 ### What pretraining produces
 
@@ -123,8 +122,7 @@ experiments/pretrain/
   best_checkpoint.pt        # Best model by validation objective
   resolved_config.yaml      # Full resolved config used for the run
   pretrain_report.html      # HTML dashboard with training curves and metrics (not tracked)
-  last_checkpoint.pt        # Last epoch, for resuming (not tracked)
-  metrics.csv               # Per-epoch losses, RMSE, LR, and optional alignment metrics (not tracked)
+  metrics.csv               # Per-epoch objective, descriptor, RMSE, LR, and optional alignment metrics (not tracked)
   pretrain.log              # Full log output (not tracked)
 ```
 
@@ -139,9 +137,9 @@ golem report experiments/pretrain
 This reads `metrics.csv` and `resolved_config.yaml` from the experiment directory and produces a single-file HTML dashboard (`pretrain_report.html`) with:
 
 - Training & validation objective curves
+- Training & validation descriptor-loss curves
 - Validation RMSE curve
 - Learning rate schedule
-- Train vs val loss gap
 - Optional ECFP-latent alignment chart when those metrics are present
 - Summary cards (best epoch, best val loss, elapsed time, architecture)
 - Epoch-by-epoch table with the best row highlighted
@@ -183,5 +181,5 @@ The tests cover isoform enumeration, 2D descriptor computation, the NaN-aware sc
 | NaN handling / validity masking | `descriptors.py:compute_mordred_descriptors()` |
 | Scaler fit (train-only, no leakage) | `pretrain.py:pretrain()` step 5 |
 | Config defaults | `config.py` dataclass definitions |
-| Production config overrides | `configs/pretrain_openadmet.yaml` |
+| Production config overrides | `configs/golem-2d.yaml` |
 | Pretraining pipeline flow | `pretrain.py` module docstring |

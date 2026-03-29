@@ -58,7 +58,6 @@ class ECFPLatentAlignmentConfig:
     num_pairs: int = 128
     temperature: float = 0.1
     tie_epsilon: float = 0.02
-    warmup_epochs: int = 5
     log_rank_metrics: bool = True
 
 

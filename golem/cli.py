@@ -45,10 +45,6 @@ def main() -> None:
     "--verbose", is_flag=True, default=False,
     help="Show DEBUG-level logs on console.",
 )
-@click.option(
-    "--resume", "resume_from", default=None, type=click.Path(exists=True),
-    help="Path to checkpoint file to resume training from.",
-)
 def pretrain_cmd(
     smiles: str,
     config_path: str | None,
@@ -60,7 +56,6 @@ def pretrain_cmd(
     seed: int | None,
     no_isoforms: bool,
     verbose: bool,
-    resume_from: str | None,
 ) -> None:
     """Run descriptor pretraining on molecular descriptors."""
     # Build CLI overrides dict (None values are ignored by load_config)
@@ -84,7 +79,6 @@ def pretrain_cmd(
         output_dir=output,
         subsample=subsample,
         verbose=verbose,
-        resume_from=resume_from,
     )
 
 

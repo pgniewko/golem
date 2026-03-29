@@ -188,18 +188,8 @@ class TestLoadSmiles:
             load_smiles(str(txt_file))
 
 
-class TestEpochDefinedWhenMaxEpochsZero:
-    """Epoch must be defined even when max_epochs=0."""
-
-    def test_epoch_defined_when_max_epochs_zero(self):
-        epoch = 0
-        for epoch in range(0):
-            pass
-        assert epoch == 0
-
-
 class TestWarmupCosineScheduler:
-    """LR scheduler creation and state serialization."""
+    """LR scheduler creation."""
 
     def test_warmup_cosine_scheduler(self):
         model = torch.nn.Linear(4, 2)
@@ -213,23 +203,6 @@ class TestWarmupCosineScheduler:
 
         assert lrs[0] < lrs[4], "LR should increase during warmup"
         assert lrs[-1] < lrs[5], "LR should decay after warmup"
-
-    def test_scheduler_state_dict_roundtrip(self):
-        model = torch.nn.Linear(4, 2)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        scheduler = _make_warmup_cosine_scheduler(optimizer, warmup_epochs=5, max_epochs=20)
-
-        for _ in range(10):
-            scheduler.step()
-
-        state = scheduler.state_dict()
-        lr_before = scheduler.get_last_lr()[0]
-
-        scheduler2 = _make_warmup_cosine_scheduler(optimizer, warmup_epochs=5, max_epochs=20)
-        scheduler2.load_state_dict(state)
-        lr_after = scheduler2.get_last_lr()[0]
-
-        assert lr_before == pytest.approx(lr_after)
 
 
 class _DummyBatch:
@@ -437,7 +410,6 @@ class TestCheckpointMetadata:
                 self.saved_kwargs = kwargs
 
         model = DummyCheckpointModel()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         scaler = NaNAwareStandardScaler()
         scaler.fit(
             np.array([[1.0, 2.0]], dtype=np.float32),
@@ -451,7 +423,6 @@ class TestCheckpointMetadata:
 
         _save_checkpoint(
             model=model,
-            optimizer=optimizer,
             path=tmp_path / "checkpoint.pt",
             epoch=7,
             best_metric=0.123,

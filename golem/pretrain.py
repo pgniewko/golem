@@ -7,8 +7,8 @@ Pipeline:
 1. Load SMILES
 2. Split into train / val / (test) at the parent-molecule level
 3. (Optional) Enumerate isoforms within each split only
-4. Fit ``NaNAwareStandardScaler`` on **train only**
-5. Compute descriptor targets + validity masks
+4. Compute descriptor targets + validity masks
+5. Fit ``NaNAwareStandardScaler`` on **train only**
 6. Transform all splits + winsorise
 7. Build PyG datasets via ``get_tensor_data``
 8. Train with masked MSE (15% random mask ∩ validity mask)
@@ -425,7 +425,6 @@ def pretrain(
     output_dir: str,
     subsample: Optional[float] = None,
     verbose: bool = False,
-    resume_from: Optional[str] = None,
 ) -> Path:
     """Full pretraining pipeline.
 
@@ -436,13 +435,21 @@ def pretrain(
         subsample: If set, randomly subsample this fraction of SMILES
             before processing (e.g. 0.1 for 10%).
         verbose: If True, show DEBUG-level logs on console.
-        resume_from: Path to a checkpoint file to resume training from.
 
     Returns:
         Path to the best checkpoint file.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    for artifact_name in (
+        "best_checkpoint.pt",
+        "last_checkpoint.pt",
+        "metrics.csv",
+        "pretrain_report.html",
+    ):
+        artifact_path = output_dir / artifact_name
+        if artifact_path.exists():
+            artifact_path.unlink()
     _setup_logging(output_dir, verbose=verbose)
 
     # Log library versions when verbose
@@ -626,33 +633,10 @@ def pretrain(
     scheduler = _make_warmup_cosine_scheduler(optimizer, config.warmup_epochs, config.max_epochs)
 
     # ------------------------------------------------------------------
-    # 9b. Resume from checkpoint (optional)
+    # 9b. Tracking state
     # ------------------------------------------------------------------
-    start_epoch = 0
     best_val_objective = float("inf")
-    best_epoch = 0
-
-    if resume_from is not None:
-        resume_path = Path(resume_from)
-        if not resume_path.exists():
-            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
-        logger.info("Resuming from checkpoint: %s", resume_path)
-        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if "epoch" in ckpt and ckpt["epoch"] is not None:
-            start_epoch = ckpt["epoch"] + 1
-        if "best_metric" in ckpt and ckpt["best_metric"] is not None:
-            best_val_objective = ckpt["best_metric"]
-            best_epoch = ckpt.get("epoch", 0)
-        logger.info(
-            "Resumed at epoch %d (best_val_objective=%.4f)",
-            start_epoch,
-            best_val_objective,
-        )
+    best_epoch = -1
 
     train_loader = make_loader(
         train_data,
@@ -666,7 +650,7 @@ def pretrain(
         shuffle=False,
         num_workers=config.num_workers,
     )
-    train_loader.ecfp_latent_alignment = None
+    train_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
     val_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
 
     # ------------------------------------------------------------------
@@ -676,36 +660,19 @@ def pretrain(
     start_time = time.time()
 
     best_ckpt_path = output_dir / "best_checkpoint.pt"
-    last_ckpt_path = output_dir / "last_checkpoint.pt"
     metrics_path = output_dir / "metrics.csv"
 
     logger.info("Starting training: max_epochs=%d  patience=%d  masking_ratio=%.2f",
                 config.max_epochs, config.patience, config.masking_ratio)
 
-    epoch = start_epoch
-    csv_mode = "a" if resume_from is not None and metrics_path.exists() else "w"
-    if csv_mode == "a":
-        with open(metrics_path, newline="") as existing_metrics:
-            header = next(csv.reader(existing_metrics), [])
-        if header != METRICS_FIELDNAMES:
-            raise ValueError(
-                "Cannot resume with a metrics.csv written by an older schema. "
-                "Start from a fresh output directory."
-            )
-    with open(metrics_path, csv_mode, newline="") as metrics_file:
+    epoch = 0
+    with open(metrics_path, "w", newline="") as metrics_file:
         metrics_writer = csv.writer(metrics_file)
-        if csv_mode == "w":
-            metrics_writer.writerow(METRICS_FIELDNAMES)
-            metrics_file.flush()
+        metrics_writer.writerow(METRICS_FIELDNAMES)
+        metrics_file.flush()
 
-        for epoch in range(start_epoch, config.max_epochs):
+        for epoch in range(config.max_epochs):
             lr = scheduler.get_last_lr()[0]
-            train_alignment_active = (
-                alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
-            )
-            train_loader.ecfp_latent_alignment = (
-                alignment_cfg if train_alignment_active else None
-            )
             (
                 train_loss,
                 train_descriptor_loss,
@@ -742,7 +709,7 @@ def pretrain(
                 f"{val_rmse:.6f}",
                 f"{lr:.2e}",
                 f"{elapsed:.1f}",
-                _format_optional_metric(train_alignment_loss) if train_alignment_active else "",
+                _format_optional_metric(train_alignment_loss),
                 _format_optional_metric(val_alignment_loss),
                 _format_optional_metric(val_alignment_spearman),
                 _format_optional_metric(val_alignment_kendall),
@@ -759,8 +726,7 @@ def pretrain(
                 f"lr={lr:.2e}",
             ]
             if alignment_cfg.enabled:
-                if train_alignment_active:
-                    summary_parts.append(f"train_align={train_alignment_loss:.4f}")
+                summary_parts.append(f"train_align={train_alignment_loss:.4f}")
                 summary_parts.append(f"val_align={val_alignment_loss:.4f}")
             logger.info(
                 "Epoch %3d/%d — %s",
@@ -783,7 +749,7 @@ def pretrain(
 
                 # Save best checkpoint
                 _save_checkpoint(
-                    model, optimizer, best_ckpt_path,
+                    model, best_ckpt_path,
                     epoch=epoch,
                     best_metric=best_val_objective,
                     config=config,
@@ -793,7 +759,6 @@ def pretrain(
                     train_idx=train_idx,
                     val_idx=val_idx,
                     test_idx=test_idx,
-                    scheduler=scheduler,
                 )
                 logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
             else:
@@ -804,25 +769,28 @@ def pretrain(
 
             scheduler.step()
 
-    # Save last checkpoint
-    _save_checkpoint(
-        model, optimizer, last_ckpt_path,
-        epoch=epoch,
-        best_metric=best_val_objective,
-        config=config,
-        scaler=scaler,
-        descriptor_names=descriptor_names,
-        num_descriptors=num_descriptors,
-        train_idx=train_idx,
-        val_idx=val_idx,
-        test_idx=test_idx,
-        scheduler=scheduler,
-    )
+    if not best_ckpt_path.exists():
+        logger.warning(
+            "No finite validation improvement was recorded; saving the final model as best_checkpoint.pt"
+        )
+        best_epoch = epoch
+        _save_checkpoint(
+            model, best_ckpt_path,
+            epoch=epoch,
+            best_metric=best_val_objective,
+            config=config,
+            scaler=scaler,
+            descriptor_names=descriptor_names,
+            num_descriptors=num_descriptors,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+        )
 
     logger.info(
         "Training complete.  Best val_objective=%.4f at epoch %d",
         best_val_objective,
-        best_epoch + 1,
+        best_epoch + 1 if best_epoch >= 0 else epoch + 1,
     )
 
     # ------------------------------------------------------------------
@@ -889,7 +857,6 @@ def pretrain(
 
 def _save_checkpoint(
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
     path: Path,
     *,
     epoch: int,
@@ -901,13 +868,10 @@ def _save_checkpoint(
     train_idx: np.ndarray,
     val_idx: np.ndarray,
     test_idx: Optional[np.ndarray],
-    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> None:
     """Save checkpoint via gt-pyg's model.save_checkpoint()."""
     model.save_checkpoint(
         path=path,
-        optimizer=optimizer,
-        scheduler=scheduler,
         epoch=epoch,
         best_metric=best_metric,
         extra={
