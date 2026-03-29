@@ -144,10 +144,8 @@ def compute_3d_descriptors(
         for family in _THREE_D_FAMILIES
         for column in columns_by_family[family]
     ]
-    total_width = len(descriptor_names)
-    values = np.zeros((len(smiles_list), total_width), dtype=np.float32)
-    validity_mask = np.zeros((len(smiles_list), total_width), dtype=np.bool_)
-    conformer_timeouts = 0
+    values = np.zeros((len(smiles_list), len(descriptor_names)), dtype=np.float32)
+    validity_mask = np.zeros((len(smiles_list), len(descriptor_names)), dtype=np.bool_)
     conformer_failures = 0
     descriptor_failures = 0
 
@@ -160,10 +158,7 @@ def compute_3d_descriptors(
             seed=seed,
         )
         if conformer is None:
-            if failure_reason == "timeout":
-                conformer_timeouts += 1
-            else:
-                conformer_failures += 1
+            conformer_failures += 1
             continue
 
         offset = 0
@@ -190,17 +185,28 @@ def compute_3d_descriptors(
             validity_mask[row_idx, offset : offset + width] = family_mask
             offset += width
 
+    all_invalid = ~validity_mask.any(axis=0)
+    if all_invalid.any():
+        logger.info("Dropping %d all-invalid 3D descriptor columns", int(all_invalid.sum()))
+        keep_columns = ~all_invalid
+        values = values[:, keep_columns]
+        validity_mask = validity_mask[:, keep_columns]
+        descriptor_names = [
+            name
+            for name, keep in zip(descriptor_names, keep_columns, strict=False)
+            if keep
+        ]
+
     logger.info(
         "3D descriptors: %d molecules × %d descriptors (%.1f%% valid entries)",
         values.shape[0],
         values.shape[1],
         validity_mask.mean() * 100 if validity_mask.size else 0.0,
     )
-    if conformer_timeouts or conformer_failures or descriptor_failures:
+    if conformer_failures or descriptor_failures:
         logger.info(
             "3D target generation kept all molecules in-place "
-            "(%d conformer timeouts, %d other conformer failures, %d descriptor-family failures; invalid entries were masked)",
-            conformer_timeouts,
+            "(%d conformer failures, %d descriptor-family failures; invalid entries were masked)",
             conformer_failures,
             descriptor_failures,
         )
@@ -240,12 +246,25 @@ def compute_descriptor_targets(
         name_blocks.append(names_3d)
 
     if len(values_blocks) == 1:
-        return values_blocks[0], mask_blocks[0], name_blocks[0]
+        values, mask, names = values_blocks[0], mask_blocks[0], name_blocks[0]
+        if values.shape[1] == 0:
+            raise ValueError(
+                "No valid descriptor targets remained after dropping all-invalid columns."
+            )
+        return values, mask, names
+
+    values = np.concatenate(values_blocks, axis=1)
+    masks = np.concatenate(mask_blocks, axis=1)
+    names = [name for block in name_blocks for name in block]
+    if values.shape[1] == 0:
+        raise ValueError(
+            "No valid descriptor targets remained after dropping all-invalid columns."
+        )
 
     return (
-        np.concatenate(values_blocks, axis=1),
-        np.concatenate(mask_blocks, axis=1),
-        [name for block in name_blocks for name in block],
+        values,
+        masks,
+        names,
     )
 
 

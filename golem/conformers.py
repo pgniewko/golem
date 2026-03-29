@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -60,7 +59,6 @@ def generate_lowest_energy_conformer(
     seed: int,
 ) -> tuple[LowestEnergyConformer | None, str | None]:
     """Generate conformers and keep only the lowest-energy optimized conformer."""
-    started_at = time.monotonic()
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None, "invalid_smiles"
@@ -69,26 +67,20 @@ def generate_lowest_energy_conformer(
     params = AllChem.ETKDGv3()
     params.randomSeed = _molecule_seed(smiles, seed)
     params.pruneRmsThresh = -1.0
-    params.timeout = max(int(config.timeout_seconds), 0)
 
     try:
         conf_ids = list(
             AllChem.EmbedMultipleConfs(mol, numConfs=config.n_generate, params=params)
         )
-    except Exception as exc:
+    except Exception:
         logger.debug("Conformer embedding failed for %s", smiles, exc_info=True)
-        message = str(exc).lower()
-        return None, "timeout" if "timed out" in message or "timeout" in message else "embedding_failed"
+        return None, "embedding_failed"
 
     if not conf_ids:
-        if config.timeout_seconds > 0 and (time.monotonic() - started_at) >= config.timeout_seconds:
-            return None, "timeout"
         return None, "no_conformers"
 
     energies = _optimize_conformers(mol, "MMFF") or _optimize_conformers(mol, "UFF")
     if energies is None:
-        if config.timeout_seconds > 0 and (time.monotonic() - started_at) >= config.timeout_seconds:
-            return None, "timeout"
         return None, "optimization_failed"
 
     best_conformer_id = min(energies.items(), key=lambda item: item[1])[0]

@@ -84,7 +84,6 @@ class ConformerConfig:
     """Offline conformer generation settings for 3D descriptor targets."""
 
     n_generate: int = 8
-    timeout_seconds: int = 15
 
 
 def _reject_unknown_keys(section_name: str, values: dict, allowed_keys: set[str]) -> None:
@@ -178,7 +177,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         _reject_unknown_keys("isoforms.rdkit_fallback", fb, {"enabled"})
         isoform_d["rdkit_fallback"] = fb.get("enabled", False)
 
-    removed_conformer_keys = {"energy_window_kcal", "n_keep", "prune_rms"} & set(
+    removed_conformer_keys = {"energy_window_kcal", "n_keep", "prune_rms", "timeout_seconds"} & set(
         conformers_d
     )
     if removed_conformer_keys:
@@ -188,7 +187,6 @@ def _dict_to_config(d: dict) -> PretrainConfig:
             "Generate conformers with conformers.n_generate; the lowest-energy conformer is kept."
         )
 
-    # Remove keys not in dataclass.
     model_fields = {f.name for f in fields(ModelConfig)}
     isoform_fields = {f.name for f in fields(IsoformConfig)}
     descriptor_fields = {f.name for f in fields(DescriptorConfig)}
@@ -211,15 +209,6 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     _reject_unknown_keys("descriptors.three_d_settings", descriptor3d_d, descriptor3d_fields)
     _reject_unknown_keys("ecfp_latent_alignment", alignment_d, alignment_fields)
 
-    model_d = {k: v for k, v in model_d.items() if k in model_fields}
-    isoform_d = {k: v for k, v in isoform_d.items() if k in isoform_fields}
-    descriptors_d = {k: v for k, v in descriptors_d.items() if k in descriptor_fields}
-    descriptor3d_d = {
-        k: v for k, v in descriptor3d_d.items() if k in descriptor3d_fields
-    }
-    conformers_d = {k: v for k, v in conformers_d.items() if k in conformer_fields}
-    alignment_d = {k: v for k, v in alignment_d.items() if k in alignment_fields}
-
     # Handle residual "pretrain" sub-key (already flattened in load_config,
     # but handle gracefully if _dict_to_config is called directly)
     pretrain_d = d.pop("pretrain", {})
@@ -236,9 +225,6 @@ def _dict_to_config(d: dict) -> PretrainConfig:
 
     _reject_unknown_keys("", d, scalar_pretrain_fields)
 
-    # Filter to known fields
-    d = {k: v for k, v in d.items() if k in pretrain_fields}
-
     config = PretrainConfig(
         model=ModelConfig(**model_d),
         isoforms=IsoformConfig(**isoform_d),
@@ -253,11 +239,6 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     if config.descriptors.loss_weight < 0:
         raise ValueError("descriptors.loss_weight must be >= 0.")
     _validate_integer_field("conformers.n_generate", config.conformers.n_generate, minimum=1)
-    _validate_integer_field(
-        "conformers.timeout_seconds",
-        config.conformers.timeout_seconds,
-        minimum=0,
-    )
     return config
 
 

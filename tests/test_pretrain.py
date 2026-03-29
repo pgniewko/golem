@@ -69,6 +69,7 @@ class TestConfig:
             "  energy_window_kcal: 2.73\n"
             "  n_keep: 4\n"
             "  prune_rms: 0.75\n"
+            "  timeout_seconds: 15\n"
         )
         with pytest.raises(ValueError, match="Removed config keys"):
             load_config(yaml_path=str(yaml_file))
@@ -105,11 +106,11 @@ class TestConfig:
         with pytest.raises(ValueError, match=r"conformers\.n_generate must be >= 1"):
             load_config(yaml_path=str(yaml_file))
 
-    def test_load_config_rejects_non_integer_timeout_seconds(self, tmp_path):
-        """timeout_seconds must not be silently truncated."""
+    def test_load_config_rejects_unknown_pretrain_key(self, tmp_path):
+        """Unknown pretrain keys should fail fast."""
         yaml_file = tmp_path / "test.yaml"
-        yaml_file.write_text("conformers:\n  timeout_seconds: 0.5\n")
-        with pytest.raises(ValueError, match=r"conformers\.timeout_seconds must be an integer"):
+        yaml_file.write_text("pretrain:\n  max_epochz: 10\n")
+        with pytest.raises(ValueError, match="Unknown config keys"):
             load_config(yaml_path=str(yaml_file))
 
 
