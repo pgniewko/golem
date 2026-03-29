@@ -94,7 +94,7 @@ def _enumerate_tautomers(
         return []
 
 
-def _is_valid_protomer(protomer_mol: Chem.Mol, original_smi: str) -> bool:
+def _is_valid_protomer(protomer_mol: Chem.Mol) -> bool:
     """Validate a protomer against known Dimorphite-DL failure modes.
 
     Rejects:
@@ -175,7 +175,7 @@ def _enumerate_protonation(
         protomers: List[Chem.Mol] = []
         for psmi in protomer_smiles:
             pmol = Chem.MolFromSmiles(psmi)
-            if pmol is not None and _is_valid_protomer(pmol, smi):
+            if pmol is not None and _is_valid_protomer(pmol):
                 protomers.append(pmol)
         return protomers
 

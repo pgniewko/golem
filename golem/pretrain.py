@@ -24,7 +24,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -160,11 +160,11 @@ def _train_one_epoch(
 ) -> tuple[float, float, float]:
     """Run one training epoch. Returns objective, descriptor, and alignment losses."""
     model.train()
-    total_loss = 0.0
-    total_descriptor_loss = 0.0
+    total_descriptor_se = 0.0
+    total_descriptor_count = 0
     total_alignment_loss = 0.0
-    n_batches = 0
     n_alignment_batches = 0
+    saw_optimization_step = False
     alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
         loader, "ecfp_latent_alignment", None
     )
@@ -192,12 +192,17 @@ def _train_one_epoch(
         # Random 15% mask ∩ validity mask
         final_mask = (torch.rand_like(targets) < masking_ratio).bool() & valid_mask
 
-        if final_mask.sum() == 0 and valid_mask.sum() > 0:
+        masked_count = int(final_mask.sum().item())
+        if masked_count == 0 and valid_mask.sum() > 0:
             final_mask = valid_mask
+            masked_count = int(final_mask.sum().item())
 
         descriptor_loss = pred.sum() * 0.0
-        if final_mask.sum() > 0:
+        if masked_count > 0:
+            masked_diff = pred[final_mask] - targets[final_mask]
             descriptor_loss = F.mse_loss(pred[final_mask], targets[final_mask])
+            total_descriptor_se += masked_diff.pow(2).sum().item()
+            total_descriptor_count += masked_count
 
         alignment_loss = pred.sum() * 0.0
         has_alignment_pairs = False
@@ -208,9 +213,10 @@ def _train_one_epoch(
                 total_alignment_loss += alignment_loss.item()
                 n_alignment_batches += 1
 
-        if final_mask.sum() == 0 and not has_alignment_pairs:
+        if masked_count == 0 and not has_alignment_pairs:
             continue
 
+        saw_optimization_step = True
         total_step_loss = descriptor_loss * descriptor_loss_weight
         if has_alignment_pairs and alignment_cfg is not None:
             total_step_loss = total_step_loss + alignment_loss * alignment_cfg.weight
@@ -220,15 +226,24 @@ def _train_one_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
-        total_loss += total_step_loss.item()
-        total_descriptor_loss += descriptor_loss.item()
-        n_batches += 1
+    descriptor_loss_value = math.nan
+    if total_descriptor_count > 0:
+        descriptor_loss_value = total_descriptor_se / total_descriptor_count
+    elif saw_optimization_step:
+        descriptor_loss_value = 0.0
 
-    return (
-        total_loss / n_batches if n_batches else math.nan,
-        total_descriptor_loss / n_batches if n_batches else math.nan,
-        total_alignment_loss / n_alignment_batches if n_alignment_batches else math.nan,
+    alignment_loss_value = (
+        total_alignment_loss / n_alignment_batches if n_alignment_batches else math.nan
     )
+
+    objective_terms: list[float] = []
+    if math.isfinite(descriptor_loss_value):
+        objective_terms.append(descriptor_loss_value * descriptor_loss_weight)
+    if math.isfinite(alignment_loss_value) and alignment_cfg is not None:
+        objective_terms.append(alignment_loss_value * alignment_cfg.weight)
+    objective_loss = float(sum(objective_terms)) if objective_terms else math.nan
+
+    return objective_loss, descriptor_loss_value, alignment_loss_value
 
 
 @torch.no_grad()
@@ -548,6 +563,7 @@ def pretrain(
     effective_subsample = subsample if subsample is not None else config.subsample
     if effective_subsample is not None and not (0.0 < effective_subsample <= 1.0):
         raise ValueError("subsample must be in the interval (0.0, 1.0].")
+    resolved_config = replace(config, subsample=effective_subsample)
 
     if config.max_epochs > 0 and config.warmup_epochs >= config.max_epochs:
         logger.warning(
@@ -556,8 +572,7 @@ def pretrain(
         )
 
     # Save resolved config (convert tuples to lists for safe_load compatibility)
-    config_dict = json.loads(json.dumps(asdict(config)))
-    config_dict["subsample"] = effective_subsample
+    config_dict = json.loads(json.dumps(asdict(resolved_config)))
     with open(output_dir / "resolved_config.yaml", "w") as f:
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
@@ -762,7 +777,7 @@ def pretrain(
             last_ckpt_path,
             epoch=epoch_to_save,
             best_metric=best_val_objective if math.isfinite(best_val_objective) else None,
-            config=config,
+            config=resolved_config,
             scaler=scaler,
             descriptor_names=descriptor_names,
             num_descriptors=num_descriptors,
@@ -866,7 +881,7 @@ def pretrain(
                         model, best_ckpt_path,
                         epoch=epoch,
                         best_metric=best_val_objective,
-                        config=config,
+                        config=resolved_config,
                         scaler=scaler,
                         descriptor_names=descriptor_names,
                         num_descriptors=num_descriptors,
@@ -907,7 +922,7 @@ def pretrain(
                 if math.isfinite(best_val_objective)
                 else last_val_loss if math.isfinite(last_val_loss) else math.nan
             ),
-            config=config,
+            config=resolved_config,
             scaler=scaler,
             descriptor_names=descriptor_names,
             num_descriptors=num_descriptors,

@@ -385,6 +385,112 @@ class TestResolvedConfig:
         resolved = yaml.safe_load((tmp_path / "out" / "resolved_config.yaml").read_text())
         assert resolved["subsample"] == pytest.approx(0.25)
 
+    def test_pretrain_checkpoint_uses_effective_subsample(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        smiles = ["CCO", "CCN", "CCC", "CCCl", "CCCC"]
+        desc_values = np.array(
+            [
+                [1.0, 2.0],
+                [2.0, 3.0],
+                [3.0, 4.0],
+                [4.0, 5.0],
+                [5.0, 6.0],
+            ],
+            dtype=np.float32,
+        )
+        desc_valid = np.ones_like(desc_values, dtype=np.bool_)
+        captured_subsamples: list[float | None] = []
+
+        class DummyCheckpointModel(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.prediction = torch.nn.Parameter(
+                    torch.zeros((1, kwargs["num_tasks"]), dtype=torch.float32)
+                )
+
+            def forward(self, x, edge_index, edge_attr, batch, zero_var=False, return_latent=False):
+                pred = self.prediction.expand(x.shape[0], -1)
+                log_var = torch.zeros_like(pred)
+                if return_latent:
+                    return pred, log_var, pred
+                return pred, log_var
+
+            def num_parameters(self):
+                return sum(p.numel() for p in self.parameters())
+
+            def load_weights(self, path, map_location=None):
+                return None
+
+        cfg = PretrainConfig(max_epochs=1, patience=5, batch_size=2)
+        cfg.isoforms.enabled = False
+        cfg.model.norm = "ln"
+        cfg.subsample = 0.5
+
+        monkeypatch.setattr("golem.pretrain.load_smiles", lambda _path: smiles)
+        monkeypatch.setattr(
+            "golem.pretrain._prepare_split_smiles",
+            lambda _smiles, _cfg: (
+                smiles,
+                np.array([0, 1, 2]),
+                np.array([3]),
+                np.array([4]),
+            ),
+        )
+        monkeypatch.setattr(
+            "golem.pretrain.compute_descriptor_targets",
+            lambda *_args, **_kwargs: (desc_values, desc_valid, ["d0", "d1"]),
+        )
+        monkeypatch.setattr(
+            "golem.pretrain._build_pyg_dataset",
+            lambda _smiles, values, mask, fingerprint_bits=None: [
+                _DummyBatch(
+                    torch.tensor(values[i : i + 1], dtype=torch.float32),
+                    torch.tensor(mask[i : i + 1], dtype=torch.float32),
+                )
+                for i in range(len(values))
+            ],
+        )
+        monkeypatch.setattr(
+            "golem.pretrain.make_loader",
+            lambda dataset, batch_size, shuffle=False, num_workers=0: _DummyLoader(dataset),
+        )
+        monkeypatch.setattr("golem.pretrain.generate_report", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            "golem.pretrain._save_checkpoint",
+            lambda model, path, *, epoch, best_metric, config, scaler, descriptor_names, num_descriptors, train_idx, val_idx, test_idx: (
+                captured_subsamples.append(config.subsample),
+                path.write_bytes(b"checkpoint"),
+            ),
+        )
+
+        dummy_gt_pyg = SimpleNamespace(
+            GraphTransformerNet=DummyCheckpointModel,
+            __version__="0.0.test",
+        )
+        dummy_gt_pyg_data = SimpleNamespace(
+            get_atom_feature_dim=lambda: 1,
+            get_bond_feature_dim=lambda: 1,
+        )
+        monkeypatch.setitem(sys.modules, "gt_pyg", dummy_gt_pyg)
+        monkeypatch.setitem(sys.modules, "gt_pyg.data", dummy_gt_pyg_data)
+        monkeypatch.setattr(
+            "golem.pretrain._checkpoint_library_versions",
+            lambda: {"golem": "1.2.3", "gt_pyg": "0.0.test"},
+        )
+
+        pretrain(
+            smiles_path=str(tmp_path / "smiles.smi"),
+            config=cfg,
+            output_dir=str(tmp_path / "out"),
+            subsample=0.25,
+        )
+
+        assert captured_subsamples
+        assert all(value == pytest.approx(0.25) for value in captured_subsamples)
+
     def test_pretrain_rejects_invalid_runtime_subsample(self, tmp_path):
         smiles_file = tmp_path / "mols.smi"
         smiles_file.write_text("C\nCC\n")
@@ -552,6 +658,36 @@ class TestWeightedObjective:
         assert train_loss == pytest.approx(1.0)
         assert train_descriptor_loss == pytest.approx(0.0)
         assert train_alignment_loss == pytest.approx(2.0)
+
+    def test_train_one_epoch_weights_descriptor_loss_by_masked_target_count(self):
+        loader = _DummyLoader(
+            [
+                _DummyBatch(
+                    torch.tensor([[10.0]], dtype=torch.float32),
+                    torch.tensor([[1.0]], dtype=torch.float32),
+                ),
+                _DummyBatch(
+                    torch.ones((100, 1), dtype=torch.float32),
+                    torch.ones((100, 1), dtype=torch.float32),
+                ),
+            ]
+        )
+        model = _DummyModel(torch.tensor([[0.0]], dtype=torch.float32))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+
+        train_loss, train_descriptor_loss, train_alignment_loss = _train_one_epoch(
+            model,
+            loader,
+            optimizer,
+            masking_ratio=1.0,
+            descriptor_loss_weight=1.0,
+            device=torch.device("cpu"),
+        )
+
+        expected_descriptor_loss = 200.0 / 101.0
+        assert train_loss == pytest.approx(expected_descriptor_loss)
+        assert train_descriptor_loss == pytest.approx(expected_descriptor_loss)
+        assert np.isnan(train_alignment_loss)
 
     def test_validate_ignores_alignment_when_no_pairs_can_be_sampled(
         self,

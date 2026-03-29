@@ -159,22 +159,21 @@ class TestValidProtomer:
     def test_valid_protomer_accepted(self):
         """A normal molecule should pass validation."""
         mol = Chem.MolFromSmiles("CC(=O)[O-]")
-        assert _is_valid_protomer(mol, "CC(=O)O") is True
+        assert _is_valid_protomer(mol) is True
 
     def test_nh4_rejected(self):
         """Nitrogen with 4 hydrogens should be rejected."""
         # Manually create NH4+ scenario: ammonium
         mol = Chem.MolFromSmiles("[NH4+]")
         if mol is not None:
-            assert _is_valid_protomer(mol, "N") is False
+            assert _is_valid_protomer(mol) is False
 
     def test_protonated_tertiary_amide_is_rejected_even_after_atom_reordering(self):
         """False tertiary-amide protonation should not depend on atom order."""
-        original = "CC(=O)N1CCCCC1"
         protomer = Chem.MolFromSmiles("[NH+]1(CCCCC1)C(C)=O")
 
         assert protomer is not None
-        assert _is_valid_protomer(protomer, original) is False
+        assert _is_valid_protomer(protomer) is False
 
 
 # ---------------------------------------------------------------------------
