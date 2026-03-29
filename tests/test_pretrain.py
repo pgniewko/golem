@@ -420,8 +420,8 @@ class TestWeightedObjective:
             "golem.pretrain.compute_alignment_batch",
             lambda batch, z, alignment_cfg, deterministic_pairs=False: (
                 z.mean(),
-                None,
-                None,
+                torch.tensor([0.25], dtype=torch.float32),
+                torch.tensor([0.5], dtype=torch.float32),
             ),
         )
 
@@ -472,8 +472,8 @@ class TestWeightedObjective:
             "golem.pretrain.compute_alignment_batch",
             lambda batch, z, alignment_cfg, deterministic_pairs=False: (
                 z.mean(),
-                None,
-                None,
+                torch.tensor([0.25], dtype=torch.float32),
+                torch.tensor([0.5], dtype=torch.float32),
             ),
         )
 
@@ -489,6 +489,58 @@ class TestWeightedObjective:
         assert train_loss == pytest.approx(1.0)
         assert train_descriptor_loss == pytest.approx(0.0)
         assert train_alignment_loss == pytest.approx(2.0)
+
+    def test_validate_ignores_alignment_when_no_pairs_can_be_sampled(
+        self,
+        monkeypatch,
+    ):
+        cfg = PretrainConfig()
+        cfg.descriptors.loss_weight = 0.0
+        cfg.ecfp_latent_alignment.enabled = True
+        cfg.ecfp_latent_alignment.weight = 0.5
+        cfg.ecfp_latent_alignment.log_rank_metrics = True
+
+        loader = _DummyLoader(
+            [
+                _DummyBatch(
+                    torch.tensor([[0.0]], dtype=torch.float32),
+                    torch.tensor([[0.0]], dtype=torch.float32),
+                )
+            ]
+        )
+        loader.ecfp_latent_alignment = cfg.ecfp_latent_alignment
+        loader[0].ecfp = torch.tensor([[True, False]], dtype=torch.bool)
+        model = _DummyModel(torch.tensor([[0.0]], dtype=torch.float32))
+
+        monkeypatch.setattr(
+            "golem.pretrain.compute_alignment_batch",
+            lambda batch, z, alignment_cfg, deterministic_pairs=False: (
+                z.sum() * 0.0,
+                torch.empty(0, dtype=torch.float32),
+                torch.empty(0, dtype=torch.float32),
+            ),
+        )
+
+        (
+            objective_loss,
+            descriptor_loss,
+            rmse,
+            alignment_loss,
+            alignment_spearman,
+            alignment_kendall,
+        ) = _validate(
+            model,
+            loader,
+            cfg.descriptors.loss_weight,
+            torch.device("cpu"),
+        )
+
+        assert np.isnan(objective_loss)
+        assert np.isnan(descriptor_loss)
+        assert np.isnan(rmse)
+        assert np.isnan(alignment_loss)
+        assert np.isnan(alignment_spearman)
+        assert np.isnan(alignment_kendall)
 
 
 class TestParentLevelSplit:

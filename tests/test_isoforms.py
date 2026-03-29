@@ -168,6 +168,14 @@ class TestValidProtomer:
         if mol is not None:
             assert _is_valid_protomer(mol, "N") is False
 
+    def test_protonated_tertiary_amide_is_rejected_even_after_atom_reordering(self):
+        """False tertiary-amide protonation should not depend on atom order."""
+        original = "CC(=O)N1CCCCC1"
+        protomer = Chem.MolFromSmiles("[NH+]1(CCCCC1)C(C)=O")
+
+        assert protomer is not None
+        assert _is_valid_protomer(protomer, original) is False
+
 
 # ---------------------------------------------------------------------------
 # TestNeutralization

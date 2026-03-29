@@ -162,6 +162,7 @@ def _train_one_epoch(
     total_descriptor_loss = 0.0
     total_alignment_loss = 0.0
     n_batches = 0
+    n_alignment_batches = 0
     alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
         loader, "ecfp_latent_alignment", None
     )
@@ -197,14 +198,20 @@ def _train_one_epoch(
             descriptor_loss = F.mse_loss(pred[final_mask], targets[final_mask])
 
         alignment_loss = pred.sum() * 0.0
+        has_alignment_pairs = False
         if z is not None and alignment_cfg is not None:
-            alignment_loss, _, _ = compute_alignment_batch(batch, z, alignment_cfg)
-        if final_mask.sum() == 0 and alignment_cfg is None:
+            alignment_loss, d_fp, _ = compute_alignment_batch(batch, z, alignment_cfg)
+            has_alignment_pairs = isinstance(d_fp, torch.Tensor) and d_fp.numel() > 0
+            if has_alignment_pairs:
+                total_alignment_loss += alignment_loss.item()
+                n_alignment_batches += 1
+
+        if final_mask.sum() == 0 and not has_alignment_pairs:
             continue
 
-        total_step_loss = descriptor_loss * descriptor_loss_weight + alignment_loss * (
-            alignment_cfg.weight if alignment_cfg is not None else 0.0
-        )
+        total_step_loss = descriptor_loss * descriptor_loss_weight
+        if has_alignment_pairs and alignment_cfg is not None:
+            total_step_loss = total_step_loss + alignment_loss * alignment_cfg.weight
 
         optimizer.zero_grad()
         total_step_loss.backward()
@@ -213,13 +220,12 @@ def _train_one_epoch(
 
         total_loss += total_step_loss.item()
         total_descriptor_loss += descriptor_loss.item()
-        total_alignment_loss += alignment_loss.item()
         n_batches += 1
 
     return (
-        total_loss / max(n_batches, 1),
-        total_descriptor_loss / max(n_batches, 1),
-        total_alignment_loss / max(n_batches, 1),
+        total_loss / n_batches if n_batches else math.nan,
+        total_descriptor_loss / n_batches if n_batches else math.nan,
+        total_alignment_loss / n_alignment_batches if n_alignment_batches else math.nan,
     )
 
 
@@ -261,8 +267,10 @@ def _validate(
                 alignment_cfg,
                 deterministic_pairs=True,
             )
-            alignment_losses.append(alignment_loss.item())
-            if alignment_cfg.log_rank_metrics:
+            has_alignment_pairs = isinstance(d_fp, torch.Tensor) and d_fp.numel() > 0
+            if has_alignment_pairs:
+                alignment_losses.append(alignment_loss.item())
+            if has_alignment_pairs and alignment_cfg.log_rank_metrics:
                 spearman, kendall = compute_alignment_metrics(d_fp, d_z)
                 if math.isfinite(spearman):
                     spearmans.append(spearman)
@@ -755,8 +763,9 @@ def pretrain(
                     f"val_rmse={val_rmse:.4f}",
                     f"lr={lr:.2e}",
                 ]
-                if alignment_cfg.enabled:
+                if alignment_cfg.enabled and math.isfinite(train_alignment_loss):
                     summary_parts.append(f"train_align={train_alignment_loss:.4f}")
+                if alignment_cfg.enabled and math.isfinite(val_alignment_loss):
                     summary_parts.append(f"val_align={val_alignment_loss:.4f}")
                 logger.info(
                     "Epoch %3d/%d — %s",
