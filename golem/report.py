@@ -113,6 +113,7 @@ def _compute_summary(
     """Derive summary stats from metrics + config."""
     last_row = metrics[-1]
     finite_rows = [row for row in metrics if math.isfinite(row["val_loss"])]
+    finite_rmse_rows = [row for row in metrics if math.isfinite(row["val_rmse"])]
     if finite_rows:
         best_row = min(finite_rows, key=lambda r: r["val_loss"])
     else:
@@ -120,12 +121,18 @@ def _compute_summary(
             "No finite validation objective found in metrics; using the last row as the report summary anchor"
         )
         best_row = last_row
+    if finite_rmse_rows:
+        best_rmse_row = min(finite_rmse_rows, key=lambda r: r["val_rmse"])
+    else:
+        best_rmse_row = last_row
 
     return {
         "best_epoch": best_row["epoch"],
         "best_epoch_display": best_row["epoch"] + 1,
         "best_val_objective": best_row["val_loss"],
-        "best_val_rmse": best_row["val_rmse"],
+        "best_val_rmse": best_rmse_row["val_rmse"],
+        "best_val_rmse_epoch": best_rmse_row["epoch"],
+        "best_val_rmse_epoch_display": best_rmse_row["epoch"] + 1,
         "total_epochs": len(metrics),
         "max_epochs": config.get("max_epochs", "?"),
         "elapsed": _fmt_elapsed(last_row["elapsed_seconds"]),
@@ -227,7 +234,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="card best">
     <div class="label">Best Val RMSE</div>
     <div class="value">{{BEST_VAL_RMSE}}</div>
-    <div class="detail">At best epoch</div>
+    <div class="detail">Epoch {{BEST_VAL_RMSE_EPOCH}}</div>
   </div>
   <div class="card time">
     <div class="label">Elapsed Time</div>
@@ -504,6 +511,7 @@ new Chart(document.getElementById('alignmentChart'), {
         "{{BEST_VAL_OBJECTIVE}}": f"{summary['best_val_objective']:.4f}",
         "{{BEST_VAL_RMSE}}": f"{summary['best_val_rmse']:.4f}",
         "{{BEST_EPOCH}}": str(summary["best_epoch_display"]),
+        "{{BEST_VAL_RMSE_EPOCH}}": str(summary["best_val_rmse_epoch_display"]),
         "{{TOTAL_EPOCHS}}": str(summary["total_epochs"]),
         "{{MAX_EPOCHS}}": str(summary["max_epochs"]),
         "{{ELAPSED}}": summary["elapsed"],

@@ -281,6 +281,11 @@ class TestSMILESValidation:
 class TestEnumerateIsoforms:
     """Tests for single-SMILES isoform enumeration."""
 
+    def test_enabled_flag_disables_all_enumeration(self):
+        """enabled=False should return only the canonical parent."""
+        config = IsoformConfig(enabled=False)
+        assert enumerate_isoforms("CC(=O)O", config) == ["CC(=O)O"]
+
     def test_original_always_first(self, default_config):
         """Original SMILES should always be at index 0."""
         smi = "c1ccccc1"

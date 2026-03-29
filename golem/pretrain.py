@@ -33,7 +33,11 @@ import torch
 from rdkit import Chem
 import torch.nn.functional as F
 import yaml
-from golem.config import ECFPLatentAlignmentConfig, PretrainConfig
+from golem.config import (
+    ECFPLatentAlignmentConfig,
+    PretrainConfig,
+    validate_pretrain_config,
+)
 from golem.descriptors import (
     NaNAwareStandardScaler,
     compute_descriptor_targets,
@@ -561,9 +565,8 @@ def pretrain(
 
     seed_everything(config.seed)
     effective_subsample = subsample if subsample is not None else config.subsample
-    if effective_subsample is not None and not (0.0 < effective_subsample <= 1.0):
-        raise ValueError("subsample must be in the interval (0.0, 1.0].")
     resolved_config = replace(config, subsample=effective_subsample)
+    validate_pretrain_config(resolved_config)
 
     if config.max_epochs > 0 and config.warmup_epochs >= config.max_epochs:
         logger.warning(
@@ -716,7 +719,12 @@ def pretrain(
         head_norm=mc.head_norm,
         head_residual=mc.head_residual,
     )
-    if "head_dropout" in gt_params and mc.head_dropout is not None:
+    if mc.head_dropout is not None:
+        if "head_dropout" not in gt_params:
+            raise RuntimeError(
+                "model.head_dropout is set, but the installed gt-pyg "
+                "GraphTransformerNet does not accept head_dropout."
+            )
         model_kwargs["head_dropout"] = mc.head_dropout
     model = GraphTransformerNet(**model_kwargs).to(device)
     if alignment_cfg.enabled and "return_latent" not in inspect.signature(model.forward).parameters:

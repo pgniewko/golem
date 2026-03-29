@@ -240,6 +240,9 @@ def enumerate_isoforms(smiles: str, config: IsoformConfig) -> List[str]:
     if original_can is None:
         return [smiles]
 
+    if not config.enabled:
+        return [original_can]
+
     seen: Set[str] = {original_can}
     isoforms: List[str] = [original_can]
 

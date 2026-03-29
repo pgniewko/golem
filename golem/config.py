@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from dataclasses import dataclass, field, asdict, fields
 from numbers import Integral, Real
@@ -124,6 +125,71 @@ def _validate_fraction_field(
         )
 
 
+def _validate_real_field(
+    name: str,
+    value: Any,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    minimum_inclusive: bool = True,
+    maximum_inclusive: bool = True,
+) -> None:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number.")
+    numeric_value = float(value)
+    if not math.isfinite(numeric_value):
+        raise ValueError(f"{name} must be finite.")
+    if minimum is not None:
+        if minimum_inclusive:
+            if numeric_value < minimum:
+                raise ValueError(f"{name} must be >= {minimum}.")
+        elif numeric_value <= minimum:
+            raise ValueError(f"{name} must be > {minimum}.")
+    if maximum is not None:
+        if maximum_inclusive:
+            if numeric_value > maximum:
+                raise ValueError(f"{name} must be <= {maximum}.")
+        elif numeric_value >= maximum:
+            raise ValueError(f"{name} must be < {maximum}.")
+
+
+def _validate_range_field(
+    name: str,
+    value: Any,
+    *,
+    allow_equal: bool,
+) -> None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{name} must be a length-2 sequence.")
+    lo, hi = value
+    _validate_real_field(f"{name}[0]", lo)
+    _validate_real_field(f"{name}[1]", hi)
+    if allow_equal:
+        if float(lo) > float(hi):
+            raise ValueError(f"{name}[0] must be <= {name}[1].")
+    elif float(lo) >= float(hi):
+        raise ValueError(f"{name}[0] must be < {name}[1].")
+
+
+def _validate_split_ratios(name: str, fractions: Any) -> None:
+    if not isinstance(fractions, (list, tuple)):
+        raise ValueError(f"{name} must be a list or tuple.")
+    if len(fractions) not in (2, 3):
+        raise ValueError(f"{name} must contain exactly 2 or 3 ratios.")
+    total = 0.0
+    for idx, frac in enumerate(fractions):
+        _validate_real_field(
+            f"{name}[{idx}]",
+            frac,
+            minimum=0.0,
+            maximum=1.0,
+            minimum_inclusive=False,
+        )
+        total += float(frac)
+    if abs(total - 1.0) >= 1e-6:
+        raise ValueError(f"{name} must sum to 1.0, got {total}.")
+
+
 @dataclass
 class PretrainConfig:
     """Full pretraining pipeline config."""
@@ -147,6 +213,114 @@ class PretrainConfig:
     winsorize_range: Tuple[float, float] = (-6.0, 6.0)
     split_ratios: List[float] = field(default_factory=lambda: [0.7, 0.2, 0.1])
     seed: int = 42  # pretrain seed (finetune notebooks use 1928374650)
+
+
+def validate_pretrain_config(config: PretrainConfig) -> PretrainConfig:
+    """Validate a resolved config and return it unchanged."""
+    _validate_integer_field("model.hidden_dim", config.model.hidden_dim, minimum=1)
+    _validate_integer_field("model.num_gt_layers", config.model.num_gt_layers, minimum=1)
+    _validate_integer_field("model.num_heads", config.model.num_heads, minimum=1)
+    if config.model.hidden_dim % config.model.num_heads != 0:
+        raise ValueError(
+            "model.hidden_dim must be divisible by model.num_heads."
+        )
+    _validate_integer_field("model.num_head_layers", config.model.num_head_layers, minimum=1)
+    _validate_real_field(
+        "model.dropout",
+        config.model.dropout,
+        minimum=0.0,
+        maximum=1.0,
+        maximum_inclusive=False,
+    )
+    if config.model.head_dropout is not None:
+        _validate_real_field(
+            "model.head_dropout",
+            config.model.head_dropout,
+            minimum=0.0,
+            maximum=1.0,
+            maximum_inclusive=False,
+        )
+
+    _validate_integer_field("batch_size", config.batch_size, minimum=1)
+    _validate_integer_field("max_epochs", config.max_epochs, minimum=1)
+    _validate_integer_field("patience", config.patience, minimum=1)
+    _validate_integer_field("warmup_epochs", config.warmup_epochs, minimum=0)
+    _validate_integer_field("num_workers", config.num_workers, minimum=0)
+    _validate_integer_field("seed", config.seed, minimum=0)
+    _validate_real_field("lr", config.lr, minimum=0.0, minimum_inclusive=False)
+    _validate_real_field("weight_decay", config.weight_decay, minimum=0.0)
+    _validate_fraction_field(
+        "masking_ratio",
+        config.masking_ratio,
+        minimum_exclusive=0.0,
+        maximum_inclusive=1.0,
+    )
+    _validate_range_field("winsorize_range", config.winsorize_range, allow_equal=False)
+    _validate_split_ratios("split_ratios", config.split_ratios)
+    if config.subsample is not None:
+        _validate_fraction_field(
+            "subsample",
+            config.subsample,
+            minimum_exclusive=0.0,
+            maximum_inclusive=1.0,
+        )
+
+    _validate_integer_field("isoforms.max_tautomers", config.isoforms.max_tautomers, minimum=1)
+    _validate_integer_field("isoforms.max_protomers", config.isoforms.max_protomers, minimum=1)
+    _validate_range_field("isoforms.ph_range", config.isoforms.ph_range, allow_equal=True)
+
+    if not config.descriptors.include_2d_targets and not config.descriptors.include_3d_targets:
+        raise ValueError("At least one descriptor target family must be enabled.")
+    _validate_real_field("descriptors.loss_weight", config.descriptors.loss_weight, minimum=0.0)
+
+    _validate_integer_field("conformers.n_generate", config.conformers.n_generate, minimum=1)
+
+    _validate_real_field(
+        "ecfp_latent_alignment.weight",
+        config.ecfp_latent_alignment.weight,
+        minimum=0.0,
+    )
+    _validate_integer_field(
+        "ecfp_latent_alignment.fp_bits",
+        config.ecfp_latent_alignment.fp_bits,
+        minimum=1,
+    )
+    _validate_integer_field(
+        "ecfp_latent_alignment.fp_radius",
+        config.ecfp_latent_alignment.fp_radius,
+        minimum=0,
+    )
+    _validate_integer_field(
+        "ecfp_latent_alignment.num_pairs",
+        config.ecfp_latent_alignment.num_pairs,
+        minimum=1,
+    )
+    _validate_real_field(
+        "ecfp_latent_alignment.temperature",
+        config.ecfp_latent_alignment.temperature,
+        minimum=0.0,
+        minimum_inclusive=False,
+    )
+    _validate_real_field(
+        "ecfp_latent_alignment.tie_epsilon",
+        config.ecfp_latent_alignment.tie_epsilon,
+        minimum=0.0,
+    )
+
+    if (
+        config.descriptors.loss_weight == 0.0
+        and (
+            not config.ecfp_latent_alignment.enabled
+            or config.ecfp_latent_alignment.weight == 0.0
+        )
+    ):
+        raise ValueError(
+            "At least one training objective must have a positive weight. "
+            "Set descriptors.loss_weight > 0 or enable ecfp_latent_alignment "
+            "with weight > 0."
+        )
+
+    return config
 
 
 def _deep_update(base: dict, overrides: dict) -> dict:
@@ -260,18 +434,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         ecfp_latent_alignment=ECFPLatentAlignmentConfig(**alignment_d),
         **d,
     )
-    if config.descriptors.loss_weight < 0:
-        raise ValueError("descriptors.loss_weight must be >= 0.")
-    _validate_integer_field("batch_size", config.batch_size, minimum=1)
-    _validate_integer_field("conformers.n_generate", config.conformers.n_generate, minimum=1)
-    if config.subsample is not None:
-        _validate_fraction_field(
-            "subsample",
-            config.subsample,
-            minimum_exclusive=0.0,
-            maximum_inclusive=1.0,
-        )
-    return config
+    return validate_pretrain_config(config)
 
 
 def load_config(

@@ -125,6 +125,46 @@ class TestConfig:
         with pytest.raises(ValueError, match=r"subsample must be in the interval \(0.0, 1.0\]"):
             load_config(subsample=1.1)
 
+    def test_load_config_rejects_non_positive_max_epochs(self):
+        """max_epochs must be positive."""
+        with pytest.raises(ValueError, match=r"max_epochs must be >= 1"):
+            load_config(max_epochs=0)
+
+    def test_load_config_rejects_non_positive_patience(self):
+        """patience must be positive."""
+        with pytest.raises(ValueError, match=r"patience must be >= 1"):
+            load_config(patience=0)
+
+    def test_load_config_rejects_negative_warmup_epochs(self):
+        """warmup_epochs must not be negative."""
+        with pytest.raises(ValueError, match=r"warmup_epochs must be >= 0"):
+            load_config(warmup_epochs=-1)
+
+    def test_load_config_rejects_negative_num_workers(self):
+        """num_workers must not be negative."""
+        with pytest.raises(ValueError, match=r"num_workers must be >= 0"):
+            load_config(num_workers=-1)
+
+    def test_load_config_rejects_invalid_masking_ratio(self):
+        """masking_ratio must be in (0, 1]."""
+        with pytest.raises(ValueError, match=r"masking_ratio must be in the interval \(0.0, 1.0\]"):
+            load_config(masking_ratio=0.0)
+
+    def test_load_config_rejects_invalid_split_ratios(self):
+        """split ratios must be positive and sum to 1."""
+        with pytest.raises(ValueError, match=r"split_ratios\[1\] must be > 0.0"):
+            load_config(split_ratios=[1.0, 0.0])
+
+    def test_load_config_rejects_zero_weighted_objective(self):
+        """A zero-weight objective should fail fast."""
+        with pytest.raises(ValueError, match=r"At least one training objective must have a positive weight"):
+            load_config(descriptors={"loss_weight": 0.0})
+
+    def test_load_config_rejects_non_positive_alignment_num_pairs(self):
+        """Alignment num_pairs must be positive."""
+        with pytest.raises(ValueError, match=r"ecfp_latent_alignment\.num_pairs must be >= 1"):
+            load_config(ecfp_latent_alignment={"num_pairs": 0})
+
     def test_load_config_rejects_unknown_pretrain_key(self, tmp_path):
         """Unknown pretrain keys should fail fast."""
         yaml_file = tmp_path / "test.yaml"
@@ -208,6 +248,21 @@ class TestLoadSmiles:
 
 
 class TestResolvedConfig:
+    def test_pretrain_revalidates_direct_config(self, tmp_path):
+        smiles_file = tmp_path / "mols.smi"
+        smiles_file.write_text("C\nCC\nCCC\n")
+
+        cfg = PretrainConfig()
+        cfg.isoforms.enabled = False
+        cfg.max_epochs = 0
+
+        with pytest.raises(ValueError, match=r"max_epochs must be >= 1"):
+            pretrain(
+                smiles_path=str(smiles_file),
+                config=cfg,
+                output_dir=str(tmp_path / "out"),
+            )
+
     def test_pretrain_writes_effective_subsample_to_resolved_config(
         self,
         monkeypatch,
@@ -845,6 +900,93 @@ class TestParentLevelSplit:
         )
 
         with pytest.raises(ValueError, match="singleton final training batch"):
+            pretrain(
+                smiles_path=str(tmp_path / "smiles.smi"),
+                config=cfg,
+                output_dir=str(tmp_path / "out"),
+            )
+
+    def test_pretrain_rejects_unsupported_head_dropout_backend(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        smiles = ["CCO", "CCN", "CCC", "CCCl"]
+        desc_values = np.array(
+            [
+                [1.0, 2.0],
+                [2.0, 3.0],
+                [3.0, 4.0],
+                [4.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+        desc_valid = np.ones_like(desc_values, dtype=np.bool_)
+
+        class DummyGraphTransformerNet(torch.nn.Module):
+            def __init__(
+                self,
+                node_dim_in,
+                edge_dim_in=None,
+                hidden_dim=128,
+                norm="ln",
+                gate=False,
+                qkv_bias=False,
+                num_gt_layers=4,
+                num_heads=8,
+                gt_aggregators=None,
+                aggregators=None,
+                act="gelu",
+                dropout=0.1,
+                num_tasks=1,
+                num_head_layers=1,
+                head_norm=False,
+                head_residual=False,
+            ):
+                super().__init__()
+
+        cfg = PretrainConfig(max_epochs=1, batch_size=2)
+        cfg.isoforms.enabled = False
+        cfg.model.norm = "ln"
+        cfg.model.head_dropout = 0.2
+
+        monkeypatch.setattr("golem.pretrain.load_smiles", lambda _path: smiles)
+        monkeypatch.setattr(
+            "golem.pretrain._prepare_split_smiles",
+            lambda _smiles, _cfg: (
+                smiles,
+                np.array([0, 1]),
+                np.array([2]),
+                np.array([3]),
+            ),
+        )
+        monkeypatch.setattr(
+            "golem.pretrain.compute_descriptor_targets",
+            lambda *_args, **_kwargs: (desc_values, desc_valid, ["d0", "d1"]),
+        )
+        monkeypatch.setattr(
+            "golem.pretrain._build_pyg_dataset",
+            lambda _smiles, values, mask, fingerprint_bits=None: [
+                _DummyBatch(
+                    torch.tensor(values[i : i + 1], dtype=torch.float32),
+                    torch.tensor(mask[i : i + 1], dtype=torch.float32),
+                )
+                for i in range(len(values))
+            ],
+        )
+
+        dummy_gt_pyg = SimpleNamespace(
+            GraphTransformerNet=DummyGraphTransformerNet,
+            __version__="0.0.test",
+        )
+        dummy_gt_pyg_data = SimpleNamespace(
+            get_atom_feature_dim=lambda: 1,
+            get_bond_feature_dim=lambda: 1,
+        )
+        monkeypatch.setitem(sys.modules, "gt_pyg", dummy_gt_pyg)
+        monkeypatch.setitem(sys.modules, "gt_pyg.data", dummy_gt_pyg_data)
+
+        with pytest.raises(RuntimeError, match="head_dropout"):
             pretrain(
                 smiles_path=str(tmp_path / "smiles.smi"),
                 config=cfg,
