@@ -152,7 +152,7 @@ def compute_3d_descriptors(
     for row_idx, smiles in enumerate(
         tqdm(smiles_list, desc="3D descriptors", unit="mol")
     ):
-        conformer, failure_reason = generate_lowest_energy_conformer(
+        conformer = generate_lowest_energy_conformer(
             smiles,
             conformers,
             seed=seed,

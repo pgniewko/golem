@@ -94,6 +94,15 @@ def _reject_unknown_keys(section_name: str, values: dict, allowed_keys: set[str]
         raise ValueError(f"Unknown config keys: {unknown}.")
 
 
+def _pop_section_dict(d: dict, key: str) -> dict:
+    value = d.pop(key, None)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{key} must be a mapping if provided.")
+    return value
+
+
 def _validate_integer_field(name: str, value: Any, *, minimum: int) -> None:
     if isinstance(value, bool) or not isinstance(value, Integral):
         raise ValueError(f"{name} must be an integer.")
@@ -138,12 +147,12 @@ def _deep_update(base: dict, overrides: dict) -> dict:
 
 def _dict_to_config(d: dict) -> PretrainConfig:
     """Build PretrainConfig from a flat/nested dict."""
-    model_d = d.pop("model", {})
-    isoform_d = d.pop("isoforms", {})
-    descriptors_d = d.pop("descriptors", {})
-    conformers_d = d.pop("conformers", {})
-    alignment_d = d.pop("ecfp_latent_alignment", {})
-    descriptor3d_d = descriptors_d.pop("three_d_settings", {})
+    model_d = _pop_section_dict(d, "model")
+    isoform_d = _pop_section_dict(d, "isoforms")
+    descriptors_d = _pop_section_dict(d, "descriptors")
+    conformers_d = _pop_section_dict(d, "conformers")
+    alignment_d = _pop_section_dict(d, "ecfp_latent_alignment")
+    descriptor3d_d = _pop_section_dict(descriptors_d, "three_d_settings")
 
     # Handle nested YAML structures for isoforms
     if "tautomers" in isoform_d and isinstance(isoform_d["tautomers"], dict):
@@ -211,7 +220,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
 
     # Handle residual "pretrain" sub-key (already flattened in load_config,
     # but handle gracefully if _dict_to_config is called directly)
-    pretrain_d = d.pop("pretrain", {})
+    pretrain_d = _pop_section_dict(d, "pretrain")
     _reject_unknown_keys("pretrain", pretrain_d, scalar_pretrain_fields)
     for k, v in pretrain_d.items():
         if k not in d:

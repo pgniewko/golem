@@ -113,6 +113,14 @@ class TestConfig:
         with pytest.raises(ValueError, match="Unknown config keys"):
             load_config(yaml_path=str(yaml_file))
 
+    def test_load_config_treats_null_section_as_empty_override(self, tmp_path):
+        """Explicit null nested sections should behave like empty overrides."""
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text("descriptors: null\n")
+        cfg = load_config(yaml_path=str(yaml_file))
+        assert cfg.descriptors.include_2d_targets is True
+        assert cfg.descriptors.include_3d_targets is False
+
 
 class TestSeedEverything:
     """Tests for reproducibility seeding."""

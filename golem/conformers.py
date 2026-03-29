@@ -57,11 +57,11 @@ def generate_lowest_energy_conformer(
     config: ConformerConfig,
     *,
     seed: int,
-) -> tuple[LowestEnergyConformer | None, str | None]:
+) -> LowestEnergyConformer | None:
     """Generate conformers and keep only the lowest-energy optimized conformer."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        return None, "invalid_smiles"
+        return None
 
     mol = Chem.AddHs(mol)
     params = AllChem.ETKDGv3()
@@ -74,21 +74,18 @@ def generate_lowest_energy_conformer(
         )
     except Exception:
         logger.debug("Conformer embedding failed for %s", smiles, exc_info=True)
-        return None, "embedding_failed"
+        return None
 
     if not conf_ids:
-        return None, "no_conformers"
+        return None
 
     energies = _optimize_conformers(mol, "MMFF") or _optimize_conformers(mol, "UFF")
     if energies is None:
-        return None, "optimization_failed"
+        return None
 
     best_conformer_id = min(energies.items(), key=lambda item: item[1])[0]
 
-    return (
-        LowestEnergyConformer(
-            mol=mol,
-            conformer_id=best_conformer_id,
-        ),
-        None,
+    return LowestEnergyConformer(
+        mol=mol,
+        conformer_id=best_conformer_id,
     )
