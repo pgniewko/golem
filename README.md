@@ -32,7 +32,7 @@ python -m pip install -e /path/to/gt-pyg
 # Install golem (editable)
 python -m pip install -e .
 
-# (Optional) Install dev dependencies for tests and notebooks
+# (Optional) Install dev dependencies
 python -m pip install -e ".[dev]"
 ```
 
@@ -44,6 +44,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e ../gt-pyg
+# Optional: install dev dependencies
 python -m pip install -e ".[dev]"
 ```
 
@@ -59,7 +60,7 @@ python -c "from golem.config import PretrainConfig; print('golem OK')"
 
 ## Running Pretraining
 
-### Quick test run (~1 minute)
+### Quick smoke run (~1 minute)
 
 ```bash
 golem pretrain \
@@ -153,14 +154,6 @@ To write the report to a custom path:
 ```bash
 golem report experiments/pretrain --output path/to/report.html
 ```
-
-## Running Tests
-
-```bash
-pytest tests -q
-```
-
-The tests cover isoform enumeration, 2D descriptor computation, the NaN-aware scaler, config loading, data splitting, and SMILES file loading. Note: descriptor tests require `mordredcommunity` and may take a few seconds.
 
 ### Key module responsibilities
 
