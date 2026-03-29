@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import AllChem, rdMolAlign
+from rdkit.Chem import AllChem
 
 from golem.config import ConformerConfig
 
@@ -60,7 +60,7 @@ def generate_conformer_ensemble(
     *,
     seed: int,
 ) -> tuple[ConformerEnsemble | None, str | None]:
-    """Generate a low-energy, RMS-pruned conformer ensemble."""
+    """Generate a low-energy conformer ensemble."""
     started_at = time.monotonic()
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -93,35 +93,20 @@ def generate_conformer_ensemble(
         return None, "optimization_failed"
 
     min_energy = min(energies.values())
-    kept: list[tuple[int, float]] = []
-    for conf_id, energy in sorted(energies.items(), key=lambda item: item[1]):
-        rel_energy = energy - min_energy
-        if rel_energy > config.energy_window_kcal:
-            continue
-
-        duplicate = False
-        for kept_id, _ in kept:
-            try:
-                duplicate = (
-                    rdMolAlign.GetBestRMS(mol, mol, prbId=conf_id, refId=kept_id)
-                    < config.prune_rms
-                )
-            except Exception:
-                logger.debug("RMS comparison failed for %s", smiles, exc_info=True)
-                duplicate = True
-            if duplicate:
-                break
-        if duplicate:
-            continue
-
-        kept.append((conf_id, rel_energy))
-        if len(kept) >= config.n_keep:
-            break
+    kept = [
+        (conf_id, energy - min_energy)
+        for conf_id, energy in sorted(energies.items(), key=lambda item: item[1])
+    ]
+    kept = [
+        (conf_id, rel_energy)
+        for conf_id, rel_energy in kept
+        if rel_energy <= config.energy_window_kcal
+    ]
 
     if not kept:
         if config.timeout_seconds > 0 and (time.monotonic() - started_at) >= config.timeout_seconds:
             return None, "timeout"
-        return None, "rms_pruned"
+        return None, "energy_filtered"
 
     return (
         ConformerEnsemble(

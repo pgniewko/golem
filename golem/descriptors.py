@@ -170,7 +170,9 @@ def compute_aggregated_3d_descriptors(
     dropped_conformer_failures = 0
     dropped_invalid_descriptors = 0
 
-    for row_idx, smiles in enumerate(smiles_list):
+    for row_idx, smiles in enumerate(
+        tqdm(smiles_list, desc="3D descriptors", unit="mol")
+    ):
         ensemble, failure_reason = generate_conformer_ensemble(
             smiles,
             conformers,

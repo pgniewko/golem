@@ -80,7 +80,12 @@ class DescriptorConfig:
 
 @dataclass
 class ConformerConfig:
-    """Offline conformer generation settings for 3D descriptor targets."""
+    """Offline conformer generation settings for 3D descriptor targets.
+
+    ``n_keep`` and ``prune_rms`` are retained for backward-compatible config
+    parsing, but the current ensemble selection keeps all low-energy conformers
+    within ``energy_window_kcal`` without RMS-based pruning.
+    """
 
     n_generate: int = 8
     n_keep: int = 4
