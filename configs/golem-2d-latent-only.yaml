@@ -1,0 +1,24 @@
+# These are overrides over the defaults in golem.config.PretrainConfig.
+#
+# This preset keeps the 2D descriptor heads active so the task dimensionality
+# remains defined, but it trains only on the ECFP-latent alignment objective.
+
+model:
+  dropout: 0.2
+  head_dropout: 0.2
+
+pretrain:
+  max_epochs: 5000
+  patience: 100
+  lr: 3.0e-4
+
+isoforms:
+  desalting: { enabled: true }
+
+descriptors:
+  include_2d_targets: true
+  include_3d_targets: false
+  loss_weight: 0.0
+
+ecfp_latent_alignment:
+  enabled: true
