@@ -2,7 +2,7 @@
 
 Descriptor pretraining for Graph Transformers on molecular descriptors. Inspired by [CheMeleon](https://github.com/JacksonBurns/chemeleon), with improvements including NaN-aware validity masking and scaling, and isoform enumeration for data augmentation.
 
-Golem pretrains a [gt-pyg](https://github.com/pgniewko/gt-pyg) `GraphTransformerNet` backbone to predict Mordred 2D molecular descriptors, then the pretrained weights transfer to downstream property-prediction tasks via fine-tuning notebooks.
+Golem pretrains a [gt-pyg](https://github.com/pgniewko/gt-pyg) `GraphTransformerNet` backbone to predict Mordred 2D molecular descriptors, with optional 3D descriptor targets and ECFP-latent alignment.
 
 ## Installation
 
@@ -44,6 +44,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e ../gt-pyg
+python -m pip install -e .
 # Optional: install dev dependencies
 python -m pip install -e ".[dev]"
 ```
@@ -164,7 +165,7 @@ golem report experiments/pretrain --output path/to/report.html
 | `conformers.py` | Builds the lowest-energy RDKit conformer used for optional 3D descriptor targets |
 | `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
 | `descriptors.py` | Computes 2D/3D descriptor targets; provides `NaNAwareStandardScaler` |
-| `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; isoforms &rarr; descriptors &rarr; split &rarr; scale &rarr; train &rarr; checkpoint |
+| `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; split parents &rarr; expand isoforms within each split &rarr; descriptors &rarr; scale &rarr; train &rarr; checkpoint |
 | `utils.py` | Shared utilities: seeding, train/val/test splitting, PyG DataLoader creation, SMILES file loading |
 
 ### Where things live

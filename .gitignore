@@ -10,6 +10,7 @@
 pretrain.log
 metrics.csv
 pretrain_report.html
+experiments/test/
 
 # Temp files
 tmp*
