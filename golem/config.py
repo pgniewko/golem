@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field, asdict, fields
+from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
 import yaml
@@ -89,8 +90,16 @@ class ConformerConfig:
 def _reject_unknown_keys(section_name: str, values: dict, allowed_keys: set[str]) -> None:
     unknown_keys = sorted(set(values) - allowed_keys)
     if unknown_keys:
-        unknown = ", ".join(f"{section_name}.{key}" for key in unknown_keys)
+        prefix = f"{section_name}." if section_name else ""
+        unknown = ", ".join(f"{prefix}{key}" for key in unknown_keys)
         raise ValueError(f"Unknown config keys: {unknown}.")
+
+
+def _validate_integer_field(name: str, value: Any, *, minimum: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{name} must be an integer.")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}.")
 
 
 @dataclass
@@ -140,11 +149,17 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     # Handle nested YAML structures for isoforms
     if "tautomers" in isoform_d and isinstance(isoform_d["tautomers"], dict):
         taut = isoform_d.pop("tautomers")
+        _reject_unknown_keys("isoforms.tautomers", taut, {"enabled", "max_tautomers"})
         isoform_d["tautomers"] = taut.get("enabled", True)
         if "max_tautomers" in taut:
             isoform_d["max_tautomers"] = taut["max_tautomers"]
     if "protonation" in isoform_d and isinstance(isoform_d["protonation"], dict):
         prot = isoform_d.pop("protonation")
+        _reject_unknown_keys(
+            "isoforms.protonation",
+            prot,
+            {"enabled", "max_protomers", "ph_range"},
+        )
         isoform_d["protonation"] = prot.get("enabled", True)
         if "ph_range" in prot:
             isoform_d["ph_range"] = tuple(prot["ph_range"])
@@ -152,12 +167,15 @@ def _dict_to_config(d: dict) -> PretrainConfig:
             isoform_d["max_protomers"] = prot["max_protomers"]
     if "neutralization" in isoform_d and isinstance(isoform_d["neutralization"], dict):
         neut = isoform_d.pop("neutralization")
+        _reject_unknown_keys("isoforms.neutralization", neut, {"enabled"})
         isoform_d["neutralization"] = neut.get("enabled", True)
     if "desalting" in isoform_d and isinstance(isoform_d["desalting"], dict):
         desalt = isoform_d.pop("desalting")
+        _reject_unknown_keys("isoforms.desalting", desalt, {"enabled"})
         isoform_d["desalting"] = desalt.get("enabled", False)
     if "rdkit_fallback" in isoform_d and isinstance(isoform_d["rdkit_fallback"], dict):
         fb = isoform_d.pop("rdkit_fallback")
+        _reject_unknown_keys("isoforms.rdkit_fallback", fb, {"enabled"})
         isoform_d["rdkit_fallback"] = fb.get("enabled", False)
 
     removed_conformer_keys = {"energy_window_kcal", "n_keep", "prune_rms"} & set(
@@ -178,9 +196,20 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     conformer_fields = {f.name for f in fields(ConformerConfig)}
     alignment_fields = {f.name for f in fields(ECFPLatentAlignmentConfig)}
     pretrain_fields = {f.name for f in fields(PretrainConfig)}
+    scalar_pretrain_fields = pretrain_fields - {
+        "model",
+        "isoforms",
+        "descriptors",
+        "conformers",
+        "ecfp_latent_alignment",
+    }
 
+    _reject_unknown_keys("model", model_d, model_fields)
+    _reject_unknown_keys("isoforms", isoform_d, isoform_fields)
+    _reject_unknown_keys("descriptors", descriptors_d, descriptor_fields)
     _reject_unknown_keys("conformers", conformers_d, conformer_fields)
     _reject_unknown_keys("descriptors.three_d_settings", descriptor3d_d, descriptor3d_fields)
+    _reject_unknown_keys("ecfp_latent_alignment", alignment_d, alignment_fields)
 
     model_d = {k: v for k, v in model_d.items() if k in model_fields}
     isoform_d = {k: v for k, v in isoform_d.items() if k in isoform_fields}
@@ -194,6 +223,7 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     # Handle residual "pretrain" sub-key (already flattened in load_config,
     # but handle gracefully if _dict_to_config is called directly)
     pretrain_d = d.pop("pretrain", {})
+    _reject_unknown_keys("pretrain", pretrain_d, scalar_pretrain_fields)
     for k, v in pretrain_d.items():
         if k not in d:
             d[k] = v
@@ -203,6 +233,8 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         d["winsorize_range"] = tuple(d["winsorize_range"])
     if "ph_range" in isoform_d and isinstance(isoform_d["ph_range"], list):
         isoform_d["ph_range"] = tuple(isoform_d["ph_range"])
+
+    _reject_unknown_keys("", d, scalar_pretrain_fields)
 
     # Filter to known fields
     d = {k: v for k, v in d.items() if k in pretrain_fields}
@@ -220,8 +252,12 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     )
     if config.descriptors.loss_weight < 0:
         raise ValueError("descriptors.loss_weight must be >= 0.")
-    if config.conformers.timeout_seconds < 0:
-        raise ValueError("conformers.timeout_seconds must be >= 0.")
+    _validate_integer_field("conformers.n_generate", config.conformers.n_generate, minimum=1)
+    _validate_integer_field(
+        "conformers.timeout_seconds",
+        config.conformers.timeout_seconds,
+        minimum=0,
+    )
     return config
 
 

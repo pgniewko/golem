@@ -91,6 +91,27 @@ class TestConfig:
         with pytest.raises(ValueError, match="Unknown config keys"):
             load_config(yaml_path=str(yaml_file))
 
+    def test_load_config_rejects_unknown_descriptor_key(self, tmp_path):
+        """Unknown descriptor keys should fail fast."""
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text("descriptors:\n  include_3d_targerts: true\n")
+        with pytest.raises(ValueError, match="Unknown config keys"):
+            load_config(yaml_path=str(yaml_file))
+
+    def test_load_config_rejects_non_positive_n_generate(self, tmp_path):
+        """n_generate must be a positive integer."""
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text("conformers:\n  n_generate: 0\n")
+        with pytest.raises(ValueError, match=r"conformers\.n_generate must be >= 1"):
+            load_config(yaml_path=str(yaml_file))
+
+    def test_load_config_rejects_non_integer_timeout_seconds(self, tmp_path):
+        """timeout_seconds must not be silently truncated."""
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text("conformers:\n  timeout_seconds: 0.5\n")
+        with pytest.raises(ValueError, match=r"conformers\.timeout_seconds must be an integer"):
+            load_config(yaml_path=str(yaml_file))
+
 
 class TestSeedEverything:
     """Tests for reproducibility seeding."""
