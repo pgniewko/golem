@@ -1,19 +1,7 @@
 """Pretraining loop for Graph Transformers on Mordred descriptors.
 
 Uses ``GraphTransformerNet(num_tasks=num_descriptors)`` directly — no wrapper
-model.  The built-in ``mu_mlp`` serves as the descriptor prediction head.
-
-Pipeline:
-1. Load SMILES
-2. Split into train / val / (test) at the parent-molecule level
-3. (Optional) Enumerate isoforms within each split only
-4. Compute descriptor targets + validity masks
-5. Fit ``NaNAwareStandardScaler`` on **train only**
-6. Transform all splits + winsorise
-7. Build PyG datasets via ``get_tensor_data``
-8. Train with masked MSE (15% random mask ∩ validity mask)
-9. Early stopping on validation objective
-10. Save checkpoint with scaler, descriptor names, config
+model. The built-in ``mu_mlp`` serves as the descriptor prediction head.
 """
 
 from __future__ import annotations
@@ -24,24 +12,22 @@ import json
 import logging
 import math
 import time
-from dataclasses import asdict, replace
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
-from rdkit import Chem
 import torch.nn.functional as F
 import yaml
+from rdkit import Chem
+
 from golem.config import (
     ECFPLatentAlignmentConfig,
     PretrainConfig,
     validate_pretrain_config,
 )
-from golem.descriptors import (
-    NaNAwareStandardScaler,
-    compute_descriptor_targets,
-)
+from golem.descriptors import NaNAwareStandardScaler, compute_descriptor_targets
 from golem.ecfp_latent_alignment import (
     compute_alignment_batch,
     compute_alignment_metrics,
@@ -49,17 +35,12 @@ from golem.ecfp_latent_alignment import (
 )
 from golem.isoforms import enumerate_isoforms_batch
 from golem.report import generate_report
-from golem.utils import (
-    load_smiles,
-    make_loader,
-    seed_everything,
-    split_data,
-)
+from golem.utils import load_smiles, make_loader, seed_everything, split_data
 
 logger = logging.getLogger(__name__)
 
 _BATCH_NORM_NAMES = {"bn", "batchnorm", "batch_norm"}
-
+_SPLIT_NAMES = ("train", "val", "test")
 METRICS_FIELDNAMES = [
     "epoch",
     "train_loss",
@@ -74,21 +55,25 @@ METRICS_FIELDNAMES = [
     "val_alignment_spearman",
     "val_alignment_kendall",
 ]
+SplitIndices = dict[str, np.ndarray | None]
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint metadata
-# ---------------------------------------------------------------------------
+@dataclass
+class EpochMetrics:
+    objective_loss: float = math.nan
+    descriptor_loss: float = math.nan
+    rmse: float = math.nan
+    alignment_loss: float = math.nan
+    alignment_spearman: float = math.nan
+    alignment_kendall: float = math.nan
+
 
 def _checkpoint_library_versions() -> dict[str, str]:
     """Return library versions recorded in generated checkpoints."""
     import golem
     import gt_pyg
 
-    return {
-        "golem": golem.__version__,
-        "gt_pyg": gt_pyg.__version__,
-    }
+    return {"golem": golem.__version__, "gt_pyg": gt_pyg.__version__}
 
 
 def _format_optional_metric(value: float) -> str:
@@ -96,45 +81,28 @@ def _format_optional_metric(value: float) -> str:
     return f"{value:.6f}" if math.isfinite(value) else ""
 
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
-
 def _setup_logging(output_dir: Path, verbose: bool = False) -> None:
-    """Configure logging to both stdout and file.
-
-    Uses a named ``"golem"`` logger with ``propagate=False`` so that
-    existing root-logger handlers (e.g. Jupyter, application loggers)
-    are not destroyed.
-
-    Args:
-        output_dir: Directory for the log file.
-        verbose: If True, set console handler to DEBUG level.
-    """
+    """Configure logging to both stdout and file."""
     golem_logger = logging.getLogger("golem")
     golem_logger.setLevel(logging.DEBUG)
     golem_logger.propagate = False
 
-    # Remove existing golem handlers (avoid duplicates on re-runs)
-    for h in golem_logger.handlers[:]:
-        golem_logger.removeHandler(h)
+    for handler in golem_logger.handlers[:]:
+        golem_logger.removeHandler(handler)
 
-    # Console handler (INFO by default, DEBUG when verbose)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG if verbose else logging.INFO)
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s — %(message)s", datefmt="%H:%M:%S"))
-    golem_logger.addHandler(ch)
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s — %(message)s", datefmt="%H:%M:%S"
+    )
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console_handler.setFormatter(formatter)
+    golem_logger.addHandler(console_handler)
 
-    # File handler (DEBUG)
-    fh = logging.FileHandler(output_dir / "pretrain.log", mode="w")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s — %(message)s"))
-    golem_logger.addHandler(fh)
+    file_handler = logging.FileHandler(output_dir / "pretrain.log", mode="w")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    golem_logger.addHandler(file_handler)
 
-
-# ---------------------------------------------------------------------------
-# LR schedule: linear warmup + cosine decay
-# ---------------------------------------------------------------------------
 
 def _make_warmup_cosine_scheduler(
     optimizer: torch.optim.Optimizer,
@@ -142,343 +110,329 @@ def _make_warmup_cosine_scheduler(
     max_epochs: int,
 ) -> torch.optim.lr_scheduler.LambdaLR:
     """Return a LambdaLR with linear warmup then cosine decay."""
+
     def _lr_lambda(epoch: int) -> float:
         if epoch < warmup_epochs:
             return (epoch + 1) / warmup_epochs
         progress = (epoch - warmup_epochs) / max(max_epochs - warmup_epochs, 1)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
+
     return torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
 
-# ---------------------------------------------------------------------------
-# Single-epoch routines
-# ---------------------------------------------------------------------------
+def _forward_batch(
+    model: torch.nn.Module,
+    batch,
+    alignment_cfg: ECFPLatentAlignmentConfig | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    common_kwargs = {
+        "batch": batch.batch,
+        "zero_var": True,
+    }
+    if alignment_cfg is None:
+        pred, _ = model(batch.x, batch.edge_index, batch.edge_attr, **common_kwargs)
+        return pred, None
 
-def _train_one_epoch(
+    pred, _, latent = model(
+        batch.x,
+        batch.edge_index,
+        batch.edge_attr,
+        return_latent=True,
+        **common_kwargs,
+    )
+    return pred, latent
+
+
+def _run_epoch(
     model: torch.nn.Module,
     loader,
-    optimizer: torch.optim.Optimizer,
-    masking_ratio: float,
     descriptor_loss_weight: float,
     device: torch.device,
-) -> tuple[float, float, float]:
-    """Run one training epoch. Returns objective, descriptor, and alignment losses."""
-    model.train()
-    total_descriptor_se = 0.0
-    total_descriptor_count = 0
-    total_alignment_loss = 0.0
-    n_alignment_batches = 0
-    saw_optimization_step = False
+    *,
+    optimizer: torch.optim.Optimizer | None = None,
+    masking_ratio: float | None = None,
+) -> EpochMetrics:
+    """Run one training or evaluation epoch."""
+    is_training = optimizer is not None
     alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
         loader, "ecfp_latent_alignment", None
     )
-    for batch in loader:
-        batch = batch.to(device)
-        targets = batch.y  # [B, D]
-        valid_mask = batch.y_mask.bool()  # [B, D]
+    descriptor_se = 0.0
+    descriptor_count = 0
+    alignment_losses: list[float] = []
+    spearmans: list[float] = []
+    kendalls: list[float] = []
+    saw_optimization_step = False
 
-        if alignment_cfg is not None:
-            pred, _log_var, z = model(
-                batch.x,
-                batch.edge_index,
-                batch.edge_attr,
-                batch=batch.batch,
-                zero_var=True,
-                return_latent=True,
-            )
-        else:
-            pred, _log_var = model(
-                batch.x, batch.edge_index, batch.edge_attr,
-                batch=batch.batch, zero_var=True,
-            )
-            z = None
+    model.train(is_training)
+    context = nullcontext() if is_training else torch.no_grad()
+    with context:
+        for batch in loader:
+            batch = batch.to(device)
+            targets = batch.y
+            valid_mask = batch.y_mask.bool()
+            pred, latent = _forward_batch(model, batch, alignment_cfg)
 
-        # Random 15% mask ∩ validity mask
-        final_mask = (torch.rand_like(targets) < masking_ratio).bool() & valid_mask
+            if is_training:
+                descriptor_mask = (torch.rand_like(targets) < masking_ratio).bool()
+                descriptor_mask &= valid_mask
+                masked_count = int(descriptor_mask.sum().item())
+                if masked_count == 0 and valid_mask.sum().item() > 0:
+                    descriptor_mask = valid_mask
+                    masked_count = int(descriptor_mask.sum().item())
+            else:
+                descriptor_mask = valid_mask
+                masked_count = int(valid_mask.sum().item())
 
-        masked_count = int(final_mask.sum().item())
-        if masked_count == 0 and valid_mask.sum() > 0:
-            final_mask = valid_mask
-            masked_count = int(final_mask.sum().item())
+            descriptor_loss = pred.sum() * 0.0
+            if masked_count:
+                masked_diff = pred[descriptor_mask] - targets[descriptor_mask]
+                descriptor_loss = F.mse_loss(
+                    pred[descriptor_mask], targets[descriptor_mask]
+                )
+                descriptor_se += masked_diff.pow(2).sum().item()
+                descriptor_count += masked_count
 
-        descriptor_loss = pred.sum() * 0.0
-        if masked_count > 0:
-            masked_diff = pred[final_mask] - targets[final_mask]
-            descriptor_loss = F.mse_loss(pred[final_mask], targets[final_mask])
-            total_descriptor_se += masked_diff.pow(2).sum().item()
-            total_descriptor_count += masked_count
+            alignment_loss = pred.sum() * 0.0
+            has_alignment_pairs = False
+            if latent is not None and alignment_cfg is not None:
+                alignment_loss, d_fp, d_z = compute_alignment_batch(
+                    batch,
+                    latent,
+                    alignment_cfg,
+                    deterministic_pairs=not is_training,
+                )
+                has_alignment_pairs = isinstance(d_fp, torch.Tensor) and d_fp.numel() > 0
+                if has_alignment_pairs:
+                    alignment_losses.append(alignment_loss.item())
+                if (
+                    not is_training
+                    and has_alignment_pairs
+                    and alignment_cfg.log_rank_metrics
+                ):
+                    spearman, kendall = compute_alignment_metrics(d_fp, d_z)
+                    if math.isfinite(spearman):
+                        spearmans.append(spearman)
+                    if math.isfinite(kendall):
+                        kendalls.append(kendall)
 
-        alignment_loss = pred.sum() * 0.0
-        has_alignment_pairs = False
-        if z is not None and alignment_cfg is not None:
-            alignment_loss, d_fp, _ = compute_alignment_batch(batch, z, alignment_cfg)
-            has_alignment_pairs = isinstance(d_fp, torch.Tensor) and d_fp.numel() > 0
-            if has_alignment_pairs:
-                total_alignment_loss += alignment_loss.item()
-                n_alignment_batches += 1
+            if not is_training:
+                continue
+            if masked_count == 0 and not has_alignment_pairs:
+                continue
 
-        if masked_count == 0 and not has_alignment_pairs:
-            continue
+            saw_optimization_step = True
+            total_step_loss = descriptor_loss * descriptor_loss_weight
+            if has_alignment_pairs and alignment_cfg is not None:
+                total_step_loss = total_step_loss + alignment_loss * alignment_cfg.weight
 
-        saw_optimization_step = True
-        total_step_loss = descriptor_loss * descriptor_loss_weight
-        if has_alignment_pairs and alignment_cfg is not None:
-            total_step_loss = total_step_loss + alignment_loss * alignment_cfg.weight
-
-        optimizer.zero_grad()
-        total_step_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
+            optimizer.zero_grad()
+            total_step_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
 
     descriptor_loss_value = math.nan
-    if total_descriptor_count > 0:
-        descriptor_loss_value = total_descriptor_se / total_descriptor_count
+    if descriptor_count:
+        descriptor_loss_value = descriptor_se / descriptor_count
     elif saw_optimization_step:
         descriptor_loss_value = 0.0
 
-    alignment_loss_value = (
-        total_alignment_loss / n_alignment_batches if n_alignment_batches else math.nan
-    )
-
+    alignment_loss_value = float(np.mean(alignment_losses)) if alignment_losses else math.nan
     objective_terms: list[float] = []
     if math.isfinite(descriptor_loss_value):
         objective_terms.append(descriptor_loss_value * descriptor_loss_weight)
     if math.isfinite(alignment_loss_value) and alignment_cfg is not None:
         objective_terms.append(alignment_loss_value * alignment_cfg.weight)
-    objective_loss = float(sum(objective_terms)) if objective_terms else math.nan
 
-    return objective_loss, descriptor_loss_value, alignment_loss_value
-
-
-@torch.no_grad()
-def _validate(
-    model: torch.nn.Module,
-    loader,
-    descriptor_loss_weight: float,
-    device: torch.device,
-) -> tuple[float, float, float, float, float, float]:
-    """Validate and optionally compute alignment metrics."""
-    model.eval()
-    total_se = 0.0
-    total_count = 0
-    alignment_losses: List[float] = []
-    spearmans: List[float] = []
-    kendalls: List[float] = []
-    alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
-        loader, "ecfp_latent_alignment", None
+    return EpochMetrics(
+        objective_loss=float(sum(objective_terms)) if objective_terms else math.nan,
+        descriptor_loss=descriptor_loss_value,
+        rmse=math.sqrt(descriptor_loss_value)
+        if not is_training and math.isfinite(descriptor_loss_value)
+        else math.nan,
+        alignment_loss=alignment_loss_value,
+        alignment_spearman=float(np.mean(spearmans)) if spearmans else math.nan,
+        alignment_kendall=float(np.mean(kendalls)) if kendalls else math.nan,
     )
 
-    for batch in loader:
-        batch = batch.to(device)
-        targets = batch.y
-        valid_mask = batch.y_mask.bool()
-
-        if alignment_cfg is not None:
-            pred, _, z = model(
-                batch.x,
-                batch.edge_index,
-                batch.edge_attr,
-                batch=batch.batch,
-                zero_var=True,
-                return_latent=True,
-            )
-            alignment_loss, d_fp, d_z = compute_alignment_batch(
-                batch,
-                z,
-                alignment_cfg,
-                deterministic_pairs=True,
-            )
-            has_alignment_pairs = isinstance(d_fp, torch.Tensor) and d_fp.numel() > 0
-            if has_alignment_pairs:
-                alignment_losses.append(alignment_loss.item())
-            if has_alignment_pairs and alignment_cfg.log_rank_metrics:
-                spearman, kendall = compute_alignment_metrics(d_fp, d_z)
-                if math.isfinite(spearman):
-                    spearmans.append(spearman)
-                if math.isfinite(kendall):
-                    kendalls.append(kendall)
-        else:
-            pred, _ = model(
-                batch.x, batch.edge_index, batch.edge_attr,
-                batch=batch.batch, zero_var=True,
-            )
-
-        if valid_mask.sum() == 0:
-            continue
-
-        se = (pred[valid_mask] - targets[valid_mask]).pow(2).sum().item()
-        total_se += se
-        total_count += valid_mask.sum().item()
-
-    descriptor_loss = math.nan
-    rmse = math.nan
-    if total_count > 0:
-        descriptor_loss = total_se / total_count
-        rmse = math.sqrt(descriptor_loss)
-
-    alignment_loss = float(np.mean(alignment_losses)) if alignment_losses else math.nan
-    objective_terms: list[float] = []
-    if math.isfinite(descriptor_loss):
-        objective_terms.append(descriptor_loss * descriptor_loss_weight)
-    if math.isfinite(alignment_loss) and alignment_cfg is not None:
-        objective_terms.append(alignment_loss * alignment_cfg.weight)
-    objective_loss = float(sum(objective_terms)) if objective_terms else math.nan
-
-    return (
-        objective_loss,
-        descriptor_loss,
-        rmse,
-        alignment_loss,
-        float(np.mean(spearmans)) if spearmans else math.nan,
-        float(np.mean(kendalls)) if kendalls else math.nan,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Dataset construction
-# ---------------------------------------------------------------------------
 
 def _build_pyg_dataset(
-    smiles_list: List[str],
+    smiles_list: list[str],
     descriptor_values: np.ndarray,
     validity_mask: np.ndarray,
-    fingerprint_bits: Optional[np.ndarray] = None,
+    fingerprint_bits: np.ndarray | None = None,
 ) -> list:
-    """Build PyG Data objects with graph features + descriptor targets.
-
-    Uses ``get_tensor_data`` from gt-pyg for graph featurisation, then
-    overwrites ``data.y`` and ``data.y_mask`` with descriptor targets.
-    """
+    """Build PyG Data objects with graph features + descriptor targets."""
     from gt_pyg import get_tensor_data
 
     logger.info("Building PyG graph features for %d molecules …", len(smiles_list))
     data_list = get_tensor_data(smiles_list, y=None)
-
-    # Overwrite y and y_mask with actual descriptor data.
-    # Store as [1, D] so that PyG batching concatenates to [B, D]
-    # (matching the stacking behavior of data.y).
-    for i, data in enumerate(data_list):
-        data.y = torch.tensor(descriptor_values[i], dtype=torch.float32).unsqueeze(0)
-        data.y_mask = torch.tensor(validity_mask[i], dtype=torch.float32).unsqueeze(0)
+    for index, data in enumerate(data_list):
+        data.y = torch.tensor(descriptor_values[index], dtype=torch.float32).unsqueeze(0)
+        data.y_mask = torch.tensor(validity_mask[index], dtype=torch.float32).unsqueeze(0)
         if fingerprint_bits is not None:
-            data.ecfp = torch.tensor(fingerprint_bits[i], dtype=torch.bool).unsqueeze(0)
-
+            data.ecfp = torch.tensor(fingerprint_bits[index], dtype=torch.bool).unsqueeze(0)
     return data_list
 
 
-def _canonicalize_parent_smiles(parent_smiles: List[str]) -> List[str]:
-    """Canonicalize and deduplicate parent SMILES before splitting."""
-    canonical_smiles: List[str] = []
+def _prepare_parent_smiles(parent_smiles: list[str]) -> list[str]:
+    """Drop invalid parents, canonicalize valid ones, and deduplicate synonyms."""
+    canonical_smiles: list[str] = []
     seen_smiles: set[str] = set()
+    n_filtered = 0
     n_collapsed = 0
 
-    for smi in parent_smiles:
-        canonical_smi = smi
-        mol = Chem.MolFromSmiles(smi)
-        if mol is not None:
-            try:
-                Chem.SanitizeMol(mol)
-                canonical_smi = Chem.MolToSmiles(mol, canonical=True)
-            except Exception:
-                canonical_smi = smi
-
-        if canonical_smi in seen_smiles:
+    for smiles in parent_smiles:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            logger.debug("Filtered unparseable SMILES: %s", smiles)
+            n_filtered += 1
+            continue
+        try:
+            Chem.SanitizeMol(mol)
+            canonical_smiles_value = Chem.MolToSmiles(mol, canonical=True)
+        except Exception:
+            logger.debug("Filtered invalid SMILES: %s", smiles)
+            n_filtered += 1
+            continue
+        if canonical_smiles_value in seen_smiles:
             n_collapsed += 1
             continue
+        seen_smiles.add(canonical_smiles_value)
+        canonical_smiles.append(canonical_smiles_value)
 
-        seen_smiles.add(canonical_smi)
-        canonical_smiles.append(canonical_smi)
-
+    if n_filtered:
+        logger.info(
+            "Filtered %d invalid SMILES (%d remain)",
+            n_filtered,
+            len(parent_smiles) - n_filtered,
+        )
     if n_collapsed:
         logger.info(
             "Collapsed %d duplicate/synonymous parent SMILES before splitting",
             n_collapsed,
         )
-
     return canonical_smiles
 
 
 def _expand_smiles_within_split(
-    parent_smiles: List[str],
+    parent_smiles: list[str],
     config: PretrainConfig,
     seen_smiles: set[str],
-) -> List[str]:
-    """Expand parent SMILES within a single split and deduplicate across splits."""
+) -> list[str]:
+    """Expand parent SMILES within one split and deduplicate across splits."""
     if not parent_smiles:
         return []
 
-    if config.isoforms.enabled:
-        iso_map = enumerate_isoforms_batch(parent_smiles, config.isoforms)
-        split_smiles: List[str] = []
-        for parent_smi in parent_smiles:
-            for smi in iso_map[parent_smi]:
-                if smi not in seen_smiles:
-                    seen_smiles.add(smi)
-                    split_smiles.append(smi)
-        return split_smiles
-
-    split_smiles = []
-    for smi in parent_smiles:
-        if smi not in seen_smiles:
-            seen_smiles.add(smi)
-            split_smiles.append(smi)
+    expanded = (
+        enumerate_isoforms_batch(parent_smiles, config.isoforms)
+        if config.isoforms.enabled
+        else {smiles: [smiles] for smiles in parent_smiles}
+    )
+    split_smiles: list[str] = []
+    for parent_smiles_value in parent_smiles:
+        for smiles in expanded[parent_smiles_value]:
+            if smiles in seen_smiles:
+                continue
+            seen_smiles.add(smiles)
+            split_smiles.append(smiles)
     return split_smiles
 
 
-def _prepare_split_smiles(
-    parent_smiles: List[str],
-    config: PretrainConfig,
-) -> Tuple[List[str], np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    """Split parent molecules first, then expand isoforms within each split."""
-    parent_smiles = _canonicalize_parent_smiles(parent_smiles)
-    parent_splits = split_data(len(parent_smiles), config.split_ratios, seed=config.seed)
-
-    if len(parent_splits) == 3:
-        parent_train_idx, parent_val_idx, parent_test_idx = parent_splits
-    else:
-        parent_train_idx, parent_val_idx = parent_splits
-        parent_test_idx = None
-
-    train_parents = [parent_smiles[i] for i in parent_train_idx]
-    val_parents = [parent_smiles[i] for i in parent_val_idx]
-    test_parents = [parent_smiles[i] for i in parent_test_idx] if parent_test_idx is not None else []
-
+def _log_split_sizes(label: str, splits: dict[str, list[str]], *, has_test: bool) -> None:
     logger.info(
-        "Parent split: train=%d  val=%d%s",
-        len(train_parents),
-        len(val_parents),
-        f"  test={len(test_parents)}" if parent_test_idx is not None else "  (no test)",
+        "%s split: train=%d  val=%d%s",
+        label,
+        len(splits["train"]),
+        len(splits["val"]),
+        f"  test={len(splits['test'])}" if has_test else "  (no test)",
     )
 
-    seen_smiles: set[str] = set()
-    train_smiles = _expand_smiles_within_split(train_parents, config, seen_smiles)
-    val_smiles = _expand_smiles_within_split(val_parents, config, seen_smiles)
-    test_smiles = _expand_smiles_within_split(test_parents, config, seen_smiles)
 
-    if not train_smiles or not val_smiles or (parent_test_idx is not None and not test_smiles):
+def _prepare_split_smiles(
+    parent_smiles: list[str],
+    config: PretrainConfig,
+) -> tuple[list[str], SplitIndices]:
+    """Split parent molecules first, then expand isoforms within each split."""
+    parent_smiles = _prepare_parent_smiles(parent_smiles)
+    parent_splits = split_data(len(parent_smiles), config.split_ratios, seed=config.seed)
+    split_parent_indices: SplitIndices = {
+        "train": parent_splits[0],
+        "val": parent_splits[1],
+        "test": parent_splits[2] if len(parent_splits) == 3 else None,
+    }
+    has_test = split_parent_indices["test"] is not None
+    split_parents = {
+        name: [parent_smiles[index] for index in indices]
+        if indices is not None
+        else []
+        for name, indices in split_parent_indices.items()
+    }
+    _log_split_sizes("Parent", split_parents, has_test=has_test)
+
+    seen_smiles: set[str] = set()
+    split_smiles = {
+        name: _expand_smiles_within_split(split_parents[name], config, seen_smiles)
+        for name in _SPLIT_NAMES
+    }
+    if not split_smiles["train"] or not split_smiles["val"] or (
+        has_test and not split_smiles["test"]
+    ):
         raise ValueError(
             "One or more data splits became empty after parent-level splitting and "
             "within-split isoform deduplication. Increase dataset size, adjust "
             "split ratios, or disable aggressive subsampling."
         )
+    _log_split_sizes("Expanded", split_smiles, has_test=has_test)
 
-    all_smiles = train_smiles + val_smiles + test_smiles
-    train_idx = np.arange(0, len(train_smiles))
-    val_idx = np.arange(len(train_smiles), len(train_smiles) + len(val_smiles))
-    test_idx = (
-        np.arange(len(train_smiles) + len(val_smiles), len(all_smiles))
-        if parent_test_idx is not None
-        else None
-    )
+    all_smiles: list[str] = []
+    split_indices: SplitIndices = {}
+    for name in _SPLIT_NAMES:
+        if split_parent_indices[name] is None:
+            split_indices[name] = None
+            continue
+        start = len(all_smiles)
+        all_smiles.extend(split_smiles[name])
+        split_indices[name] = np.arange(start, len(all_smiles))
+    return all_smiles, split_indices
 
-    logger.info(
-        "Expanded split: train=%d  val=%d%s",
-        len(train_smiles),
-        len(val_smiles),
-        f"  test={len(test_smiles)}" if test_idx is not None else "  (no test)",
-    )
 
-    return all_smiles, train_idx, val_idx, test_idx
+def _build_split_datasets(
+    smiles_list: list[str],
+    descriptor_values: np.ndarray,
+    validity_mask: np.ndarray,
+    split_indices: SplitIndices,
+    fingerprint_bits: np.ndarray | None = None,
+) -> dict[str, list]:
+    datasets: dict[str, list] = {}
+    for name, indices in split_indices.items():
+        if indices is None:
+            continue
+        datasets[name] = _build_pyg_dataset(
+            [smiles_list[index] for index in indices],
+            descriptor_values[indices],
+            validity_mask[indices],
+            fingerprint_bits=fingerprint_bits[indices] if fingerprint_bits is not None else None,
+        )
+    return datasets
+
+
+def _make_split_loaders(
+    datasets: dict[str, list],
+    config: PretrainConfig,
+    alignment_cfg: ECFPLatentAlignmentConfig,
+) -> dict[str, object]:
+    loaders: dict[str, object] = {}
+    for name, dataset in datasets.items():
+        loader = make_loader(
+            dataset,
+            config.batch_size,
+            shuffle=name == "train",
+            num_workers=config.num_workers,
+        )
+        loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
+        loaders[name] = loader
+    return loaders
 
 
 def _validate_training_batch_configuration(
@@ -486,9 +440,7 @@ def _validate_training_batch_configuration(
     config: PretrainConfig,
 ) -> None:
     """Reject batch-norm training setups that would create singleton batches."""
-    if config.model.norm.lower() not in _BATCH_NORM_NAMES:
-        return
-    if train_size == 0:
+    if config.model.norm.lower() not in _BATCH_NORM_NAMES or train_size == 0:
         return
 
     singleton_final_batch = config.batch_size == 1 or train_size % config.batch_size == 1
@@ -517,27 +469,34 @@ def _validate_training_batch_configuration(
     )
 
 
+def _checkpoint_extra(
+    config: PretrainConfig,
+    scaler: NaNAwareStandardScaler,
+    descriptor_names: list[str],
+    num_descriptors: int,
+    split_indices: SplitIndices,
+) -> dict[str, object]:
+    return {
+        "scaler_state": scaler.state_dict(),
+        "descriptor_names": descriptor_names,
+        "descriptor_count": num_descriptors,
+        "config": asdict(config),
+        "library_versions": _checkpoint_library_versions(),
+        "split_indices": {
+            name: indices.tolist() if indices is not None else None
+            for name, indices in split_indices.items()
+        },
+    }
+
+
 def pretrain(
     smiles_path: str,
     config: PretrainConfig,
     output_dir: str,
-    subsample: Optional[float] = None,
+    subsample: float | None = None,
     verbose: bool = False,
 ) -> Path:
-    """Full pretraining pipeline.
-
-    Args:
-        smiles_path: Path to SMILES file (``.smi`` or ``.csv``).
-        config: Resolved ``PretrainConfig``.
-        output_dir: Directory for checkpoints, logs, metrics.
-        subsample: If set, randomly subsample this fraction of SMILES
-            before processing (e.g. 0.1 for 10%). Explicit function
-            arguments override ``config.subsample`` and must be in ``(0, 1]``.
-        verbose: If True, show DEBUG-level logs on console.
-
-    Returns:
-        Path to the best checkpoint file.
-    """
+    """Full pretraining pipeline."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     for artifact_name in (
@@ -551,12 +510,14 @@ def pretrain(
             artifact_path.unlink()
     _setup_logging(output_dir, verbose=verbose)
 
-    # Log library versions when verbose
     if verbose:
         try:
-            import rdkit
             import gypsum_dl
-            logger.debug("rdkit %s, gypsum_dl %s", rdkit.__version__, gypsum_dl.__version__)
+            import rdkit
+
+            logger.debug(
+                "rdkit %s, gypsum_dl %s", rdkit.__version__, gypsum_dl.__version__
+            )
         except Exception:
             pass
 
@@ -568,209 +529,140 @@ def pretrain(
     resolved_config = replace(config, subsample=effective_subsample)
     validate_pretrain_config(resolved_config)
 
-    if config.max_epochs > 0 and config.warmup_epochs >= config.max_epochs:
+    if resolved_config.warmup_epochs >= resolved_config.max_epochs:
         logger.warning(
             "warmup_epochs (%d) >= max_epochs (%d): model will only warm up, never decay",
-            config.warmup_epochs, config.max_epochs,
+            resolved_config.warmup_epochs,
+            resolved_config.max_epochs,
         )
 
-    # Save resolved config (convert tuples to lists for safe_load compatibility)
-    config_dict = json.loads(json.dumps(asdict(resolved_config)))
-    with open(output_dir / "resolved_config.yaml", "w") as f:
-        yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+    with open(output_dir / "resolved_config.yaml", "w") as handle:
+        yaml.dump(
+            json.loads(json.dumps(asdict(resolved_config))),
+            handle,
+            default_flow_style=False,
+            sort_keys=False,
+        )
 
-    # ------------------------------------------------------------------
-    # 1. Load SMILES
-    # ------------------------------------------------------------------
     smiles_list = load_smiles(smiles_path)
     logger.info("Loaded %d SMILES from %s", len(smiles_list), smiles_path)
-
     if effective_subsample is not None and 0 < effective_subsample < 1:
         rng = np.random.RandomState(config.seed)
-        n_sub = max(1, int(len(smiles_list) * effective_subsample))
-        indices = rng.choice(len(smiles_list), size=n_sub, replace=False)
-        smiles_list = [smiles_list[i] for i in sorted(indices)]
+        n_subsampled = max(1, int(len(smiles_list) * effective_subsample))
+        indices = rng.choice(len(smiles_list), size=n_subsampled, replace=False)
+        smiles_list = [smiles_list[index] for index in sorted(indices)]
         logger.info(
             "Subsampled to %d SMILES (%.1f%%)",
             len(smiles_list),
             effective_subsample * 100,
         )
 
-    # ------------------------------------------------------------------
-    # 2. Filter invalid parent SMILES before splitting
-    # ------------------------------------------------------------------
-    valid_smiles = []
-    for smi in smiles_list:
-        mol = Chem.MolFromSmiles(smi)
-        if mol is not None:
-            try:
-                Chem.SanitizeMol(mol)
-                valid_smiles.append(smi)
-            except Exception:
-                logger.debug("Filtered invalid SMILES: %s", smi)
-        else:
-            logger.debug("Filtered unparseable SMILES: %s", smi)
-    n_filtered = len(smiles_list) - len(valid_smiles)
-    if n_filtered > 0:
-        logger.info("Filtered %d invalid SMILES (%d remain)", n_filtered, len(valid_smiles))
-    smiles_list = valid_smiles
+    smiles_list, split_indices = _prepare_split_smiles(smiles_list, config)
+    train_idx = split_indices["train"]
+    val_idx = split_indices["val"]
+    assert train_idx is not None and val_idx is not None
 
-    # ------------------------------------------------------------------
-    # 3. Split parents first, then expand isoforms within each split
-    # ------------------------------------------------------------------
-    smiles_list, train_idx, val_idx, test_idx = _prepare_split_smiles(smiles_list, config)
-
-    # ------------------------------------------------------------------
-    # 4. Compute descriptor targets
-    # ------------------------------------------------------------------
     logger.info(
         "Computing descriptor targets (2D=%s, 3D=%s) …",
         config.descriptors.include_2d_targets,
         config.descriptors.include_3d_targets,
     )
-    desc_values, desc_valid, descriptor_names = compute_descriptor_targets(
+    descriptor_values, descriptor_validity, descriptor_names = compute_descriptor_targets(
         smiles_list,
         config.descriptors,
         config.conformers,
         seed=config.seed,
     )
+    num_descriptors = descriptor_values.shape[1]
+    logger.info(
+        "Descriptor matrix: %d molecules × %d descriptors",
+        descriptor_values.shape[0],
+        num_descriptors,
+    )
 
-    num_descriptors = desc_values.shape[1]
-    logger.info("Descriptor matrix: %d molecules × %d descriptors", desc_values.shape[0], num_descriptors)
-
-    fp_bits = None
     alignment_cfg = config.ecfp_latent_alignment
+    fingerprint_bits = None
     if alignment_cfg.enabled:
-        fp_bits = compute_fingerprints(smiles_list, alignment_cfg)
+        fingerprint_bits = compute_fingerprints(smiles_list, alignment_cfg)
         logger.info(
             "Fingerprint matrix: %d molecules × %d bits",
-            fp_bits.shape[0],
-            fp_bits.shape[1],
+            fingerprint_bits.shape[0],
+            fingerprint_bits.shape[1],
         )
 
-    # ------------------------------------------------------------------
-    # 5. Fit scaler on TRAIN only
-    # ------------------------------------------------------------------
     scaler = NaNAwareStandardScaler(winsorize_range=config.winsorize_range)
-    scaler.fit(desc_values[train_idx], desc_valid[train_idx])
+    scaler.fit(descriptor_values[train_idx], descriptor_validity[train_idx])
     logger.info("Scaler fit on train split (%d samples)", len(train_idx))
+    descriptor_values = scaler.transform(descriptor_values)
 
-    # ------------------------------------------------------------------
-    # 6. Transform all splits
-    # ------------------------------------------------------------------
-    desc_values = scaler.transform(desc_values)
-
-    # ------------------------------------------------------------------
-    # 7. Build PyG datasets
-    # ------------------------------------------------------------------
-    train_smiles = [smiles_list[i] for i in train_idx]
-    val_smiles = [smiles_list[i] for i in val_idx]
-    train_fp = fp_bits[train_idx] if fp_bits is not None else None
-    val_fp = fp_bits[val_idx] if fp_bits is not None else None
-
-    train_data = _build_pyg_dataset(
-        train_smiles,
-        desc_values[train_idx],
-        desc_valid[train_idx],
-        fingerprint_bits=train_fp,
+    datasets = _build_split_datasets(
+        smiles_list,
+        descriptor_values,
+        descriptor_validity,
+        split_indices,
+        fingerprint_bits=fingerprint_bits,
     )
-    _validate_training_batch_configuration(len(train_data), config)
-    val_data = _build_pyg_dataset(
-        val_smiles,
-        desc_values[val_idx],
-        desc_valid[val_idx],
-        fingerprint_bits=val_fp,
-    )
+    _validate_training_batch_configuration(len(datasets["train"]), config)
+    loaders = _make_split_loaders(datasets, config, alignment_cfg)
 
-    test_data = None
-    if test_idx is not None:
-        test_smiles = [smiles_list[i] for i in test_idx]
-        test_fp = fp_bits[test_idx] if fp_bits is not None else None
-        test_data = _build_pyg_dataset(
-            test_smiles,
-            desc_values[test_idx],
-            desc_valid[test_idx],
-            fingerprint_bits=test_fp,
-        )
-
-    # ------------------------------------------------------------------
-    # 8. Create model
-    # ------------------------------------------------------------------
     from gt_pyg import GraphTransformerNet
     from gt_pyg.data import get_atom_feature_dim, get_bond_feature_dim
 
-    mc = config.model
+    model_config = config.model
     gt_params = inspect.signature(GraphTransformerNet.__init__).parameters
-    model_kwargs = dict(
-        node_dim_in=get_atom_feature_dim(),
-        edge_dim_in=get_bond_feature_dim(),
-        num_gt_layers=mc.num_gt_layers,
-        hidden_dim=mc.hidden_dim,
-        num_heads=mc.num_heads,
-        norm=mc.norm,
-        gt_aggregators=mc.gt_aggregators,
-        aggregators=mc.aggregators,
-        dropout=mc.dropout,
-        act=mc.act,
-        gate=mc.gate,
-        qkv_bias=mc.qkv_bias,
-        num_tasks=num_descriptors,
-        num_head_layers=mc.num_head_layers,
-        head_norm=mc.head_norm,
-        head_residual=mc.head_residual,
-    )
-    if mc.head_dropout is not None:
+    model_kwargs = {
+        "node_dim_in": get_atom_feature_dim(),
+        "edge_dim_in": get_bond_feature_dim(),
+        "num_gt_layers": model_config.num_gt_layers,
+        "hidden_dim": model_config.hidden_dim,
+        "num_heads": model_config.num_heads,
+        "norm": model_config.norm,
+        "gt_aggregators": model_config.gt_aggregators,
+        "aggregators": model_config.aggregators,
+        "dropout": model_config.dropout,
+        "act": model_config.act,
+        "gate": model_config.gate,
+        "qkv_bias": model_config.qkv_bias,
+        "num_tasks": num_descriptors,
+        "num_head_layers": model_config.num_head_layers,
+        "head_norm": model_config.head_norm,
+        "head_residual": model_config.head_residual,
+    }
+    if model_config.head_dropout is not None:
         if "head_dropout" not in gt_params:
             raise RuntimeError(
                 "model.head_dropout is set, but the installed gt-pyg "
                 "GraphTransformerNet does not accept head_dropout."
             )
-        model_kwargs["head_dropout"] = mc.head_dropout
+        model_kwargs["head_dropout"] = model_config.head_dropout
+
     model = GraphTransformerNet(**model_kwargs).to(device)
-    if alignment_cfg.enabled and "return_latent" not in inspect.signature(model.forward).parameters:
+    if alignment_cfg.enabled and "return_latent" not in inspect.signature(
+        model.forward
+    ).parameters:
         raise RuntimeError(
             "ECFP-latent alignment requires gt-pyg with "
             "GraphTransformerNet.forward(..., return_latent=True)."
         )
-
-    n_params = model.num_parameters()
-    logger.info("Model: %d trainable parameters, num_tasks=%d", n_params, num_descriptors)
-
-    # ------------------------------------------------------------------
-    # 9. Optimizer + LR scheduler
-    # ------------------------------------------------------------------
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.lr, weight_decay=config.weight_decay,
+    logger.info(
+        "Model: %d trainable parameters, num_tasks=%d",
+        model.num_parameters(),
+        num_descriptors,
     )
-    scheduler = _make_warmup_cosine_scheduler(optimizer, config.warmup_epochs, config.max_epochs)
 
-    # ------------------------------------------------------------------
-    # 9b. Tracking state
-    # ------------------------------------------------------------------
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+    )
+    scheduler = _make_warmup_cosine_scheduler(
+        optimizer, config.warmup_epochs, config.max_epochs
+    )
+
     best_val_objective = float("inf")
     best_epoch = -1
-
-    train_loader = make_loader(
-        train_data,
-        config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-    )
-    val_loader = make_loader(
-        val_data,
-        config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-    )
-    train_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
-    val_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
-
-    # ------------------------------------------------------------------
-    # 10. Metrics CSV + Training loop
-    # ------------------------------------------------------------------
     patience_counter = 0
     start_time = time.time()
-
     best_ckpt_path = output_dir / "best_checkpoint.pt"
     last_ckpt_path = output_dir / "last_checkpoint.pt"
     metrics_path = output_dir / "metrics.csv"
@@ -778,25 +670,40 @@ def pretrain(
     last_completed_epoch: int | None = None
     last_saved_epoch: int | None = None
 
+    def _save_checkpoint(
+        path: Path,
+        *,
+        epoch: int,
+        best_metric: float | None,
+    ) -> None:
+        model.save_checkpoint(
+            path=path,
+            epoch=epoch,
+            best_metric=best_metric,
+            extra=_checkpoint_extra(
+                resolved_config,
+                scaler,
+                descriptor_names,
+                num_descriptors,
+                split_indices,
+            ),
+        )
+
     def _save_last_checkpoint(epoch_to_save: int) -> None:
         nonlocal last_saved_epoch
         _save_checkpoint(
-            model,
             last_ckpt_path,
             epoch=epoch_to_save,
             best_metric=best_val_objective if math.isfinite(best_val_objective) else None,
-            config=resolved_config,
-            scaler=scaler,
-            descriptor_names=descriptor_names,
-            num_descriptors=num_descriptors,
-            train_idx=train_idx,
-            val_idx=val_idx,
-            test_idx=test_idx,
         )
         last_saved_epoch = epoch_to_save
 
-    logger.info("Starting training: max_epochs=%d  patience=%d  masking_ratio=%.2f",
-                config.max_epochs, config.patience, config.masking_ratio)
+    logger.info(
+        "Starting training: max_epochs=%d  patience=%d  masking_ratio=%.2f",
+        config.max_epochs,
+        config.patience,
+        config.masking_ratio,
+    )
 
     epoch = 0
     try:
@@ -807,99 +714,82 @@ def pretrain(
 
             for epoch in range(config.max_epochs):
                 lr = scheduler.get_last_lr()[0]
-                (
-                    train_loss,
-                    train_descriptor_loss,
-                    train_alignment_loss,
-                ) = _train_one_epoch(
+                train_metrics = _run_epoch(
                     model,
-                    train_loader,
-                    optimizer,
-                    config.masking_ratio,
+                    loaders["train"],
+                    config.descriptors.loss_weight,
+                    device,
+                    optimizer=optimizer,
+                    masking_ratio=config.masking_ratio,
+                )
+                val_metrics = _run_epoch(
+                    model,
+                    loaders["val"],
                     config.descriptors.loss_weight,
                     device,
                 )
-                (
-                    val_loss,
-                    val_descriptor_loss,
-                    val_rmse,
-                    val_alignment_loss,
-                    val_alignment_spearman,
-                    val_alignment_kendall,
-                ) = _validate(
-                    model,
-                    val_loader,
-                    config.descriptors.loss_weight,
-                    device,
-                )
-                last_val_loss = val_loss
+                last_val_loss = val_metrics.objective_loss
                 last_completed_epoch = epoch
 
-                elapsed = time.time() - start_time
-                row = [
-                    epoch,
-                    f"{train_loss:.6f}",
-                    f"{val_loss:.6f}",
-                    f"{train_descriptor_loss:.6f}",
-                    f"{val_descriptor_loss:.6f}",
-                    f"{val_rmse:.6f}",
-                    f"{lr:.2e}",
-                    f"{elapsed:.1f}",
-                    _format_optional_metric(train_alignment_loss),
-                    _format_optional_metric(val_alignment_loss),
-                    _format_optional_metric(val_alignment_spearman),
-                    _format_optional_metric(val_alignment_kendall),
-                ]
-                metrics_writer.writerow(row)
+                metrics_writer.writerow(
+                    [
+                        epoch,
+                        f"{train_metrics.objective_loss:.6f}",
+                        f"{val_metrics.objective_loss:.6f}",
+                        f"{train_metrics.descriptor_loss:.6f}",
+                        f"{val_metrics.descriptor_loss:.6f}",
+                        f"{val_metrics.rmse:.6f}",
+                        f"{lr:.2e}",
+                        f"{time.time() - start_time:.1f}",
+                        _format_optional_metric(train_metrics.alignment_loss),
+                        _format_optional_metric(val_metrics.alignment_loss),
+                        _format_optional_metric(val_metrics.alignment_spearman),
+                        _format_optional_metric(val_metrics.alignment_kendall),
+                    ]
+                )
                 metrics_file.flush()
 
                 summary_parts = [
-                    f"train_loss={train_loss:.4f}",
-                    f"val_loss={val_loss:.4f}",
-                    f"train_desc={train_descriptor_loss:.4f}",
-                    f"val_desc={val_descriptor_loss:.4f}",
-                    f"val_rmse={val_rmse:.4f}",
+                    f"train_loss={train_metrics.objective_loss:.4f}",
+                    f"val_loss={val_metrics.objective_loss:.4f}",
+                    f"train_desc={train_metrics.descriptor_loss:.4f}",
+                    f"val_desc={val_metrics.descriptor_loss:.4f}",
+                    f"val_rmse={val_metrics.rmse:.4f}",
                     f"lr={lr:.2e}",
                 ]
-                if alignment_cfg.enabled and math.isfinite(train_alignment_loss):
-                    summary_parts.append(f"train_align={train_alignment_loss:.4f}")
-                if alignment_cfg.enabled and math.isfinite(val_alignment_loss):
-                    summary_parts.append(f"val_align={val_alignment_loss:.4f}")
+                if alignment_cfg.enabled and math.isfinite(train_metrics.alignment_loss):
+                    summary_parts.append(f"train_align={train_metrics.alignment_loss:.4f}")
+                if alignment_cfg.enabled and math.isfinite(val_metrics.alignment_loss):
+                    summary_parts.append(f"val_align={val_metrics.alignment_loss:.4f}")
                 logger.info(
                     "Epoch %3d/%d — %s",
                     epoch + 1,
                     config.max_epochs,
                     "  ".join(summary_parts),
                 )
-                if math.isfinite(val_alignment_spearman) or math.isfinite(val_alignment_kendall):
+                if math.isfinite(val_metrics.alignment_spearman) or math.isfinite(
+                    val_metrics.alignment_kendall
+                ):
                     logger.info(
                         "           val_alignment_spearman=%.4f  val_alignment_kendall=%.4f",
-                        val_alignment_spearman,
-                        val_alignment_kendall,
+                        val_metrics.alignment_spearman,
+                        val_metrics.alignment_kendall,
                     )
 
-                # Early stopping
-                if math.isfinite(val_loss) and val_loss < best_val_objective:
-                    best_val_objective = val_loss
+                if math.isfinite(val_metrics.objective_loss) and (
+                    val_metrics.objective_loss < best_val_objective
+                ):
+                    best_val_objective = val_metrics.objective_loss
                     best_epoch = epoch
                     patience_counter = 0
-
-                    # Save best checkpoint
                     _save_checkpoint(
-                        model, best_ckpt_path,
+                        best_ckpt_path,
                         epoch=epoch,
                         best_metric=best_val_objective,
-                        config=resolved_config,
-                        scaler=scaler,
-                        descriptor_names=descriptor_names,
-                        num_descriptors=num_descriptors,
-                        train_idx=train_idx,
-                        val_idx=val_idx,
-                        test_idx=test_idx,
                     )
                     logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
                 else:
-                    if not math.isfinite(val_loss):
+                    if not math.isfinite(val_metrics.objective_loss):
                         logger.warning(
                             "Validation objective is non-finite at epoch %d; skipping best-checkpoint update",
                             epoch + 1,
@@ -907,11 +797,13 @@ def pretrain(
                     patience_counter += 1
 
                 _save_last_checkpoint(epoch)
-
                 if patience_counter >= config.patience:
-                    logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, config.patience)
+                    logger.info(
+                        "Early stopping at epoch %d (patience=%d)",
+                        epoch + 1,
+                        config.patience,
+                    )
                     break
-
                 scheduler.step()
     finally:
         if last_completed_epoch is not None and last_saved_epoch != last_completed_epoch:
@@ -922,22 +814,14 @@ def pretrain(
             "No finite validation improvement was recorded; saving the final model as best_checkpoint.pt"
         )
         best_epoch = epoch
-        _save_checkpoint(
-            model, best_ckpt_path,
-            epoch=epoch,
-            best_metric=(
-                best_val_objective
-                if math.isfinite(best_val_objective)
-                else last_val_loss if math.isfinite(last_val_loss) else math.nan
-            ),
-            config=resolved_config,
-            scaler=scaler,
-            descriptor_names=descriptor_names,
-            num_descriptors=num_descriptors,
-            train_idx=train_idx,
-            val_idx=val_idx,
-            test_idx=test_idx,
+        fallback_metric = (
+            best_val_objective
+            if math.isfinite(best_val_objective)
+            else last_val_loss
+            if math.isfinite(last_val_loss)
+            else math.nan
         )
+        _save_checkpoint(best_ckpt_path, epoch=epoch, best_metric=fallback_metric)
 
     logger.info(
         "Training complete.  Best val_objective=%.4f at epoch %d",
@@ -945,29 +829,10 @@ def pretrain(
         best_epoch + 1 if best_epoch >= 0 else epoch + 1,
     )
 
-    # ------------------------------------------------------------------
-    # 12. Test RMSE (if test split exists)
-    # ------------------------------------------------------------------
-    if test_data is not None and best_ckpt_path.exists():
-        test_loader = make_loader(
-            test_data,
-            config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-        )
-        test_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
-
-        # Load best checkpoint for test evaluation
+    test_loader = loaders.get("test")
+    if test_loader is not None and best_ckpt_path.exists():
         model.load_weights(best_ckpt_path, map_location=device)
-
-        (
-            test_loss,
-            test_descriptor_loss,
-            test_rmse,
-            test_alignment_loss,
-            test_alignment_spearman,
-            test_alignment_kendall,
-        ) = _validate(
+        test_metrics = _run_epoch(
             model,
             test_loader,
             config.descriptors.loss_weight,
@@ -975,25 +840,21 @@ def pretrain(
         )
         logger.info(
             "Test objective loss=%.4f  descriptor_loss=%.4f  rmse=%.4f",
-            test_loss,
-            test_descriptor_loss,
-            test_rmse,
+            test_metrics.objective_loss,
+            test_metrics.descriptor_loss,
+            test_metrics.rmse,
         )
         if alignment_cfg.enabled:
-            logger.info(
-                "Test alignment loss=%.4f",
-                test_alignment_loss,
-            )
-            if math.isfinite(test_alignment_spearman) or math.isfinite(test_alignment_kendall):
+            logger.info("Test alignment loss=%.4f", test_metrics.alignment_loss)
+            if math.isfinite(test_metrics.alignment_spearman) or math.isfinite(
+                test_metrics.alignment_kendall
+            ):
                 logger.info(
                     "Test alignment rank metrics: spearman=%.4f  kendall=%.4f",
-                    test_alignment_spearman,
-                    test_alignment_kendall,
+                    test_metrics.alignment_spearman,
+                    test_metrics.alignment_kendall,
                 )
 
-    # ------------------------------------------------------------------
-    # 13. Generate HTML report
-    # ------------------------------------------------------------------
     try:
         generate_report(output_dir)
     except Exception:
@@ -1001,41 +862,3 @@ def pretrain(
 
     logger.info("Outputs saved to %s", output_dir)
     return best_ckpt_path
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint helper
-# ---------------------------------------------------------------------------
-
-def _save_checkpoint(
-    model: torch.nn.Module,
-    path: Path,
-    *,
-    epoch: int,
-    best_metric: float | None,
-    config: PretrainConfig,
-    scaler: NaNAwareStandardScaler,
-    descriptor_names: List[str],
-    num_descriptors: int,
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
-    test_idx: Optional[np.ndarray],
-) -> None:
-    """Save checkpoint via gt-pyg's model.save_checkpoint()."""
-    model.save_checkpoint(
-        path=path,
-        epoch=epoch,
-        best_metric=best_metric,
-        extra={
-            "scaler_state": scaler.state_dict(),
-            "descriptor_names": descriptor_names,
-            "descriptor_count": num_descriptors,
-            "config": asdict(config),
-            "library_versions": _checkpoint_library_versions(),
-            "split_indices": {
-                "train": train_idx.tolist(),
-                "val": val_idx.tolist(),
-                "test": test_idx.tolist() if test_idx is not None else None,
-            },
-        },
-    )

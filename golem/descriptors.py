@@ -224,48 +224,31 @@ def compute_descriptor_targets(
     if not descriptors.include_2d_targets and not descriptors.include_3d_targets:
         raise ValueError("At least one descriptor target family must be enabled.")
 
-    values_blocks = []
-    mask_blocks = []
-    name_blocks = []
-
+    blocks = []
     if descriptors.include_2d_targets:
-        values_2d, mask_2d, names_2d = compute_mordred_descriptors(smiles_list)
-        values_blocks.append(values_2d)
-        mask_blocks.append(mask_2d)
-        name_blocks.append(names_2d)
-
+        blocks.append(compute_mordred_descriptors(smiles_list))
     if descriptors.include_3d_targets:
-        values_3d, mask_3d, names_3d = compute_3d_descriptors(
-            smiles_list,
-            descriptors.three_d_settings,
-            conformers,
-            seed=seed,
-        )
-        values_blocks.append(values_3d)
-        mask_blocks.append(mask_3d)
-        name_blocks.append(names_3d)
-
-    if len(values_blocks) == 1:
-        values, mask, names = values_blocks[0], mask_blocks[0], name_blocks[0]
-        if values.shape[1] == 0:
-            raise ValueError(
-                "No valid descriptor targets remained after dropping all-invalid columns."
+        blocks.append(
+            compute_3d_descriptors(
+                smiles_list,
+                descriptors.three_d_settings,
+                conformers,
+                seed=seed,
             )
-        return values, mask, names
+        )
 
-    values = np.concatenate(values_blocks, axis=1)
-    masks = np.concatenate(mask_blocks, axis=1)
-    names = [name for block in name_blocks for name in block]
+    if len(blocks) == 1:
+        values, masks, names = blocks[0]
+    else:
+        values = np.concatenate([block[0] for block in blocks], axis=1)
+        masks = np.concatenate([block[1] for block in blocks], axis=1)
+        names = [name for _, _, block_names in blocks for name in block_names]
+
     if values.shape[1] == 0:
         raise ValueError(
             "No valid descriptor targets remained after dropping all-invalid columns."
         )
-
-    return (
-        values,
-        masks,
-        names,
-    )
+    return values, masks, names
 
 
 # ---------------------------------------------------------------------------
