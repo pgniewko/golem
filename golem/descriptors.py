@@ -306,21 +306,38 @@ class NaNAwareStandardScaler:
         Returns:
             self (for chaining).
         """
-        # Work with float64 for numerical stability
-        X_masked = np.where(validity_mask, X.astype(np.float64), np.nan)
+        # Work with float64 for numerical stability and compute statistics
+        # only over valid entries to avoid expected RuntimeWarnings for
+        # all-invalid columns.
+        X64 = X.astype(np.float64, copy=False)
+        valid = validity_mask.astype(bool, copy=False)
+        valid_count = valid.sum(axis=0)
+        masked_values = np.where(valid, X64, 0.0)
 
-        self.mean_ = np.nanmean(X_masked, axis=0)
-        self.std_ = np.nanstd(X_masked, axis=0)
+        self.mean_ = np.divide(
+            masked_values.sum(axis=0),
+            valid_count,
+            out=np.zeros(X64.shape[1], dtype=np.float64),
+            where=valid_count > 0,
+        )
+        centered = np.where(valid, X64 - self.mean_, 0.0)
+        self.std_ = np.sqrt(
+            np.divide(
+                np.square(centered).sum(axis=0),
+                valid_count,
+                out=np.ones(X64.shape[1], dtype=np.float64),
+                where=valid_count > 0,
+            )
+        )
 
-        # Guard against all-NaN columns (nanmean/nanstd return NaN)
-        nan_mean = np.isnan(self.mean_)
-        if nan_mean.any():
+        all_invalid = valid_count == 0
+        if all_invalid.any():
             logger.info(
                 "Setting mean=0.0, std=1.0 for %d all-NaN descriptors in train",
-                nan_mean.sum(),
+                all_invalid.sum(),
             )
-            self.mean_[nan_mean] = 0.0
-            self.std_[nan_mean] = 1.0
+            self.mean_[all_invalid] = 0.0
+            self.std_[all_invalid] = 1.0
 
         # Guard against zero-std (constant columns): replace with 1.0
         zero_std = self.std_ < 1e-12

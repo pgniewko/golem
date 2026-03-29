@@ -1,5 +1,7 @@
 """Tests for golem.descriptors."""
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -7,6 +9,26 @@ from golem.descriptors import (
     NaNAwareStandardScaler,
     compute_mordred_descriptors,
 )
+
+
+def _reference_fit_stats(X: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Reference the old nanmean/nanstd implementation exactly."""
+    X_masked = np.where(mask, X.astype(np.float64), np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mean = np.nanmean(X_masked, axis=0)
+        std = np.nanstd(X_masked, axis=0)
+
+    nan_mean = np.isnan(mean)
+    if nan_mean.any():
+        mean[nan_mean] = 0.0
+        std[nan_mean] = 1.0
+
+    zero_std = std < 1e-12
+    if zero_std.any():
+        std[zero_std] = 1.0
+
+    return mean, std
 
 
 class TestComputeMordredDescriptors:
@@ -113,3 +135,39 @@ class TestNaNAwareStandardScaler:
         scaler = NaNAwareStandardScaler()
         with pytest.raises(RuntimeError, match="not been fit"):
             scaler.transform(np.zeros((2, 3)))
+
+    def test_all_invalid_column_does_not_emit_runtime_warning(self):
+        """All-invalid columns should be handled without numpy RuntimeWarnings."""
+        X = np.array([[1.0, 0.0], [3.0, 0.0]], dtype=np.float32)
+        mask = np.array([[True, False], [True, False]], dtype=bool)
+        scaler = NaNAwareStandardScaler()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            scaler.fit(X, mask)
+
+        np.testing.assert_allclose(scaler.mean_, np.array([2.0, 0.0]))
+        np.testing.assert_allclose(scaler.std_, np.array([1.0, 1.0]))
+
+    def test_fit_and_transform_match_old_nanmean_nanstd_logic(self):
+        """New stats path must match the old masking semantics exactly."""
+        rng = np.random.RandomState(123)
+        X = rng.randn(40, 8).astype(np.float32)
+        mask = rng.rand(40, 8) > 0.25
+
+        # Cover the failure/missing-feature edge cases explicitly.
+        mask[:, 1] = False              # all-invalid column
+        X[:, 2] = 7.0                   # constant valid column
+        mask[:, 2] = True
+        X[~mask] = 0.0
+
+        scaler = NaNAwareStandardScaler(winsorize_range=(-4.0, 5.0))
+        scaler.fit(X, mask)
+
+        ref_mean, ref_std = _reference_fit_stats(X, mask)
+        np.testing.assert_allclose(scaler.mean_, ref_mean, atol=1e-12, rtol=0.0)
+        np.testing.assert_allclose(scaler.std_, ref_std, atol=1e-12, rtol=0.0)
+
+        expected = np.clip((X.astype(np.float64) - ref_mean) / ref_std, -4.0, 5.0).astype(np.float32)
+        actual = scaler.transform(X)
+        np.testing.assert_array_equal(actual, expected)

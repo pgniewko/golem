@@ -1,8 +1,12 @@
 """Tests for golem.pretrain and golem.config."""
 
+import sys
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
+import yaml
 
 from golem.config import (
     PretrainConfig,
@@ -16,6 +20,7 @@ from golem.pretrain import (
     _save_checkpoint,
     _train_one_epoch,
     _validate,
+    pretrain,
 )
 from golem.utils import load_smiles, seed_everything, split_data
 
@@ -30,6 +35,8 @@ class TestConfig:
         assert cfg.batch_size == 128
         assert cfg.model.hidden_dim == 128
         assert cfg.isoforms.enabled is True
+        assert cfg.num_workers == 0
+        assert cfg.subsample is None
 
     def test_load_config_defaults_only(self):
         """load_config with no args should return defaults."""
@@ -39,9 +46,11 @@ class TestConfig:
 
     def test_load_config_cli_overrides(self):
         """CLI overrides should take precedence."""
-        cfg = load_config(max_epochs=10, seed=123)
+        cfg = load_config(max_epochs=10, seed=123, num_workers=2, subsample=0.25)
         assert cfg.max_epochs == 10
         assert cfg.seed == 123
+        assert cfg.num_workers == 2
+        assert cfg.subsample == 0.25
 
     def test_load_config_yaml(self, tmp_path):
         """YAML loading should work."""
@@ -186,6 +195,147 @@ class TestLoadSmiles:
         txt_file.write_text("c1ccccc1\n")
         with pytest.raises(ValueError, match="Unsupported"):
             load_smiles(str(txt_file))
+
+
+class TestResolvedConfig:
+    def test_pretrain_writes_effective_subsample_to_resolved_config(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        smiles_file = tmp_path / "mols.smi"
+        smiles_file.write_text(
+            "\n".join(
+                [
+                    "C",
+                    "CC",
+                    "CCC",
+                    "CCCC",
+                    "CCO",
+                    "CCN",
+                    "CCCl",
+                    "c1ccccc1",
+                    "O",
+                    "N",
+                ]
+            )
+            + "\n"
+        )
+
+        cfg = PretrainConfig()
+        cfg.isoforms.enabled = False
+        cfg.subsample = 0.5
+
+        def stop_after_config(*args, **kwargs):
+            raise RuntimeError("stop after config write")
+
+        monkeypatch.setattr("golem.pretrain.compute_descriptor_targets", stop_after_config)
+
+        with pytest.raises(RuntimeError, match="stop after config write"):
+            pretrain(
+                smiles_path=str(smiles_file),
+                config=cfg,
+                output_dir=str(tmp_path / "out"),
+            )
+
+        resolved = yaml.safe_load((tmp_path / "out" / "resolved_config.yaml").read_text())
+        assert resolved["subsample"] == pytest.approx(0.5)
+
+    def test_pretrain_writes_last_checkpoint_each_run(self, monkeypatch, tmp_path):
+        smiles = ["CCO", "CCN", "CCC", "CCCl"]
+        desc_values = np.array(
+            [
+                [1.0, 2.0],
+                [2.0, 3.0],
+                [3.0, 4.0],
+                [4.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+        desc_valid = np.ones_like(desc_values, dtype=np.bool_)
+        saved_paths: list[str] = []
+
+        class DummyCheckpointModel(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+                self.prediction = torch.nn.Parameter(
+                    torch.zeros((1, kwargs["num_tasks"]), dtype=torch.float32)
+                )
+
+            def forward(self, x, edge_index, edge_attr, batch, zero_var=False, return_latent=False):
+                pred = self.prediction.expand(x.shape[0], -1)
+                log_var = torch.zeros_like(pred)
+                if return_latent:
+                    return pred, log_var, pred
+                return pred, log_var
+
+            def num_parameters(self):
+                return sum(p.numel() for p in self.parameters())
+
+            def save_checkpoint(self, path, **kwargs):
+                saved_paths.append(str(path))
+                path.write_bytes(b"checkpoint")
+
+            def load_weights(self, path, map_location=None):
+                return None
+
+        cfg = PretrainConfig(max_epochs=1, patience=5, batch_size=2)
+        cfg.isoforms.enabled = False
+
+        monkeypatch.setattr("golem.pretrain.load_smiles", lambda _path: smiles)
+        monkeypatch.setattr(
+            "golem.pretrain._prepare_split_smiles",
+            lambda _smiles, _cfg: (
+                smiles,
+                np.array([0, 1]),
+                np.array([2]),
+                np.array([3]),
+            ),
+        )
+        monkeypatch.setattr(
+            "golem.pretrain.compute_descriptor_targets",
+            lambda *_args, **_kwargs: (desc_values, desc_valid, ["d0", "d1"]),
+        )
+        monkeypatch.setattr(
+            "golem.pretrain._build_pyg_dataset",
+            lambda _smiles, values, mask, fingerprint_bits=None: [
+                _DummyBatch(
+                    torch.tensor(values[i : i + 1], dtype=torch.float32),
+                    torch.tensor(mask[i : i + 1], dtype=torch.float32),
+                )
+                for i in range(len(values))
+            ],
+        )
+        monkeypatch.setattr(
+            "golem.pretrain.make_loader",
+            lambda dataset, batch_size, shuffle=False, num_workers=0: _DummyLoader(dataset),
+        )
+        monkeypatch.setattr("golem.pretrain.generate_report", lambda *_args, **_kwargs: None)
+
+        dummy_gt_pyg = SimpleNamespace(
+            GraphTransformerNet=DummyCheckpointModel,
+            __version__="0.0.test",
+        )
+        dummy_gt_pyg_data = SimpleNamespace(
+            get_atom_feature_dim=lambda: 1,
+            get_bond_feature_dim=lambda: 1,
+        )
+        monkeypatch.setitem(sys.modules, "gt_pyg", dummy_gt_pyg)
+        monkeypatch.setitem(sys.modules, "gt_pyg.data", dummy_gt_pyg_data)
+        monkeypatch.setattr(
+            "golem.pretrain._checkpoint_library_versions",
+            lambda: {"golem": "1.2.3", "gt_pyg": "0.0.test"},
+        )
+
+        pretrain(
+            smiles_path=str(tmp_path / "smiles.smi"),
+            config=cfg,
+            output_dir=str(tmp_path / "out"),
+        )
+
+        assert (tmp_path / "out" / "best_checkpoint.pt").exists()
+        assert (tmp_path / "out" / "last_checkpoint.pt").exists()
+        assert str(tmp_path / "out" / "last_checkpoint.pt") in saved_paths
 
 
 class TestWarmupCosineScheduler:

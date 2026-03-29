@@ -108,6 +108,7 @@ Set `descriptors.include_2d_targets: false` together with `descriptors.include_3
 | `--max-epochs` | Override max training epochs | 500 |
 | `--batch-size` | Override batch size | 128 |
 | `--lr` | Override learning rate | 1e-4 |
+| `--num-workers` | Override PyG data loading workers | 0 |
 | `--subsample` | Subsample fraction (e.g. 0.1 for 10%) | None (use all) |
 | `--seed` | Override random seed | 42 |
 | `--no-isoforms` | Disable isoform enumeration | Enabled |
@@ -120,6 +121,7 @@ After a run completes, the output directory contains:
 ```
 experiments/pretrain/
   best_checkpoint.pt        # Best model by validation objective
+  last_checkpoint.pt        # Most recent completed-epoch weights
   resolved_config.yaml      # Full resolved config used for the run
   pretrain_report.html      # HTML dashboard with training curves and metrics (not tracked)
   metrics.csv               # Per-epoch objective, descriptor, RMSE, LR, and optional alignment metrics (not tracked)

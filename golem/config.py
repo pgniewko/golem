@@ -127,7 +127,8 @@ class PretrainConfig:
     lr: float = 1e-4
     weight_decay: float = 1e-5
     warmup_epochs: int = 25
-    num_workers: int = 4
+    num_workers: int = 0
+    subsample: float | None = None
     winsorize_range: Tuple[float, float] = (-6.0, 6.0)
     split_ratios: List[float] = field(default_factory=lambda: [0.7, 0.2, 0.1])
     seed: int = 42  # pretrain seed (finetune notebooks use 1928374650)

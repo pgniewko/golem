@@ -111,8 +111,15 @@ def _compute_summary(
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Derive summary stats from metrics + config."""
-    best_row = min(metrics, key=lambda r: r["val_loss"])
     last_row = metrics[-1]
+    finite_rows = [row for row in metrics if math.isfinite(row["val_loss"])]
+    if finite_rows:
+        best_row = min(finite_rows, key=lambda r: r["val_loss"])
+    else:
+        logger.warning(
+            "No finite validation objective found in metrics; using the last row as the report summary anchor"
+        )
+        best_row = last_row
 
     return {
         "best_epoch": best_row["epoch"],

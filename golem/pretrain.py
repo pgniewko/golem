@@ -465,6 +465,7 @@ def pretrain(
     logger.info("Device: %s", device)
 
     seed_everything(config.seed)
+    effective_subsample = config.subsample if config.subsample is not None else subsample
 
     if config.max_epochs > 0 and config.warmup_epochs >= config.max_epochs:
         logger.warning(
@@ -474,6 +475,7 @@ def pretrain(
 
     # Save resolved config (convert tuples to lists for safe_load compatibility)
     config_dict = json.loads(json.dumps(asdict(config)))
+    config_dict["subsample"] = effective_subsample
     with open(output_dir / "resolved_config.yaml", "w") as f:
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
@@ -483,12 +485,16 @@ def pretrain(
     smiles_list = load_smiles(smiles_path)
     logger.info("Loaded %d SMILES from %s", len(smiles_list), smiles_path)
 
-    if subsample is not None and 0 < subsample < 1:
+    if effective_subsample is not None and 0 < effective_subsample < 1:
         rng = np.random.RandomState(config.seed)
-        n_sub = max(1, int(len(smiles_list) * subsample))
+        n_sub = max(1, int(len(smiles_list) * effective_subsample))
         indices = rng.choice(len(smiles_list), size=n_sub, replace=False)
         smiles_list = [smiles_list[i] for i in sorted(indices)]
-        logger.info("Subsampled to %d SMILES (%.1f%%)", len(smiles_list), subsample * 100)
+        logger.info(
+            "Subsampled to %d SMILES (%.1f%%)",
+            len(smiles_list),
+            effective_subsample * 100,
+        )
 
     # ------------------------------------------------------------------
     # 2. Filter invalid parent SMILES before splitting
@@ -660,114 +666,149 @@ def pretrain(
     start_time = time.time()
 
     best_ckpt_path = output_dir / "best_checkpoint.pt"
+    last_ckpt_path = output_dir / "last_checkpoint.pt"
     metrics_path = output_dir / "metrics.csv"
+    last_val_loss = math.nan
+    last_completed_epoch: int | None = None
+    last_saved_epoch: int | None = None
+
+    def _save_last_checkpoint(epoch_to_save: int) -> None:
+        nonlocal last_saved_epoch
+        _save_checkpoint(
+            model,
+            last_ckpt_path,
+            epoch=epoch_to_save,
+            best_metric=best_val_objective if math.isfinite(best_val_objective) else None,
+            config=config,
+            scaler=scaler,
+            descriptor_names=descriptor_names,
+            num_descriptors=num_descriptors,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+        )
+        last_saved_epoch = epoch_to_save
 
     logger.info("Starting training: max_epochs=%d  patience=%d  masking_ratio=%.2f",
                 config.max_epochs, config.patience, config.masking_ratio)
 
     epoch = 0
-    with open(metrics_path, "w", newline="") as metrics_file:
-        metrics_writer = csv.writer(metrics_file)
-        metrics_writer.writerow(METRICS_FIELDNAMES)
-        metrics_file.flush()
-
-        for epoch in range(config.max_epochs):
-            lr = scheduler.get_last_lr()[0]
-            (
-                train_loss,
-                train_descriptor_loss,
-                train_alignment_loss,
-            ) = _train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                config.masking_ratio,
-                config.descriptors.loss_weight,
-                device,
-            )
-            (
-                val_loss,
-                val_descriptor_loss,
-                val_rmse,
-                val_alignment_loss,
-                val_alignment_spearman,
-                val_alignment_kendall,
-            ) = _validate(
-                model,
-                val_loader,
-                config.descriptors.loss_weight,
-                device,
-            )
-
-            elapsed = time.time() - start_time
-            row = [
-                epoch,
-                f"{train_loss:.6f}",
-                f"{val_loss:.6f}",
-                f"{train_descriptor_loss:.6f}",
-                f"{val_descriptor_loss:.6f}",
-                f"{val_rmse:.6f}",
-                f"{lr:.2e}",
-                f"{elapsed:.1f}",
-                _format_optional_metric(train_alignment_loss),
-                _format_optional_metric(val_alignment_loss),
-                _format_optional_metric(val_alignment_spearman),
-                _format_optional_metric(val_alignment_kendall),
-            ]
-            metrics_writer.writerow(row)
+    try:
+        with open(metrics_path, "w", newline="") as metrics_file:
+            metrics_writer = csv.writer(metrics_file)
+            metrics_writer.writerow(METRICS_FIELDNAMES)
             metrics_file.flush()
 
-            summary_parts = [
-                f"train_loss={train_loss:.4f}",
-                f"val_loss={val_loss:.4f}",
-                f"train_desc={train_descriptor_loss:.4f}",
-                f"val_desc={val_descriptor_loss:.4f}",
-                f"val_rmse={val_rmse:.4f}",
-                f"lr={lr:.2e}",
-            ]
-            if alignment_cfg.enabled:
-                summary_parts.append(f"train_align={train_alignment_loss:.4f}")
-                summary_parts.append(f"val_align={val_alignment_loss:.4f}")
-            logger.info(
-                "Epoch %3d/%d — %s",
-                epoch + 1,
-                config.max_epochs,
-                "  ".join(summary_parts),
-            )
-            if math.isfinite(val_alignment_spearman) or math.isfinite(val_alignment_kendall):
-                logger.info(
-                    "           val_alignment_spearman=%.4f  val_alignment_kendall=%.4f",
+            for epoch in range(config.max_epochs):
+                lr = scheduler.get_last_lr()[0]
+                (
+                    train_loss,
+                    train_descriptor_loss,
+                    train_alignment_loss,
+                ) = _train_one_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    config.masking_ratio,
+                    config.descriptors.loss_weight,
+                    device,
+                )
+                (
+                    val_loss,
+                    val_descriptor_loss,
+                    val_rmse,
+                    val_alignment_loss,
                     val_alignment_spearman,
                     val_alignment_kendall,
+                ) = _validate(
+                    model,
+                    val_loader,
+                    config.descriptors.loss_weight,
+                    device,
                 )
+                last_val_loss = val_loss
+                last_completed_epoch = epoch
 
-            # Early stopping
-            if val_loss < best_val_objective:
-                best_val_objective = val_loss
-                best_epoch = epoch
-                patience_counter = 0
+                elapsed = time.time() - start_time
+                row = [
+                    epoch,
+                    f"{train_loss:.6f}",
+                    f"{val_loss:.6f}",
+                    f"{train_descriptor_loss:.6f}",
+                    f"{val_descriptor_loss:.6f}",
+                    f"{val_rmse:.6f}",
+                    f"{lr:.2e}",
+                    f"{elapsed:.1f}",
+                    _format_optional_metric(train_alignment_loss),
+                    _format_optional_metric(val_alignment_loss),
+                    _format_optional_metric(val_alignment_spearman),
+                    _format_optional_metric(val_alignment_kendall),
+                ]
+                metrics_writer.writerow(row)
+                metrics_file.flush()
 
-                # Save best checkpoint
-                _save_checkpoint(
-                    model, best_ckpt_path,
-                    epoch=epoch,
-                    best_metric=best_val_objective,
-                    config=config,
-                    scaler=scaler,
-                    descriptor_names=descriptor_names,
-                    num_descriptors=num_descriptors,
-                    train_idx=train_idx,
-                    val_idx=val_idx,
-                    test_idx=test_idx,
+                summary_parts = [
+                    f"train_loss={train_loss:.4f}",
+                    f"val_loss={val_loss:.4f}",
+                    f"train_desc={train_descriptor_loss:.4f}",
+                    f"val_desc={val_descriptor_loss:.4f}",
+                    f"val_rmse={val_rmse:.4f}",
+                    f"lr={lr:.2e}",
+                ]
+                if alignment_cfg.enabled:
+                    summary_parts.append(f"train_align={train_alignment_loss:.4f}")
+                    summary_parts.append(f"val_align={val_alignment_loss:.4f}")
+                logger.info(
+                    "Epoch %3d/%d — %s",
+                    epoch + 1,
+                    config.max_epochs,
+                    "  ".join(summary_parts),
                 )
-                logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
-            else:
-                patience_counter += 1
+                if math.isfinite(val_alignment_spearman) or math.isfinite(val_alignment_kendall):
+                    logger.info(
+                        "           val_alignment_spearman=%.4f  val_alignment_kendall=%.4f",
+                        val_alignment_spearman,
+                        val_alignment_kendall,
+                    )
+
+                # Early stopping
+                if math.isfinite(val_loss) and val_loss < best_val_objective:
+                    best_val_objective = val_loss
+                    best_epoch = epoch
+                    patience_counter = 0
+
+                    # Save best checkpoint
+                    _save_checkpoint(
+                        model, best_ckpt_path,
+                        epoch=epoch,
+                        best_metric=best_val_objective,
+                        config=config,
+                        scaler=scaler,
+                        descriptor_names=descriptor_names,
+                        num_descriptors=num_descriptors,
+                        train_idx=train_idx,
+                        val_idx=val_idx,
+                        test_idx=test_idx,
+                    )
+                    logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
+                else:
+                    if not math.isfinite(val_loss):
+                        logger.warning(
+                            "Validation objective is non-finite at epoch %d; skipping best-checkpoint update",
+                            epoch + 1,
+                        )
+                    patience_counter += 1
+
+                _save_last_checkpoint(epoch)
+
                 if patience_counter >= config.patience:
                     logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, config.patience)
                     break
 
-            scheduler.step()
+                scheduler.step()
+    finally:
+        if last_completed_epoch is not None and last_saved_epoch != last_completed_epoch:
+            _save_last_checkpoint(last_completed_epoch)
 
     if not best_ckpt_path.exists():
         logger.warning(
@@ -777,7 +818,11 @@ def pretrain(
         _save_checkpoint(
             model, best_ckpt_path,
             epoch=epoch,
-            best_metric=best_val_objective,
+            best_metric=(
+                best_val_objective
+                if math.isfinite(best_val_objective)
+                else last_val_loss if math.isfinite(last_val_loss) else math.nan
+            ),
             config=config,
             scaler=scaler,
             descriptor_names=descriptor_names,
@@ -860,7 +905,7 @@ def _save_checkpoint(
     path: Path,
     *,
     epoch: int,
-    best_metric: float,
+    best_metric: float | None,
     config: PretrainConfig,
     scaler: NaNAwareStandardScaler,
     descriptor_names: List[str],
