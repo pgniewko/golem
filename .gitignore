@@ -13,6 +13,7 @@ pretrain_report.html
 
 # Temp files
 tmp*
+run.sh
 
 # Old planning docs (retired, consolidated into docs/audit.html)
 PLAN.md
