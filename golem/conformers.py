@@ -106,9 +106,10 @@ def generate_conformer_ensemble(
     ]
 
     if not kept:
-        if config.timeout_seconds > 0 and (time.monotonic() - started_at) >= config.timeout_seconds:
-            return None, "timeout"
-        return None, "energy_filtered"
+        raise RuntimeError(
+            "No conformers remained after non-negative energy-window filtering; "
+            "this should be unreachable with a valid config."
+        )
 
     return (
         ConformerEnsemble(

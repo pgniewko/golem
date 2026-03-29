@@ -62,6 +62,27 @@ class TestConfig:
         cfg = load_config(yaml_path=str(yaml_file), max_epochs=3)
         assert cfg.max_epochs == 3
 
+    def test_load_config_rejects_removed_conformer_knobs(self, tmp_path):
+        """Removed conformer keys should fail fast."""
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text("conformers:\n  n_keep: 4\n  prune_rms: 0.75\n")
+        with pytest.raises(ValueError, match="Removed config keys"):
+            load_config(yaml_path=str(yaml_file))
+
+    def test_load_config_rejects_negative_energy_window(self, tmp_path):
+        """energy_window_kcal must be non-negative."""
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text("conformers:\n  energy_window_kcal: -1.0\n")
+        with pytest.raises(ValueError, match="energy_window_kcal must be >= 0"):
+            load_config(yaml_path=str(yaml_file))
+
+    def test_load_config_rejects_non_finite_energy_window(self, tmp_path):
+        """energy_window_kcal must be finite."""
+        yaml_file = tmp_path / "test.yaml"
+        yaml_file.write_text("conformers:\n  energy_window_kcal: .nan\n")
+        with pytest.raises(ValueError, match="energy_window_kcal must be finite"):
+            load_config(yaml_path=str(yaml_file))
+
 
 class TestSeedEverything:
     """Tests for reproducibility seeding."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from dataclasses import dataclass, field, asdict, fields
 from typing import Any, List, Optional, Tuple
@@ -82,18 +83,15 @@ class DescriptorConfig:
 class ConformerConfig:
     """Offline conformer generation settings for 3D descriptor targets.
 
-    ``n_keep`` and ``prune_rms`` are retained for backward-compatible config
-    parsing, but the current ensemble selection keeps all low-energy conformers
-    within ``energy_window_kcal`` without RMS-based pruning. The default
-    ``energy_window_kcal`` of 2.73 keeps conformers whose Boltzmann factor is
-    at least about 0.01 at ``kT = 0.593`` kcal/mol.
+    All optimized conformers within ``energy_window_kcal`` of the
+    lowest-energy conformer are retained. The default cutoff of 2.73 keeps
+    conformers whose Boltzmann factor is at least about 0.01 at
+    ``kT = 0.593`` kcal/mol.
     """
 
     n_generate: int = 8
-    n_keep: int = 4
     timeout_seconds: int = 15
     energy_window_kcal: float = 2.73
-    prune_rms: float = 0.75
 
 
 @dataclass
@@ -163,6 +161,14 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         fb = isoform_d.pop("rdkit_fallback")
         isoform_d["rdkit_fallback"] = fb.get("enabled", False)
 
+    removed_conformer_keys = {"n_keep", "prune_rms"} & set(conformers_d)
+    if removed_conformer_keys:
+        removed = ", ".join(f"conformers.{key}" for key in sorted(removed_conformer_keys))
+        raise ValueError(
+            f"Removed config keys: {removed}. "
+            "Use conformers.energy_window_kcal to control conformer retention."
+        )
+
     # Remove keys not in dataclass.
     model_fields = {f.name for f in fields(ModelConfig)}
     isoform_fields = {f.name for f in fields(IsoformConfig)}
@@ -212,6 +218,10 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         raise ValueError("descriptors.loss_weight must be >= 0.")
     if config.conformers.timeout_seconds < 0:
         raise ValueError("conformers.timeout_seconds must be >= 0.")
+    if not math.isfinite(config.conformers.energy_window_kcal):
+        raise ValueError("conformers.energy_window_kcal must be finite.")
+    if config.conformers.energy_window_kcal < 0:
+        raise ValueError("conformers.energy_window_kcal must be >= 0.")
     return config
 
 
