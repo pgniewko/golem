@@ -84,13 +84,15 @@ class ConformerConfig:
 
     ``n_keep`` and ``prune_rms`` are retained for backward-compatible config
     parsing, but the current ensemble selection keeps all low-energy conformers
-    within ``energy_window_kcal`` without RMS-based pruning.
+    within ``energy_window_kcal`` without RMS-based pruning. The default
+    ``energy_window_kcal`` of 2.73 keeps conformers whose Boltzmann factor is
+    at least about 0.01 at ``kT = 0.593`` kcal/mol.
     """
 
     n_generate: int = 8
     n_keep: int = 4
     timeout_seconds: int = 15
-    energy_window_kcal: float = 10.0
+    energy_window_kcal: float = 2.73
     prune_rms: float = 0.75
 
 

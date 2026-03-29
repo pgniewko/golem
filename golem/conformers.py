@@ -100,6 +100,8 @@ def generate_conformer_ensemble(
     kept = [
         (conf_id, rel_energy)
         for conf_id, rel_energy in kept
+        # The default window of 2.73 kcal/mol corresponds to a Boltzmann factor
+        # of about 0.01 relative to the lowest-energy conformer at room temperature.
         if rel_energy <= config.energy_window_kcal
     ]
 
