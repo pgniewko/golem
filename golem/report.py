@@ -1,12 +1,13 @@
 """HTML report generator for Golem pretraining experiments.
 
 Reads ``metrics.csv`` and ``resolved_config.yaml`` from an experiment output
-directory and produces a self-contained Chart.js dashboard with:
+directory and produces a single-file Chart.js dashboard with:
 
-- Training & validation loss curves
+- Training & validation objective curves
+- Training & validation descriptor-loss curves
 - Validation RMSE curve
 - Learning-rate schedule
-- Summary cards (best epoch, best val loss, elapsed time, sample counts)
+- Summary cards (best epoch, best val objective, elapsed time, architecture)
 - Epoch-by-epoch table with the best row highlighted
 
 Public API::
@@ -49,6 +50,8 @@ def _load_metrics(metrics_path: Path) -> List[Dict[str, Any]]:
                 "epoch": int(row["epoch"]),
                 "train_loss": float(row["train_loss"]),
                 "val_loss": float(row["val_loss"]),
+                "train_descriptor_loss": _parse_optional_float(row, "train_descriptor_loss"),
+                "val_descriptor_loss": _parse_optional_float(row, "val_descriptor_loss"),
                 "val_rmse": float(row["val_rmse"]),
                 "learning_rate": float(row["learning_rate"]),
                 "elapsed_seconds": float(row["elapsed_seconds"]),
@@ -70,11 +73,7 @@ def _parse_optional_float(row: Dict[str, str], key: str) -> float:
 
 
 def _has_alignment_metrics(metrics: List[Dict[str, Any]]) -> bool:
-    return any(
-        math.isfinite(row.get(field, math.nan))
-        for row in metrics
-        for field in OPTIONAL_ALIGNMENT_FIELDS
-    )
+    return any(math.isfinite(row.get("val_alignment_loss", math.nan)) for row in metrics)
 
 
 def _load_config(config_path: Path) -> Dict[str, Any]:
@@ -96,6 +95,13 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{seconds:.1f}s"
 
 
+def _fmt_optional(value: float, precision: int = 6) -> str:
+    """Format a float or return an empty string for NaN."""
+    if not math.isfinite(value):
+        return ""
+    return f"{value:.{precision}f}"
+
+
 # ---------------------------------------------------------------------------
 # Summary extraction
 # ---------------------------------------------------------------------------
@@ -105,24 +111,35 @@ def _compute_summary(
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Derive summary stats from metrics + config."""
-    best_row = min(metrics, key=lambda r: r["val_loss"])
     last_row = metrics[-1]
-
-    # Sample counts from split_ratios (approximation from config)
-    split_ratios = config.get("split_ratios", [0.7, 0.2, 0.1])
+    finite_rows = [row for row in metrics if math.isfinite(row["val_loss"])]
+    finite_rmse_rows = [row for row in metrics if math.isfinite(row["val_rmse"])]
+    if finite_rows:
+        best_row = min(finite_rows, key=lambda r: r["val_loss"])
+    else:
+        logger.warning(
+            "No finite validation objective found in metrics; using the last row as the report summary anchor"
+        )
+        best_row = last_row
+    if finite_rmse_rows:
+        best_rmse_row = min(finite_rmse_rows, key=lambda r: r["val_rmse"])
+    else:
+        best_rmse_row = last_row
 
     return {
         "best_epoch": best_row["epoch"],
-        "best_val_loss": best_row["val_loss"],
-        "best_val_rmse": best_row["val_rmse"],
+        "best_epoch_display": best_row["epoch"] + 1,
+        "best_val_objective": best_row["val_loss"],
+        "best_val_rmse": best_rmse_row["val_rmse"],
+        "best_val_rmse_epoch": best_rmse_row["epoch"],
+        "best_val_rmse_epoch_display": best_rmse_row["epoch"] + 1,
         "total_epochs": len(metrics),
         "max_epochs": config.get("max_epochs", "?"),
         "elapsed": _fmt_elapsed(last_row["elapsed_seconds"]),
         "elapsed_seconds": last_row["elapsed_seconds"],
-        "final_train_loss": last_row["train_loss"],
-        "final_val_loss": last_row["val_loss"],
+        "final_train_objective": last_row["train_loss"],
+        "final_val_objective": last_row["val_loss"],
         "final_val_rmse": last_row["val_rmse"],
-        "split_ratios": split_ratios,
         "batch_size": config.get("batch_size", "?"),
         "lr": config.get("lr", "?"),
         "patience": config.get("patience", "?"),
@@ -210,14 +227,14 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <!-- Summary Cards -->
 <div class="cards">
   <div class="card best">
-    <div class="label">Best Val Loss</div>
-    <div class="value">{{BEST_VAL_LOSS}}</div>
+    <div class="label">Best Val Objective</div>
+    <div class="value">{{BEST_VAL_OBJECTIVE}}</div>
     <div class="detail">Epoch {{BEST_EPOCH}} / {{TOTAL_EPOCHS}}</div>
   </div>
   <div class="card best">
     <div class="label">Best Val RMSE</div>
     <div class="value">{{BEST_VAL_RMSE}}</div>
-    <div class="detail">At best epoch</div>
+    <div class="detail">Epoch {{BEST_VAL_RMSE_EPOCH}}</div>
   </div>
   <div class="card time">
     <div class="label">Elapsed Time</div>
@@ -234,7 +251,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <!-- Charts -->
 <div class="charts">
   <div class="chart-card">
-    <h3>Training &amp; Validation Loss</h3>
+    <h3>Training &amp; Validation Objective</h3>
     <canvas id="lossChart"></canvas>
   </div>
   <div class="chart-card">
@@ -246,8 +263,8 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <canvas id="lrChart"></canvas>
   </div>
   <div class="chart-card">
-    <h3>Train vs Val Loss Gap</h3>
-    <canvas id="gapChart"></canvas>
+    <h3>Training &amp; Validation Descriptor Loss</h3>
+    <canvas id="descriptorChart"></canvas>
   </div>
   {{ALIGNMENT_CHART}}
 </div>
@@ -266,8 +283,9 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   <table>
     <thead>
       <tr>
-        <th>Epoch</th><th>Train Loss</th><th>Val Loss</th>
-        <th>Val RMSE</th><th>LR</th><th>Elapsed</th>
+        <th>Epoch</th><th>Train Obj</th><th>Val Obj</th>
+        <th>Train Desc</th><th>Val Desc</th><th>Val RMSE</th>
+        <th>LR</th><th>Elapsed</th>
       </tr>
     </thead>
     <tbody>
@@ -282,9 +300,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 const epochs = {{EPOCHS_JSON}};
 const trainLoss = {{TRAIN_LOSS_JSON}};
 const valLoss = {{VAL_LOSS_JSON}};
+const trainDescriptorLoss = {{TRAIN_DESCRIPTOR_LOSS_JSON}};
+const valDescriptorLoss = {{VAL_DESCRIPTOR_LOSS_JSON}};
 const valRmse = {{VAL_RMSE_JSON}};
 const lr = {{LR_JSON}};
-const gap = trainLoss.map((t, i) => t - valLoss[i]);
 {{ALIGNMENT_JSON}}
 
 const gridColor = 'rgba(148,163,184,0.1)';
@@ -307,11 +326,11 @@ new Chart(document.getElementById('lossChart'), {
   data: {
     labels: epochs,
     datasets: [
-      { label: 'Train Loss', data: trainLoss, borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,0.1)', tension: 0.3, pointRadius: 2 },
-      { label: 'Val Loss',   data: valLoss,   borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)', tension: 0.3, pointRadius: 2 },
+      { label: 'Train Objective', data: trainLoss, borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,0.1)', tension: 0.3, pointRadius: 2 },
+      { label: 'Val Objective',   data: valLoss,   borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)', tension: 0.3, pointRadius: 2 },
     ],
   },
-  options: makeOpts('MSE Loss'),
+  options: makeOpts('Weighted Objective'),
 });
 
 new Chart(document.getElementById('rmseChart'), {
@@ -336,15 +355,16 @@ new Chart(document.getElementById('lrChart'), {
   options: makeOpts('Learning Rate'),
 });
 
-new Chart(document.getElementById('gapChart'), {
-  type: 'bar',
+new Chart(document.getElementById('descriptorChart'), {
+  type: 'line',
   data: {
     labels: epochs,
     datasets: [
-      { label: 'Train - Val Loss', data: gap, backgroundColor: gap.map(v => v > 0 ? 'rgba(248,113,113,0.6)' : 'rgba(74,222,128,0.6)') },
+      { label: 'Train Descriptor Loss', data: trainDescriptorLoss, borderColor: '#f97316', backgroundColor: 'rgba(249,115,22,0.1)', tension: 0.3, pointRadius: 2 },
+      { label: 'Val Descriptor Loss', data: valDescriptorLoss, borderColor: '#fb7185', backgroundColor: 'rgba(251,113,133,0.1)', tension: 0.3, pointRadius: 2 },
     ],
   },
-  options: makeOpts('Loss Gap'),
+  options: makeOpts('Descriptor Loss'),
 });
 {{ALIGNMENT_SCRIPT}}
 </script>
@@ -398,9 +418,21 @@ def generate_report(
     # Build JSON arrays for Chart.js
     import json
 
-    epochs_json = json.dumps([r["epoch"] for r in metrics])
+    epochs_json = json.dumps([r["epoch"] + 1 for r in metrics])
     train_loss_json = json.dumps([r["train_loss"] for r in metrics])
     val_loss_json = json.dumps([r["val_loss"] for r in metrics])
+    train_descriptor_loss_json = json.dumps(
+        [
+            row["train_descriptor_loss"] if math.isfinite(row["train_descriptor_loss"]) else None
+            for row in metrics
+        ]
+    )
+    val_descriptor_loss_json = json.dumps(
+        [
+            row["val_descriptor_loss"] if math.isfinite(row["val_descriptor_loss"]) else None
+            for row in metrics
+        ]
+    )
     val_rmse_json = json.dumps([r["val_rmse"] for r in metrics])
     lr_json = json.dumps([r["learning_rate"] for r in metrics])
     alignment_chart = ""
@@ -415,10 +447,10 @@ def generate_report(
   </div>
 """
         alignment_json = (
-            f"const trainAlignmentLoss = {json.dumps([r['train_alignment_loss'] for r in metrics])};\n"
-            f"const valAlignmentLoss = {json.dumps([r['val_alignment_loss'] for r in metrics])};\n"
-            f"const valAlignmentSpearman = {json.dumps([r['val_alignment_spearman'] for r in metrics])};\n"
-            f"const valAlignmentKendall = {json.dumps([r['val_alignment_kendall'] for r in metrics])};"
+            f"const trainAlignmentLoss = {json.dumps([row['train_alignment_loss'] if math.isfinite(row['train_alignment_loss']) else None for row in metrics])};\n"
+            f"const valAlignmentLoss = {json.dumps([row['val_alignment_loss'] if math.isfinite(row['val_alignment_loss']) else None for row in metrics])};\n"
+            f"const valAlignmentSpearman = {json.dumps([row['val_alignment_spearman'] if math.isfinite(row['val_alignment_spearman']) else None for row in metrics])};\n"
+            f"const valAlignmentKendall = {json.dumps([row['val_alignment_kendall'] if math.isfinite(row['val_alignment_kendall']) else None for row in metrics])};"
         )
         alignment_script = """
 new Chart(document.getElementById('alignmentChart'), {
@@ -460,10 +492,12 @@ new Chart(document.getElementById('alignmentChart'), {
         cls = ' class="best-row"' if r["epoch"] == best_epoch else ""
         table_rows.append(
             f"<tr{cls}>"
-            f"<td>{r['epoch']}</td>"
+            f"<td>{r['epoch'] + 1}</td>"
             f"<td>{r['train_loss']:.6f}</td>"
             f"<td>{r['val_loss']:.6f}</td>"
-            f"<td>{r['val_rmse']:.6f}</td>"
+            f"<td>{_fmt_optional(r['train_descriptor_loss'])}</td>"
+            f"<td>{_fmt_optional(r['val_descriptor_loss'])}</td>"
+            f"<td>{_fmt_optional(r['val_rmse'])}</td>"
             f"<td>{r['learning_rate']:.2e}</td>"
             f"<td>{_fmt_elapsed(r['elapsed_seconds'])}</td>"
             f"</tr>"
@@ -474,9 +508,10 @@ new Chart(document.getElementById('alignmentChart'), {
     html = _HTML_TEMPLATE
     replacements = {
         "{{OUTPUT_DIR}}": str(output_dir.resolve()),
-        "{{BEST_VAL_LOSS}}": f"{summary['best_val_loss']:.4f}",
+        "{{BEST_VAL_OBJECTIVE}}": f"{summary['best_val_objective']:.4f}",
         "{{BEST_VAL_RMSE}}": f"{summary['best_val_rmse']:.4f}",
-        "{{BEST_EPOCH}}": str(summary["best_epoch"]),
+        "{{BEST_EPOCH}}": str(summary["best_epoch_display"]),
+        "{{BEST_VAL_RMSE_EPOCH}}": str(summary["best_val_rmse_epoch_display"]),
         "{{TOTAL_EPOCHS}}": str(summary["total_epochs"]),
         "{{MAX_EPOCHS}}": str(summary["max_epochs"]),
         "{{ELAPSED}}": summary["elapsed"],
@@ -488,6 +523,8 @@ new Chart(document.getElementById('alignmentChart'), {
         "{{EPOCHS_JSON}}": epochs_json,
         "{{TRAIN_LOSS_JSON}}": train_loss_json,
         "{{VAL_LOSS_JSON}}": val_loss_json,
+        "{{TRAIN_DESCRIPTOR_LOSS_JSON}}": train_descriptor_loss_json,
+        "{{VAL_DESCRIPTOR_LOSS_JSON}}": val_descriptor_loss_json,
         "{{VAL_RMSE_JSON}}": val_rmse_json,
         "{{LR_JSON}}": lr_json,
         "{{ALIGNMENT_CHART}}": alignment_chart,

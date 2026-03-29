@@ -1,4 +1,3 @@
-__pycache__/
 *.pyc
 *.egg-info/
 .DS_Store
@@ -8,13 +7,13 @@ __pycache__/
 *.pt
 
 # Experiment artifacts
-descriptors_*.npz
 pretrain.log
 metrics.csv
 pretrain_report.html
 
 # Temp files
 tmp*
+run.sh
 
 # Old planning docs (retired, consolidated into docs/audit.html)
 PLAN.md

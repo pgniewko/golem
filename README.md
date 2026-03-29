@@ -63,7 +63,7 @@ python -c "from golem.config import PretrainConfig; print('golem OK')"
 
 ```bash
 golem pretrain \
-  --smiles data/openadmet/train_test_smiles.smi \
+  --smiles data/openadmet/expansion_rx/train_test_smiles.smi \
   --output experiments/test_pretrain \
   --max-epochs 10 \
   --subsample 0.1 \
@@ -74,19 +74,29 @@ golem pretrain \
 
 ```bash
 golem pretrain \
-  --smiles data/openadmet/train_test_smiles.smi \
-  --config configs/pretrain_openadmet.yaml \
+  --smiles data/openadmet/expansion_rx/train_test_smiles.smi \
+  --config configs/golem-2d.yaml \
   --output experiments/pretrain
 ```
+
+Config files in `configs/` are intended to contain overrides over the defaults in
+`golem.config.PretrainConfig`, not a full copy of every setting.
 
 Optional ECFP-latent alignment can be enabled in YAML:
 
 ```yaml
 ecfp_latent_alignment:
   enabled: true
-  weight: 0.05
-  num_pairs: 128
 ```
+
+Optional 3D descriptor targets can be enabled in YAML:
+
+```yaml
+descriptors:
+  include_3d_targets: true
+```
+
+Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ETKDGv3`, conformer optimization uses fixed `MMFF` with `UFF` fallback, and the single lowest-energy conformer from `conformers.n_generate` attempts is used for 3D descriptors. If conformer generation or a 3D descriptor family fails, the molecule is kept and the affected 3D targets are masked the same way invalid 2D descriptor entries are masked. 3D descriptor columns that are invalid for every molecule are dropped across the dataset, and the run fails if no descriptor columns remain.
 
 ### CLI options
 
@@ -98,11 +108,11 @@ ecfp_latent_alignment:
 | `--max-epochs` | Override max training epochs | 500 |
 | `--batch-size` | Override batch size | 128 |
 | `--lr` | Override learning rate | 1e-4 |
+| `--num-workers` | Override PyG data loading workers | 0 |
 | `--subsample` | Subsample fraction (e.g. 0.1 for 10%) | None (use all) |
 | `--seed` | Override random seed | 42 |
 | `--no-isoforms` | Disable isoform enumeration | Enabled |
 | `--verbose` | Show DEBUG-level logs on console | Disabled |
-| `--resume` | Path to checkpoint to resume training from | None |
 
 ### What pretraining produces
 
@@ -110,11 +120,11 @@ After a run completes, the output directory contains:
 
 ```
 experiments/pretrain/
-  best_checkpoint.pt.gz     # Best model by validation loss (gzip-compressed)
+  best_checkpoint.pt        # Best model by validation objective
+  last_checkpoint.pt        # Most recent completed-epoch weights
   resolved_config.yaml      # Full resolved config used for the run
   pretrain_report.html      # HTML dashboard with training curves and metrics (not tracked)
-  last_checkpoint.pt        # Last epoch, for resuming (not tracked)
-  metrics.csv               # Per-epoch losses, RMSE, LR, and optional alignment metrics (not tracked)
+  metrics.csv               # Per-epoch objective, descriptor, RMSE, LR, and optional alignment metrics (not tracked)
   pretrain.log              # Full log output (not tracked)
 ```
 
@@ -128,10 +138,10 @@ golem report experiments/pretrain
 
 This reads `metrics.csv` and `resolved_config.yaml` from the experiment directory and produces a single-file HTML dashboard (`pretrain_report.html`) with:
 
-- Training & validation loss curves
+- Training & validation objective curves
+- Training & validation descriptor-loss curves
 - Validation RMSE curve
 - Learning rate schedule
-- Train vs val loss gap
 - Optional ECFP-latent alignment chart when those metrics are present
 - Summary cards (best epoch, best val loss, elapsed time, architecture)
 - Epoch-by-epoch table with the best row highlighted
@@ -147,19 +157,20 @@ golem report experiments/pretrain --output path/to/report.html
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+pytest tests -q
 ```
 
-The tests cover isoform enumeration, Mordred descriptor computation, the NaN-aware scaler, config loading, data splitting, and SMILES file loading. Note: descriptor tests require `mordredcommunity` and may take a few seconds.
+The tests cover isoform enumeration, 2D descriptor computation, the NaN-aware scaler, config loading, data splitting, and SMILES file loading. Note: descriptor tests require `mordredcommunity` and may take a few seconds.
 
 ### Key module responsibilities
 
 | Module | What it does |
 |--------|-------------|
 | `cli.py` | Parses CLI args, merges config, calls `pretrain()` |
-| `config.py` | Defines `PretrainConfig` dataclass tree; merges defaults / YAML / CLI |
+| `config.py` | Defines `PretrainConfig` dataclass tree; merges defaults / YAML overrides / CLI |
+| `conformers.py` | Builds the lowest-energy RDKit conformer used for optional 3D descriptor targets |
 | `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
-| `descriptors.py` | Computes Mordred 2D descriptors; provides `NaNAwareStandardScaler` |
+| `descriptors.py` | Computes 2D/3D descriptor targets; provides `NaNAwareStandardScaler` |
 | `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; isoforms &rarr; descriptors &rarr; split &rarr; scale &rarr; train &rarr; checkpoint |
 | `utils.py` | Shared utilities: seeding, train/val/test splitting, PyG DataLoader creation, SMILES file loading |
 
@@ -172,5 +183,5 @@ The tests cover isoform enumeration, Mordred descriptor computation, the NaN-awa
 | NaN handling / validity masking | `descriptors.py:compute_mordred_descriptors()` |
 | Scaler fit (train-only, no leakage) | `pretrain.py:pretrain()` step 5 |
 | Config defaults | `config.py` dataclass definitions |
-| Production config | `configs/pretrain_openadmet.yaml` |
+| Production config overrides | `configs/golem-2d.yaml` |
 | Pretraining pipeline flow | `pretrain.py` module docstring |

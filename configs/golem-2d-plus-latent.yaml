@@ -1,0 +1,16 @@
+# These are overrides over the defaults in golem.config.PretrainConfig.
+
+model:
+  dropout: 0.2
+  head_dropout: 0.2
+
+pretrain:
+  max_epochs: 5000
+  patience: 100
+  lr: 3.0e-4
+
+isoforms:
+  desalting: { enabled: true }
+
+ecfp_latent_alignment:
+  enabled: true

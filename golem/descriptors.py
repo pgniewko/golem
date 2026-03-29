@@ -22,7 +22,12 @@ import numpy as np
 from rdkit import Chem
 from tqdm import tqdm
 
+from golem.config import ConformerConfig, DescriptorConfig, Descriptor3DSettings
+from golem.conformers import generate_lowest_energy_conformer
+
 logger = logging.getLogger(__name__)
+
+_THREE_D_FAMILIES = ("rdkit3d", "usrcat", "electroshape")
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +98,176 @@ def compute_mordred_descriptors(
     return values, validity_mask.astype(np.bool_), descriptor_names
 
 
+def _build_3d_calculators(config: Descriptor3DSettings) -> Dict[str, object]:
+    """Build the fixed 3D descriptor calculator pack."""
+    try:
+        from molfeat.calc.descriptors import RDKitDescriptors3D
+        from molfeat.calc.shape import ElectroShapeDescriptors, USRDescriptors
+    except ImportError as exc:
+        raise RuntimeError(
+            "3D descriptor targets require molfeat to be installed."
+        ) from exc
+
+    ignore_descrs = [] if config.rdkit_include_getaway else ["CalcGETAWAY"]
+    return {
+        "rdkit3d": RDKitDescriptors3D(ignore_descrs=ignore_descrs),
+        "usrcat": USRDescriptors(method="USRCAT"),
+        "electroshape": ElectroShapeDescriptors(charge_model="gasteiger"),
+    }
+
+
+def _calculator_columns(calculator: object) -> List[str]:
+    columns = getattr(calculator, "columns", None)
+    if callable(columns):
+        columns = columns()
+    if columns is None:
+        columns = getattr(calculator, "_columns", None)
+    if columns is None:
+        raise RuntimeError(f"Could not determine descriptor columns for {calculator!r}")
+    return list(columns)
+
+
+def compute_3d_descriptors(
+    smiles_list: List[str],
+    three_d_settings: Descriptor3DSettings,
+    conformers: ConformerConfig,
+    *,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Compute the fixed 3D descriptor pack on the lowest-energy conformer."""
+    calculators = _build_3d_calculators(three_d_settings)
+    columns_by_family = {
+        family: _calculator_columns(calculators[family]) for family in _THREE_D_FAMILIES
+    }
+    descriptor_names = [
+        f"{family}:{column}"
+        for family in _THREE_D_FAMILIES
+        for column in columns_by_family[family]
+    ]
+    values = np.zeros((len(smiles_list), len(descriptor_names)), dtype=np.float32)
+    validity_mask = np.zeros((len(smiles_list), len(descriptor_names)), dtype=np.bool_)
+    conformer_failures = 0
+    descriptor_failures = 0
+
+    for row_idx, smiles in enumerate(
+        tqdm(smiles_list, desc="3D descriptors", unit="mol")
+    ):
+        conformer = generate_lowest_energy_conformer(
+            smiles,
+            conformers,
+            seed=seed,
+        )
+        if conformer is None:
+            conformer_failures += 1
+            continue
+
+        offset = 0
+        for family in _THREE_D_FAMILIES:
+            width = len(columns_by_family[family])
+            try:
+                row = np.asarray(
+                    calculators[family](conformer.mol, conformer_id=conformer.conformer_id),
+                    dtype=np.float64,
+                )
+                if row.shape != (width,):
+                    raise RuntimeError(
+                        f"{family} returned shape {row.shape}, expected {(width,)}"
+                    )
+                family_mask = np.isfinite(row)
+                family_values = np.where(family_mask, row, 0.0).astype(np.float32)
+            except Exception:
+                logger.debug("3D descriptor family %s failed for %s", family, smiles, exc_info=True)
+                family_values = np.zeros(width, dtype=np.float32)
+                family_mask = np.zeros(width, dtype=np.bool_)
+                descriptor_failures += 1
+
+            values[row_idx, offset : offset + width] = family_values
+            validity_mask[row_idx, offset : offset + width] = family_mask
+            offset += width
+
+    all_invalid = ~validity_mask.any(axis=0)
+    if all_invalid.any():
+        logger.info("Dropping %d all-invalid 3D descriptor columns", int(all_invalid.sum()))
+        keep_columns = ~all_invalid
+        values = values[:, keep_columns]
+        validity_mask = validity_mask[:, keep_columns]
+        descriptor_names = [
+            name
+            for name, keep in zip(descriptor_names, keep_columns, strict=False)
+            if keep
+        ]
+
+    logger.info(
+        "3D descriptors: %d molecules × %d descriptors (%.1f%% valid entries)",
+        values.shape[0],
+        values.shape[1],
+        validity_mask.mean() * 100 if validity_mask.size else 0.0,
+    )
+    if conformer_failures or descriptor_failures:
+        logger.info(
+            "3D target generation kept all molecules in-place "
+            "(%d conformer failures, %d descriptor-family failures; invalid entries were masked)",
+            conformer_failures,
+            descriptor_failures,
+        )
+    return values, validity_mask, descriptor_names
+
+
+def compute_descriptor_targets(
+    smiles_list: List[str],
+    descriptors: DescriptorConfig,
+    conformers: ConformerConfig,
+    *,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Compute the configured 2D/3D descriptor target matrix."""
+    if not descriptors.include_2d_targets and not descriptors.include_3d_targets:
+        raise ValueError("At least one descriptor target family must be enabled.")
+
+    values_blocks = []
+    mask_blocks = []
+    name_blocks = []
+
+    if descriptors.include_2d_targets:
+        values_2d, mask_2d, names_2d = compute_mordred_descriptors(smiles_list)
+        values_blocks.append(values_2d)
+        mask_blocks.append(mask_2d)
+        name_blocks.append(names_2d)
+
+    if descriptors.include_3d_targets:
+        values_3d, mask_3d, names_3d = compute_3d_descriptors(
+            smiles_list,
+            descriptors.three_d_settings,
+            conformers,
+            seed=seed,
+        )
+        values_blocks.append(values_3d)
+        mask_blocks.append(mask_3d)
+        name_blocks.append(names_3d)
+
+    if len(values_blocks) == 1:
+        values, mask, names = values_blocks[0], mask_blocks[0], name_blocks[0]
+        if values.shape[1] == 0:
+            raise ValueError(
+                "No valid descriptor targets remained after dropping all-invalid columns."
+            )
+        return values, mask, names
+
+    values = np.concatenate(values_blocks, axis=1)
+    masks = np.concatenate(mask_blocks, axis=1)
+    names = [name for block in name_blocks for name in block]
+    if values.shape[1] == 0:
+        raise ValueError(
+            "No valid descriptor targets remained after dropping all-invalid columns."
+        )
+
+    return (
+        values,
+        masks,
+        names,
+    )
+
+
 # ---------------------------------------------------------------------------
 # NaN-aware standard scaler
 # ---------------------------------------------------------------------------
@@ -131,21 +306,38 @@ class NaNAwareStandardScaler:
         Returns:
             self (for chaining).
         """
-        # Work with float64 for numerical stability
-        X_masked = np.where(validity_mask, X.astype(np.float64), np.nan)
+        # Work with float64 for numerical stability and compute statistics
+        # only over valid entries to avoid expected RuntimeWarnings for
+        # all-invalid columns.
+        X64 = X.astype(np.float64, copy=False)
+        valid = validity_mask.astype(bool, copy=False)
+        valid_count = valid.sum(axis=0)
+        masked_values = np.where(valid, X64, 0.0)
 
-        self.mean_ = np.nanmean(X_masked, axis=0)
-        self.std_ = np.nanstd(X_masked, axis=0)
+        self.mean_ = np.divide(
+            masked_values.sum(axis=0),
+            valid_count,
+            out=np.zeros(X64.shape[1], dtype=np.float64),
+            where=valid_count > 0,
+        )
+        centered = np.where(valid, X64 - self.mean_, 0.0)
+        self.std_ = np.sqrt(
+            np.divide(
+                np.square(centered).sum(axis=0),
+                valid_count,
+                out=np.ones(X64.shape[1], dtype=np.float64),
+                where=valid_count > 0,
+            )
+        )
 
-        # Guard against all-NaN columns (nanmean/nanstd return NaN)
-        nan_mean = np.isnan(self.mean_)
-        if nan_mean.any():
+        all_invalid = valid_count == 0
+        if all_invalid.any():
             logger.info(
                 "Setting mean=0.0, std=1.0 for %d all-NaN descriptors in train",
-                nan_mean.sum(),
+                all_invalid.sum(),
             )
-            self.mean_[nan_mean] = 0.0
-            self.std_[nan_mean] = 1.0
+            self.mean_[all_invalid] = 0.0
+            self.std_[all_invalid] = 1.0
 
         # Guard against zero-std (constant columns): replace with 1.0
         zero_std = self.std_ < 1e-12

@@ -94,12 +94,12 @@ def _enumerate_tautomers(
         return []
 
 
-def _is_valid_protomer(protomer_mol: Chem.Mol, original_smi: str) -> bool:
+def _is_valid_protomer(protomer_mol: Chem.Mol) -> bool:
     """Validate a protomer against known Dimorphite-DL failure modes.
 
     Rejects:
     1. Nitrogen with >=4 total hydrogens (NH4+ on organic N)
-    2. Tertiary amide false protonation (H added to amide N that had no H)
+    2. Tertiary amide false protonation
     3. RDKit sanitization / kekulization failures
     """
     # 1. RDKit sanitization check
@@ -117,40 +117,31 @@ def _is_valid_protomer(protomer_mol: Chem.Mol, original_smi: str) -> bool:
             )
             return False
 
-    # 3. Tertiary amide false protonation
-    # Parse the original to find amide N atoms that have no H
-    orig_mol = Chem.MolFromSmiles(original_smi)
-    if orig_mol is not None:
-        # Build set of amide N atom indices in original (N bonded to C=O, no H)
-        orig_amide_n_indices: set = set()
-        for atom in orig_mol.GetAtoms():
-            if atom.GetAtomicNum() != 7:
+    # 3. Tertiary amide false protonation. Detect this directly on the
+    # protomer instead of relying on atom indices matching the original
+    # molecule, which is not stable across SMILES round-trips.
+    for atom in protomer_mol.GetAtoms():
+        if atom.GetAtomicNum() != 7 or atom.GetTotalNumHs() == 0:
+            continue
+        heavy_neighbors = sum(
+            1 for neighbor in atom.GetNeighbors() if neighbor.GetAtomicNum() > 1
+        )
+        if heavy_neighbors < 3:
+            continue
+        for neighbor in atom.GetNeighbors():
+            if neighbor.GetAtomicNum() != 6:
                 continue
-            if atom.GetTotalNumHs() > 0:
-                continue  # already has H — not a tertiary amide N
-            # Check if bonded to a C=O
-            for neighbor in atom.GetNeighbors():
-                if neighbor.GetAtomicNum() == 6:  # carbon
-                    for bond in neighbor.GetBonds():
-                        other = bond.GetOtherAtom(neighbor)
-                        if (
-                            other.GetAtomicNum() == 8
-                            and bond.GetBondTypeAsDouble() == 2.0
-                        ):
-                            orig_amide_n_indices.add(atom.GetIdx())
-                            break
-
-        # Check protomer: if any of those amide N now has H, reject
-        if orig_amide_n_indices:
-            for idx in orig_amide_n_indices:
-                if idx < protomer_mol.GetNumAtoms():
-                    patom = protomer_mol.GetAtomWithIdx(idx)
-                    if patom.GetAtomicNum() == 7 and patom.GetTotalNumHs() > 0:
-                        logger.debug(
-                            "Rejected protomer with protonated amide N: %s",
-                            _canonical(protomer_mol),
-                        )
-                        return False
+            has_carbonyl_oxygen = any(
+                bond.GetOtherAtom(neighbor).GetAtomicNum() == 8
+                and bond.GetBondTypeAsDouble() == 2.0
+                for bond in neighbor.GetBonds()
+            )
+            if has_carbonyl_oxygen:
+                logger.debug(
+                    "Rejected protomer with protonated tertiary amide N: %s",
+                    _canonical(protomer_mol),
+                )
+                return False
 
     return True
 
@@ -184,7 +175,7 @@ def _enumerate_protonation(
         protomers: List[Chem.Mol] = []
         for psmi in protomer_smiles:
             pmol = Chem.MolFromSmiles(psmi)
-            if pmol is not None and _is_valid_protomer(pmol, smi):
+            if pmol is not None and _is_valid_protomer(pmol):
                 protomers.append(pmol)
         return protomers
 
@@ -248,6 +239,9 @@ def enumerate_isoforms(smiles: str, config: IsoformConfig) -> List[str]:
     original_can = _canonical(mol)
     if original_can is None:
         return [smiles]
+
+    if not config.enabled:
+        return [original_can]
 
     seen: Set[str] = {original_can}
     isoforms: List[str] = [original_can]

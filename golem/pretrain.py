@@ -7,25 +7,24 @@ Pipeline:
 1. Load SMILES
 2. Split into train / val / (test) at the parent-molecule level
 3. (Optional) Enumerate isoforms within each split only
-4. Fit ``NaNAwareStandardScaler`` on **train only**
-5. Compute Mordred 2D descriptors + validity masks
+4. Compute descriptor targets + validity masks
+5. Fit ``NaNAwareStandardScaler`` on **train only**
 6. Transform all splits + winsorise
 7. Build PyG datasets via ``get_tensor_data``
 8. Train with masked MSE (15% random mask ∩ validity mask)
-9. Early stopping on validation loss
+9. Early stopping on validation objective
 10. Save checkpoint with scaler, descriptor names, config
 """
 
 from __future__ import annotations
 
 import csv
-import hashlib
 import inspect
 import json
 import logging
 import math
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -34,23 +33,39 @@ import torch
 from rdkit import Chem
 import torch.nn.functional as F
 import yaml
-from golem.config import ECFPLatentAlignmentConfig, PretrainConfig
-from golem.descriptors import NaNAwareStandardScaler, compute_mordred_descriptors
+from golem.config import (
+    ECFPLatentAlignmentConfig,
+    PretrainConfig,
+    validate_pretrain_config,
+)
+from golem.descriptors import (
+    NaNAwareStandardScaler,
+    compute_descriptor_targets,
+)
 from golem.ecfp_latent_alignment import (
     compute_alignment_batch,
     compute_alignment_metrics,
-    load_or_compute_fingerprints,
+    compute_fingerprints,
 )
 from golem.isoforms import enumerate_isoforms_batch
 from golem.report import generate_report
-from golem.utils import load_smiles, make_loader, seed_everything, split_data
+from golem.utils import (
+    load_smiles,
+    make_loader,
+    seed_everything,
+    split_data,
+)
 
 logger = logging.getLogger(__name__)
+
+_BATCH_NORM_NAMES = {"bn", "batchnorm", "batch_norm"}
 
 METRICS_FIELDNAMES = [
     "epoch",
     "train_loss",
     "val_loss",
+    "train_descriptor_loss",
+    "val_descriptor_loss",
     "val_rmse",
     "learning_rate",
     "elapsed_seconds",
@@ -74,6 +89,11 @@ def _checkpoint_library_versions() -> dict[str, str]:
         "golem": golem.__version__,
         "gt_pyg": gt_pyg.__version__,
     }
+
+
+def _format_optional_metric(value: float) -> str:
+    """Format finite optional metrics and leave inactive ones blank."""
+    return f"{value:.6f}" if math.isfinite(value) else ""
 
 
 # ---------------------------------------------------------------------------
@@ -139,17 +159,19 @@ def _train_one_epoch(
     loader,
     optimizer: torch.optim.Optimizer,
     masking_ratio: float,
+    descriptor_loss_weight: float,
     device: torch.device,
-) -> tuple[float, float]:
-    """Run one training epoch. Returns descriptor and alignment losses."""
+) -> tuple[float, float, float]:
+    """Run one training epoch. Returns objective, descriptor, and alignment losses."""
     model.train()
-    total_loss = 0.0
+    total_descriptor_se = 0.0
+    total_descriptor_count = 0
     total_alignment_loss = 0.0
-    n_batches = 0
+    n_alignment_batches = 0
+    saw_optimization_step = False
     alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
         loader, "ecfp_latent_alignment", None
     )
-
     for batch in loader:
         batch = batch.to(device)
         targets = batch.y  # [B, D]
@@ -172,40 +194,69 @@ def _train_one_epoch(
             z = None
 
         # Random 15% mask ∩ validity mask
-        rand_mask = (torch.rand_like(targets) < masking_ratio).bool()
-        final_mask = rand_mask & valid_mask
+        final_mask = (torch.rand_like(targets) < masking_ratio).bool() & valid_mask
 
-        if final_mask.sum() == 0:
-            # Extremely rare fallback: use all valid positions
+        masked_count = int(final_mask.sum().item())
+        if masked_count == 0 and valid_mask.sum() > 0:
             final_mask = valid_mask
+            masked_count = int(final_mask.sum().item())
 
-        if final_mask.sum() == 0:
-            continue  # skip batch if no valid positions at all
+        descriptor_loss = pred.sum() * 0.0
+        if masked_count > 0:
+            masked_diff = pred[final_mask] - targets[final_mask]
+            descriptor_loss = F.mse_loss(pred[final_mask], targets[final_mask])
+            total_descriptor_se += masked_diff.pow(2).sum().item()
+            total_descriptor_count += masked_count
 
-        loss = F.mse_loss(pred[final_mask], targets[final_mask])
-        alignment_loss = loss.new_zeros(())
+        alignment_loss = pred.sum() * 0.0
+        has_alignment_pairs = False
         if z is not None and alignment_cfg is not None:
-            alignment_loss, _, _ = compute_alignment_batch(batch, z, alignment_cfg)
-        total_step_loss = loss + alignment_loss * (alignment_cfg.weight if alignment_cfg is not None else 0.0)
+            alignment_loss, d_fp, _ = compute_alignment_batch(batch, z, alignment_cfg)
+            has_alignment_pairs = isinstance(d_fp, torch.Tensor) and d_fp.numel() > 0
+            if has_alignment_pairs:
+                total_alignment_loss += alignment_loss.item()
+                n_alignment_batches += 1
+
+        if masked_count == 0 and not has_alignment_pairs:
+            continue
+
+        saw_optimization_step = True
+        total_step_loss = descriptor_loss * descriptor_loss_weight
+        if has_alignment_pairs and alignment_cfg is not None:
+            total_step_loss = total_step_loss + alignment_loss * alignment_cfg.weight
 
         optimizer.zero_grad()
         total_step_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
-        total_loss += loss.item()
-        total_alignment_loss += alignment_loss.item()
-        n_batches += 1
+    descriptor_loss_value = math.nan
+    if total_descriptor_count > 0:
+        descriptor_loss_value = total_descriptor_se / total_descriptor_count
+    elif saw_optimization_step:
+        descriptor_loss_value = 0.0
 
-    return total_loss / max(n_batches, 1), total_alignment_loss / max(n_batches, 1)
+    alignment_loss_value = (
+        total_alignment_loss / n_alignment_batches if n_alignment_batches else math.nan
+    )
+
+    objective_terms: list[float] = []
+    if math.isfinite(descriptor_loss_value):
+        objective_terms.append(descriptor_loss_value * descriptor_loss_weight)
+    if math.isfinite(alignment_loss_value) and alignment_cfg is not None:
+        objective_terms.append(alignment_loss_value * alignment_cfg.weight)
+    objective_loss = float(sum(objective_terms)) if objective_terms else math.nan
+
+    return objective_loss, descriptor_loss_value, alignment_loss_value
 
 
 @torch.no_grad()
 def _validate(
     model: torch.nn.Module,
     loader,
+    descriptor_loss_weight: float,
     device: torch.device,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float]:
     """Validate and optionally compute alignment metrics."""
     model.eval()
     total_se = 0.0
@@ -237,8 +288,10 @@ def _validate(
                 alignment_cfg,
                 deterministic_pairs=True,
             )
-            alignment_losses.append(alignment_loss.item())
-            if alignment_cfg.log_rank_metrics:
+            has_alignment_pairs = isinstance(d_fp, torch.Tensor) and d_fp.numel() > 0
+            if has_alignment_pairs:
+                alignment_losses.append(alignment_loss.item())
+            if has_alignment_pairs and alignment_cfg.log_rank_metrics:
                 spearman, kendall = compute_alignment_metrics(d_fp, d_z)
                 if math.isfinite(spearman):
                     spearmans.append(spearman)
@@ -257,12 +310,25 @@ def _validate(
         total_se += se
         total_count += valid_mask.sum().item()
 
-    mse = total_se / max(total_count, 1)
-    rmse = math.sqrt(mse)
+    descriptor_loss = math.nan
+    rmse = math.nan
+    if total_count > 0:
+        descriptor_loss = total_se / total_count
+        rmse = math.sqrt(descriptor_loss)
+
+    alignment_loss = float(np.mean(alignment_losses)) if alignment_losses else math.nan
+    objective_terms: list[float] = []
+    if math.isfinite(descriptor_loss):
+        objective_terms.append(descriptor_loss * descriptor_loss_weight)
+    if math.isfinite(alignment_loss) and alignment_cfg is not None:
+        objective_terms.append(alignment_loss * alignment_cfg.weight)
+    objective_loss = float(sum(objective_terms)) if objective_terms else math.nan
+
     return (
-        mse,
+        objective_loss,
+        descriptor_loss,
         rmse,
-        float(np.mean(alignment_losses)) if alignment_losses else math.nan,
+        alignment_loss,
         float(np.mean(spearmans)) if spearmans else math.nan,
         float(np.mean(kendalls)) if kendalls else math.nan,
     )
@@ -300,14 +366,36 @@ def _build_pyg_dataset(
     return data_list
 
 
-# ---------------------------------------------------------------------------
-# Main pretrain function
-# ---------------------------------------------------------------------------
+def _canonicalize_parent_smiles(parent_smiles: List[str]) -> List[str]:
+    """Canonicalize and deduplicate parent SMILES before splitting."""
+    canonical_smiles: List[str] = []
+    seen_smiles: set[str] = set()
+    n_collapsed = 0
 
-def _smiles_cache_key(smiles_list: List[str]) -> str:
-    """Return a 16-char hex SHA-256 hash of the SMILES list (order-sensitive)."""
-    h = hashlib.sha256("\n".join(smiles_list).encode())
-    return h.hexdigest()[:16]
+    for smi in parent_smiles:
+        canonical_smi = smi
+        mol = Chem.MolFromSmiles(smi)
+        if mol is not None:
+            try:
+                Chem.SanitizeMol(mol)
+                canonical_smi = Chem.MolToSmiles(mol, canonical=True)
+            except Exception:
+                canonical_smi = smi
+
+        if canonical_smi in seen_smiles:
+            n_collapsed += 1
+            continue
+
+        seen_smiles.add(canonical_smi)
+        canonical_smiles.append(canonical_smi)
+
+    if n_collapsed:
+        logger.info(
+            "Collapsed %d duplicate/synonymous parent SMILES before splitting",
+            n_collapsed,
+        )
+
+    return canonical_smiles
 
 
 def _expand_smiles_within_split(
@@ -342,6 +430,7 @@ def _prepare_split_smiles(
     config: PretrainConfig,
 ) -> Tuple[List[str], np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Split parent molecules first, then expand isoforms within each split."""
+    parent_smiles = _canonicalize_parent_smiles(parent_smiles)
     parent_splits = split_data(len(parent_smiles), config.split_ratios, seed=config.seed)
 
     if len(parent_splits) == 3:
@@ -392,13 +481,48 @@ def _prepare_split_smiles(
     return all_smiles, train_idx, val_idx, test_idx
 
 
+def _validate_training_batch_configuration(
+    train_size: int,
+    config: PretrainConfig,
+) -> None:
+    """Reject batch-norm training setups that would create singleton batches."""
+    if config.model.norm.lower() not in _BATCH_NORM_NAMES:
+        return
+    if train_size == 0:
+        return
+
+    singleton_final_batch = config.batch_size == 1 or train_size % config.batch_size == 1
+    if not singleton_final_batch:
+        return
+
+    suggested_batch_sizes: list[int] = []
+    for candidate in (config.batch_size - 1, config.batch_size + 1, train_size):
+        if 1 < candidate <= train_size and train_size % candidate != 1:
+            if candidate not in suggested_batch_sizes:
+                suggested_batch_sizes.append(candidate)
+
+    suggestion = ""
+    if suggested_batch_sizes:
+        suggestion = " Try batch_size=" + " or ".join(
+            str(candidate) for candidate in suggested_batch_sizes
+        ) + "."
+
+    raise ValueError(
+        "batch_size="
+        f"{config.batch_size} with {train_size} training samples would create a "
+        "singleton final training batch, which is incompatible with "
+        f"model.norm={config.model.norm!r}. Choose a batch size where "
+        "train_size % batch_size != 1, adjust the split/subsample, or switch "
+        f"away from batch norm.{suggestion}"
+    )
+
+
 def pretrain(
     smiles_path: str,
     config: PretrainConfig,
     output_dir: str,
     subsample: Optional[float] = None,
     verbose: bool = False,
-    resume_from: Optional[str] = None,
 ) -> Path:
     """Full pretraining pipeline.
 
@@ -407,15 +531,24 @@ def pretrain(
         config: Resolved ``PretrainConfig``.
         output_dir: Directory for checkpoints, logs, metrics.
         subsample: If set, randomly subsample this fraction of SMILES
-            before processing (e.g. 0.1 for 10%).
+            before processing (e.g. 0.1 for 10%). Explicit function
+            arguments override ``config.subsample`` and must be in ``(0, 1]``.
         verbose: If True, show DEBUG-level logs on console.
-        resume_from: Path to a checkpoint file to resume training from.
 
     Returns:
         Path to the best checkpoint file.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    for artifact_name in (
+        "best_checkpoint.pt",
+        "last_checkpoint.pt",
+        "metrics.csv",
+        "pretrain_report.html",
+    ):
+        artifact_path = output_dir / artifact_name
+        if artifact_path.exists():
+            artifact_path.unlink()
     _setup_logging(output_dir, verbose=verbose)
 
     # Log library versions when verbose
@@ -431,6 +564,9 @@ def pretrain(
     logger.info("Device: %s", device)
 
     seed_everything(config.seed)
+    effective_subsample = subsample if subsample is not None else config.subsample
+    resolved_config = replace(config, subsample=effective_subsample)
+    validate_pretrain_config(resolved_config)
 
     if config.max_epochs > 0 and config.warmup_epochs >= config.max_epochs:
         logger.warning(
@@ -439,7 +575,7 @@ def pretrain(
         )
 
     # Save resolved config (convert tuples to lists for safe_load compatibility)
-    config_dict = json.loads(json.dumps(asdict(config)))
+    config_dict = json.loads(json.dumps(asdict(resolved_config)))
     with open(output_dir / "resolved_config.yaml", "w") as f:
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
@@ -449,12 +585,16 @@ def pretrain(
     smiles_list = load_smiles(smiles_path)
     logger.info("Loaded %d SMILES from %s", len(smiles_list), smiles_path)
 
-    if subsample is not None and 0 < subsample < 1:
+    if effective_subsample is not None and 0 < effective_subsample < 1:
         rng = np.random.RandomState(config.seed)
-        n_sub = max(1, int(len(smiles_list) * subsample))
+        n_sub = max(1, int(len(smiles_list) * effective_subsample))
         indices = rng.choice(len(smiles_list), size=n_sub, replace=False)
         smiles_list = [smiles_list[i] for i in sorted(indices)]
-        logger.info("Subsampled to %d SMILES (%.1f%%)", len(smiles_list), subsample * 100)
+        logger.info(
+            "Subsampled to %d SMILES (%.1f%%)",
+            len(smiles_list),
+            effective_subsample * 100,
+        )
 
     # ------------------------------------------------------------------
     # 2. Filter invalid parent SMILES before splitting
@@ -481,22 +621,19 @@ def pretrain(
     smiles_list, train_idx, val_idx, test_idx = _prepare_split_smiles(smiles_list, config)
 
     # ------------------------------------------------------------------
-    # 4. Compute Mordred descriptors (with disk cache)
+    # 4. Compute descriptor targets
     # ------------------------------------------------------------------
-    cache_key = _smiles_cache_key(smiles_list)
-    cache_path = output_dir / f"descriptors_{cache_key}.npz"
-
-    if cache_path.exists():
-        logger.info("Loading cached descriptors from %s", cache_path.name)
-        cached = np.load(cache_path, allow_pickle=True)
-        desc_values = cached["values"]
-        desc_valid = cached["valid"]
-        descriptor_names = cached["names"].tolist()
-    else:
-        logger.info("Computing Mordred descriptors …")
-        desc_values, desc_valid, descriptor_names = compute_mordred_descriptors(smiles_list)
-        np.savez(cache_path, values=desc_values, valid=desc_valid, names=np.array(descriptor_names))
-        logger.info("Saved descriptor cache to %s", cache_path.name)
+    logger.info(
+        "Computing descriptor targets (2D=%s, 3D=%s) …",
+        config.descriptors.include_2d_targets,
+        config.descriptors.include_3d_targets,
+    )
+    desc_values, desc_valid, descriptor_names = compute_descriptor_targets(
+        smiles_list,
+        config.descriptors,
+        config.conformers,
+        seed=config.seed,
+    )
 
     num_descriptors = desc_values.shape[1]
     logger.info("Descriptor matrix: %d molecules × %d descriptors", desc_values.shape[0], num_descriptors)
@@ -504,7 +641,7 @@ def pretrain(
     fp_bits = None
     alignment_cfg = config.ecfp_latent_alignment
     if alignment_cfg.enabled:
-        fp_bits = load_or_compute_fingerprints(output_dir, smiles_list, alignment_cfg)
+        fp_bits = compute_fingerprints(smiles_list, alignment_cfg)
         logger.info(
             "Fingerprint matrix: %d molecules × %d bits",
             fp_bits.shape[0],
@@ -537,6 +674,7 @@ def pretrain(
         desc_valid[train_idx],
         fingerprint_bits=train_fp,
     )
+    _validate_training_batch_configuration(len(train_data), config)
     val_data = _build_pyg_dataset(
         val_smiles,
         desc_values[val_idx],
@@ -554,11 +692,6 @@ def pretrain(
             desc_valid[test_idx],
             fingerprint_bits=test_fp,
         )
-
-    train_loader = make_loader(train_data, config.batch_size, shuffle=True, num_workers=config.num_workers)
-    val_loader = make_loader(val_data, config.batch_size, shuffle=False, num_workers=config.num_workers)
-    train_loader.ecfp_latent_alignment = None
-    val_loader.ecfp_latent_alignment = None
 
     # ------------------------------------------------------------------
     # 8. Create model
@@ -586,7 +719,12 @@ def pretrain(
         head_norm=mc.head_norm,
         head_residual=mc.head_residual,
     )
-    if "head_dropout" in gt_params and mc.head_dropout is not None:
+    if mc.head_dropout is not None:
+        if "head_dropout" not in gt_params:
+            raise RuntimeError(
+                "model.head_dropout is set, but the installed gt-pyg "
+                "GraphTransformerNet does not accept head_dropout."
+            )
         model_kwargs["head_dropout"] = mc.head_dropout
     model = GraphTransformerNet(**model_kwargs).to(device)
     if alignment_cfg.enabled and "return_latent" not in inspect.signature(model.forward).parameters:
@@ -607,29 +745,25 @@ def pretrain(
     scheduler = _make_warmup_cosine_scheduler(optimizer, config.warmup_epochs, config.max_epochs)
 
     # ------------------------------------------------------------------
-    # 9b. Resume from checkpoint (optional)
+    # 9b. Tracking state
     # ------------------------------------------------------------------
-    start_epoch = 0
-    best_val_loss = float("inf")
-    best_epoch = 0
+    best_val_objective = float("inf")
+    best_epoch = -1
 
-    if resume_from is not None:
-        resume_path = Path(resume_from)
-        if not resume_path.exists():
-            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
-        logger.info("Resuming from checkpoint: %s", resume_path)
-        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if "epoch" in ckpt and ckpt["epoch"] is not None:
-            start_epoch = ckpt["epoch"] + 1
-        if "best_metric" in ckpt and ckpt["best_metric"] is not None:
-            best_val_loss = ckpt["best_metric"]
-            best_epoch = ckpt.get("epoch", 0)
-        logger.info("Resumed at epoch %d (best_val_loss=%.4f)", start_epoch, best_val_loss)
+    train_loader = make_loader(
+        train_data,
+        config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+    )
+    val_loader = make_loader(
+        val_data,
+        config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+    )
+    train_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
+    val_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
 
     # ------------------------------------------------------------------
     # 10. Metrics CSV + Training loop
@@ -640,161 +774,222 @@ def pretrain(
     best_ckpt_path = output_dir / "best_checkpoint.pt"
     last_ckpt_path = output_dir / "last_checkpoint.pt"
     metrics_path = output_dir / "metrics.csv"
+    last_val_loss = math.nan
+    last_completed_epoch: int | None = None
+    last_saved_epoch: int | None = None
+
+    def _save_last_checkpoint(epoch_to_save: int) -> None:
+        nonlocal last_saved_epoch
+        _save_checkpoint(
+            model,
+            last_ckpt_path,
+            epoch=epoch_to_save,
+            best_metric=best_val_objective if math.isfinite(best_val_objective) else None,
+            config=resolved_config,
+            scaler=scaler,
+            descriptor_names=descriptor_names,
+            num_descriptors=num_descriptors,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+        )
+        last_saved_epoch = epoch_to_save
 
     logger.info("Starting training: max_epochs=%d  patience=%d  masking_ratio=%.2f",
                 config.max_epochs, config.patience, config.masking_ratio)
 
-    epoch = start_epoch
-    csv_mode = "a" if resume_from is not None and metrics_path.exists() else "w"
-    if csv_mode == "a":
-        with open(metrics_path, newline="") as existing_metrics:
-            header = next(csv.reader(existing_metrics), [])
-        if header != METRICS_FIELDNAMES:
-            raise ValueError(
-                "Cannot resume with a metrics.csv written by an older schema. "
-                "Start from a fresh output directory."
-            )
-    with open(metrics_path, csv_mode, newline="") as metrics_file:
-        metrics_writer = csv.writer(metrics_file)
-        if csv_mode == "w":
+    epoch = 0
+    try:
+        with open(metrics_path, "w", newline="") as metrics_file:
+            metrics_writer = csv.writer(metrics_file)
             metrics_writer.writerow(METRICS_FIELDNAMES)
-
-        for epoch in range(start_epoch, config.max_epochs):
-            lr = scheduler.get_last_lr()[0]
-            train_loader.ecfp_latent_alignment = (
-                alignment_cfg
-                if alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
-                else None
-            )
-            val_loader.ecfp_latent_alignment = (
-                alignment_cfg
-                if alignment_cfg.enabled and epoch >= alignment_cfg.warmup_epochs
-                else None
-            )
-
-            train_loss, train_alignment_loss = _train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                config.masking_ratio,
-                device,
-            )
-            (
-                val_loss,
-                val_rmse,
-                val_alignment_loss,
-                val_alignment_spearman,
-                val_alignment_kendall,
-            ) = _validate(model, val_loader, device)
-
-            elapsed = time.time() - start_time
-            metrics_writer.writerow([
-                epoch,
-                f"{train_loss:.6f}",
-                f"{val_loss:.6f}",
-                f"{val_rmse:.6f}",
-                f"{lr:.2e}",
-                f"{elapsed:.1f}",
-                f"{train_alignment_loss:.6f}",
-                f"{val_alignment_loss:.6f}",
-                f"{val_alignment_spearman:.6f}",
-                f"{val_alignment_kendall:.6f}",
-            ])
             metrics_file.flush()
 
-            logger.info(
-                "Epoch %3d/%d — train_loss=%.4f  val_loss=%.4f  val_rmse=%.4f  "
-                "train_align=%.4f  val_align=%.4f  lr=%.2e",
-                epoch + 1,
-                config.max_epochs,
-                train_loss,
-                val_loss,
-                val_rmse,
-                train_alignment_loss,
-                val_alignment_loss,
-                lr,
-            )
-            if math.isfinite(val_alignment_spearman) or math.isfinite(val_alignment_kendall):
-                logger.info(
-                    "           val_alignment_spearman=%.4f  val_alignment_kendall=%.4f",
+            for epoch in range(config.max_epochs):
+                lr = scheduler.get_last_lr()[0]
+                (
+                    train_loss,
+                    train_descriptor_loss,
+                    train_alignment_loss,
+                ) = _train_one_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    config.masking_ratio,
+                    config.descriptors.loss_weight,
+                    device,
+                )
+                (
+                    val_loss,
+                    val_descriptor_loss,
+                    val_rmse,
+                    val_alignment_loss,
                     val_alignment_spearman,
                     val_alignment_kendall,
+                ) = _validate(
+                    model,
+                    val_loader,
+                    config.descriptors.loss_weight,
+                    device,
                 )
+                last_val_loss = val_loss
+                last_completed_epoch = epoch
 
-            # Early stopping
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_epoch = epoch
-                patience_counter = 0
+                elapsed = time.time() - start_time
+                row = [
+                    epoch,
+                    f"{train_loss:.6f}",
+                    f"{val_loss:.6f}",
+                    f"{train_descriptor_loss:.6f}",
+                    f"{val_descriptor_loss:.6f}",
+                    f"{val_rmse:.6f}",
+                    f"{lr:.2e}",
+                    f"{elapsed:.1f}",
+                    _format_optional_metric(train_alignment_loss),
+                    _format_optional_metric(val_alignment_loss),
+                    _format_optional_metric(val_alignment_spearman),
+                    _format_optional_metric(val_alignment_kendall),
+                ]
+                metrics_writer.writerow(row)
+                metrics_file.flush()
 
-                # Save best checkpoint
-                _save_checkpoint(
-                    model, optimizer, best_ckpt_path,
-                    epoch=epoch,
-                    best_metric=best_val_loss,
-                    config=config,
-                    scaler=scaler,
-                    descriptor_names=descriptor_names,
-                    num_descriptors=num_descriptors,
-                    train_idx=train_idx,
-                    val_idx=val_idx,
-                    test_idx=test_idx,
-                    scheduler=scheduler,
+                summary_parts = [
+                    f"train_loss={train_loss:.4f}",
+                    f"val_loss={val_loss:.4f}",
+                    f"train_desc={train_descriptor_loss:.4f}",
+                    f"val_desc={val_descriptor_loss:.4f}",
+                    f"val_rmse={val_rmse:.4f}",
+                    f"lr={lr:.2e}",
+                ]
+                if alignment_cfg.enabled and math.isfinite(train_alignment_loss):
+                    summary_parts.append(f"train_align={train_alignment_loss:.4f}")
+                if alignment_cfg.enabled and math.isfinite(val_alignment_loss):
+                    summary_parts.append(f"val_align={val_alignment_loss:.4f}")
+                logger.info(
+                    "Epoch %3d/%d — %s",
+                    epoch + 1,
+                    config.max_epochs,
+                    "  ".join(summary_parts),
                 )
-                logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
-            else:
-                patience_counter += 1
+                if math.isfinite(val_alignment_spearman) or math.isfinite(val_alignment_kendall):
+                    logger.info(
+                        "           val_alignment_spearman=%.4f  val_alignment_kendall=%.4f",
+                        val_alignment_spearman,
+                        val_alignment_kendall,
+                    )
+
+                # Early stopping
+                if math.isfinite(val_loss) and val_loss < best_val_objective:
+                    best_val_objective = val_loss
+                    best_epoch = epoch
+                    patience_counter = 0
+
+                    # Save best checkpoint
+                    _save_checkpoint(
+                        model, best_ckpt_path,
+                        epoch=epoch,
+                        best_metric=best_val_objective,
+                        config=resolved_config,
+                        scaler=scaler,
+                        descriptor_names=descriptor_names,
+                        num_descriptors=num_descriptors,
+                        train_idx=train_idx,
+                        val_idx=val_idx,
+                        test_idx=test_idx,
+                    )
+                    logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
+                else:
+                    if not math.isfinite(val_loss):
+                        logger.warning(
+                            "Validation objective is non-finite at epoch %d; skipping best-checkpoint update",
+                            epoch + 1,
+                        )
+                    patience_counter += 1
+
+                _save_last_checkpoint(epoch)
+
                 if patience_counter >= config.patience:
                     logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, config.patience)
                     break
 
-            scheduler.step()
+                scheduler.step()
+    finally:
+        if last_completed_epoch is not None and last_saved_epoch != last_completed_epoch:
+            _save_last_checkpoint(last_completed_epoch)
 
-    # Save last checkpoint
-    _save_checkpoint(
-        model, optimizer, last_ckpt_path,
-        epoch=epoch,
-        best_metric=best_val_loss,
-        config=config,
-        scaler=scaler,
-        descriptor_names=descriptor_names,
-        num_descriptors=num_descriptors,
-        train_idx=train_idx,
-        val_idx=val_idx,
-        test_idx=test_idx,
-        scheduler=scheduler,
-    )
+    if not best_ckpt_path.exists():
+        logger.warning(
+            "No finite validation improvement was recorded; saving the final model as best_checkpoint.pt"
+        )
+        best_epoch = epoch
+        _save_checkpoint(
+            model, best_ckpt_path,
+            epoch=epoch,
+            best_metric=(
+                best_val_objective
+                if math.isfinite(best_val_objective)
+                else last_val_loss if math.isfinite(last_val_loss) else math.nan
+            ),
+            config=resolved_config,
+            scaler=scaler,
+            descriptor_names=descriptor_names,
+            num_descriptors=num_descriptors,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+        )
 
     logger.info(
-        "Training complete.  Best val_loss=%.4f at epoch %d",
-        best_val_loss, best_epoch + 1,
+        "Training complete.  Best val_objective=%.4f at epoch %d",
+        best_val_objective,
+        best_epoch + 1 if best_epoch >= 0 else epoch + 1,
     )
 
     # ------------------------------------------------------------------
     # 12. Test RMSE (if test split exists)
     # ------------------------------------------------------------------
     if test_data is not None and best_ckpt_path.exists():
-        test_loader = make_loader(test_data, config.batch_size, shuffle=False, num_workers=config.num_workers)
+        test_loader = make_loader(
+            test_data,
+            config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+        )
         test_loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
 
         # Load best checkpoint for test evaluation
         model.load_weights(best_ckpt_path, map_location=device)
 
         (
-            test_mse,
+            test_loss,
+            test_descriptor_loss,
             test_rmse,
             test_alignment_loss,
             test_alignment_spearman,
             test_alignment_kendall,
-        ) = _validate(model, test_loader, device)
-        logger.info("Test RMSE (best model): %.4f", test_rmse)
+        ) = _validate(
+            model,
+            test_loader,
+            config.descriptors.loss_weight,
+            device,
+        )
+        logger.info(
+            "Test objective loss=%.4f  descriptor_loss=%.4f  rmse=%.4f",
+            test_loss,
+            test_descriptor_loss,
+            test_rmse,
+        )
         if alignment_cfg.enabled:
             logger.info(
-                "Test alignment: loss=%.4f  spearman=%.4f  kendall=%.4f",
+                "Test alignment loss=%.4f",
                 test_alignment_loss,
-                test_alignment_spearman,
-                test_alignment_kendall,
             )
+            if math.isfinite(test_alignment_spearman) or math.isfinite(test_alignment_kendall):
+                logger.info(
+                    "Test alignment rank metrics: spearman=%.4f  kendall=%.4f",
+                    test_alignment_spearman,
+                    test_alignment_kendall,
+                )
 
     # ------------------------------------------------------------------
     # 13. Generate HTML report
@@ -814,11 +1009,10 @@ def pretrain(
 
 def _save_checkpoint(
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
     path: Path,
     *,
     epoch: int,
-    best_metric: float,
+    best_metric: float | None,
     config: PretrainConfig,
     scaler: NaNAwareStandardScaler,
     descriptor_names: List[str],
@@ -826,13 +1020,10 @@ def _save_checkpoint(
     train_idx: np.ndarray,
     val_idx: np.ndarray,
     test_idx: Optional[np.ndarray],
-    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> None:
     """Save checkpoint via gt-pyg's model.save_checkpoint()."""
     model.save_checkpoint(
         path=path,
-        optimizer=optimizer,
-        scheduler=scheduler,
         epoch=epoch,
         best_metric=best_metric,
         extra={

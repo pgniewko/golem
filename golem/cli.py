@@ -32,6 +32,7 @@ def main() -> None:
 @click.option("--max-epochs", default=None, type=int, help="Override max training epochs.")
 @click.option("--batch-size", default=None, type=int, help="Override batch size.")
 @click.option("--lr", default=None, type=float, help="Override learning rate.")
+@click.option("--num-workers", default=None, type=int, help="Override data loading workers.")
 @click.option(
     "--subsample", default=None, type=float,
     help="Subsample fraction of SMILES (e.g. 0.1 for 10%%).",
@@ -45,10 +46,6 @@ def main() -> None:
     "--verbose", is_flag=True, default=False,
     help="Show DEBUG-level logs on console.",
 )
-@click.option(
-    "--resume", "resume_from", default=None, type=click.Path(exists=True),
-    help="Path to checkpoint file to resume training from.",
-)
 def pretrain_cmd(
     smiles: str,
     config_path: str | None,
@@ -56,11 +53,11 @@ def pretrain_cmd(
     max_epochs: int | None,
     batch_size: int | None,
     lr: float | None,
+    num_workers: int | None,
     subsample: float | None,
     seed: int | None,
     no_isoforms: bool,
     verbose: bool,
-    resume_from: str | None,
 ) -> None:
     """Run descriptor pretraining on molecular descriptors."""
     # Build CLI overrides dict (None values are ignored by load_config)
@@ -71,6 +68,10 @@ def pretrain_cmd(
         overrides["batch_size"] = batch_size
     if lr is not None:
         overrides["lr"] = lr
+    if num_workers is not None:
+        overrides["num_workers"] = num_workers
+    if subsample is not None:
+        overrides["subsample"] = subsample
     if seed is not None:
         overrides["seed"] = seed
     if no_isoforms:
@@ -82,9 +83,7 @@ def pretrain_cmd(
         smiles_path=smiles,
         config=cfg,
         output_dir=output,
-        subsample=subsample,
         verbose=verbose,
-        resume_from=resume_from,
     )
 
 
