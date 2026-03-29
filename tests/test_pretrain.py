@@ -115,6 +115,16 @@ class TestConfig:
         with pytest.raises(ValueError, match=r"conformers\.n_generate must be >= 1"):
             load_config(yaml_path=str(yaml_file))
 
+    def test_load_config_rejects_non_positive_subsample(self):
+        """subsample must be strictly positive."""
+        with pytest.raises(ValueError, match=r"subsample must be in the interval \(0.0, 1.0\]"):
+            load_config(subsample=0.0)
+
+    def test_load_config_rejects_subsample_above_one(self):
+        """subsample must not exceed 1.0."""
+        with pytest.raises(ValueError, match=r"subsample must be in the interval \(0.0, 1.0\]"):
+            load_config(subsample=1.1)
+
     def test_load_config_rejects_unknown_pretrain_key(self, tmp_path):
         """Unknown pretrain keys should fail fast."""
         yaml_file = tmp_path / "test.yaml"
@@ -337,6 +347,59 @@ class TestResolvedConfig:
         assert (tmp_path / "out" / "last_checkpoint.pt").exists()
         assert str(tmp_path / "out" / "last_checkpoint.pt") in saved_paths
 
+    def test_pretrain_argument_subsample_overrides_config_subsample(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        smiles_file = tmp_path / "mols.smi"
+        smiles_file.write_text("C\nCC\nCCC\nCCCC\nCCO\n")
+        smiles = ["C", "CC", "CCC", "CCCC", "CCO"]
+
+        cfg = PretrainConfig()
+        cfg.isoforms.enabled = False
+        cfg.subsample = 0.5
+
+        def stop_after_config(*args, **kwargs):
+            raise RuntimeError("stop after config write")
+
+        monkeypatch.setattr(
+            "golem.pretrain._prepare_split_smiles",
+            lambda _smiles, _cfg: (
+                smiles,
+                np.array([0, 1, 2]),
+                np.array([3]),
+                np.array([4]),
+            ),
+        )
+        monkeypatch.setattr("golem.pretrain.compute_descriptor_targets", stop_after_config)
+
+        with pytest.raises(RuntimeError, match="stop after config write"):
+            pretrain(
+                smiles_path=str(smiles_file),
+                config=cfg,
+                output_dir=str(tmp_path / "out"),
+                subsample=0.25,
+            )
+
+        resolved = yaml.safe_load((tmp_path / "out" / "resolved_config.yaml").read_text())
+        assert resolved["subsample"] == pytest.approx(0.25)
+
+    def test_pretrain_rejects_invalid_runtime_subsample(self, tmp_path):
+        smiles_file = tmp_path / "mols.smi"
+        smiles_file.write_text("C\nCC\n")
+
+        cfg = PretrainConfig()
+        cfg.isoforms.enabled = False
+
+        with pytest.raises(ValueError, match=r"subsample must be in the interval \(0.0, 1.0\]"):
+            pretrain(
+                smiles_path=str(smiles_file),
+                config=cfg,
+                output_dir=str(tmp_path / "out"),
+                subsample=1.5,
+            )
+
 
 class TestWarmupCosineScheduler:
     """LR scheduler creation."""
@@ -546,14 +609,30 @@ class TestWeightedObjective:
 class TestParentLevelSplit:
     """Split leakage prevention when isoforms are enabled."""
 
+    def test_synonymous_parent_smiles_are_collapsed_before_split(self):
+        cfg = PretrainConfig(split_ratios=[0.5, 0.5], seed=0)
+        cfg.isoforms.enabled = False
+
+        all_smiles, train_idx, val_idx, test_idx = _prepare_split_smiles(
+            ["CCO", "OCC", "CCN"],
+            cfg,
+        )
+
+        assert test_idx is None
+        assert "OCC" not in all_smiles
+        assert all_smiles.count("CCO") == 1
+        train_smiles = [all_smiles[i] for i in train_idx]
+        val_smiles = [all_smiles[i] for i in val_idx]
+        assert set(train_smiles).isdisjoint(val_smiles)
+
     def test_isoforms_do_not_cross_split_boundaries(self, monkeypatch):
         cfg = PretrainConfig(split_ratios=[0.5, 0.5], seed=0)
-        parent_smiles = ["parent_a", "parent_b"]
+        parent_smiles = ["CCO", "CCN"]
 
         def fake_enumerate(smiles_list, _config):
             return {
-                "parent_a": ["shared_isoform", "train_only"],
-                "parent_b": ["shared_isoform", "val_only"],
+                "CCO": ["shared_isoform", "train_only"],
+                "CCN": ["shared_isoform", "val_only"],
             }
 
         monkeypatch.setattr("golem.pretrain.enumerate_isoforms_batch", fake_enumerate)
@@ -570,18 +649,71 @@ class TestParentLevelSplit:
 
     def test_raises_when_a_required_split_becomes_empty(self, monkeypatch):
         cfg = PretrainConfig(split_ratios=[0.5, 0.5], seed=0)
-        parent_smiles = ["parent_a", "parent_b"]
+        parent_smiles = ["CCO", "CCN"]
 
         def fake_enumerate(smiles_list, _config):
             return {
-                "parent_a": ["shared_isoform"],
-                "parent_b": ["shared_isoform"],
+                "CCO": ["shared_isoform"],
+                "CCN": ["shared_isoform"],
             }
 
         monkeypatch.setattr("golem.pretrain.enumerate_isoforms_batch", fake_enumerate)
 
         with pytest.raises(ValueError, match="empty"):
             _prepare_split_smiles(parent_smiles, cfg)
+
+    def test_rejects_batch_norm_training_with_singleton_final_batch(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        smiles = ["CCO", "CCN", "CCC", "CCCl"]
+        desc_values = np.array(
+            [
+                [1.0, 2.0],
+                [2.0, 3.0],
+                [3.0, 4.0],
+                [4.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+        desc_valid = np.ones_like(desc_values, dtype=np.bool_)
+
+        cfg = PretrainConfig(max_epochs=1, batch_size=2)
+        cfg.isoforms.enabled = False
+        cfg.model.norm = "bn"
+
+        monkeypatch.setattr("golem.pretrain.load_smiles", lambda _path: smiles)
+        monkeypatch.setattr(
+            "golem.pretrain._prepare_split_smiles",
+            lambda _smiles, _cfg: (
+                smiles,
+                np.array([0, 1, 2]),
+                np.array([3]),
+                None,
+            ),
+        )
+        monkeypatch.setattr(
+            "golem.pretrain.compute_descriptor_targets",
+            lambda *_args, **_kwargs: (desc_values, desc_valid, ["d0", "d1"]),
+        )
+        monkeypatch.setattr(
+            "golem.pretrain._build_pyg_dataset",
+            lambda _smiles, values, mask, fingerprint_bits=None: [
+                _DummyBatch(
+                    torch.tensor(values[i : i + 1], dtype=torch.float32),
+                    torch.tensor(mask[i : i + 1], dtype=torch.float32),
+                )
+                for i in range(len(values))
+            ],
+        )
+
+        with pytest.raises(ValueError, match="singleton final training batch"):
+            pretrain(
+                smiles_path=str(tmp_path / "smiles.smi"),
+                config=cfg,
+                output_dir=str(tmp_path / "out"),
+            )
 
 class TestCheckpointMetadata:
     """Checkpoint metadata should include training library versions."""

@@ -54,6 +54,8 @@ from golem.utils import (
 
 logger = logging.getLogger(__name__)
 
+_BATCH_NORM_NAMES = {"bn", "batchnorm", "batch_norm"}
+
 METRICS_FIELDNAMES = [
     "epoch",
     "train_loss",
@@ -345,6 +347,38 @@ def _build_pyg_dataset(
     return data_list
 
 
+def _canonicalize_parent_smiles(parent_smiles: List[str]) -> List[str]:
+    """Canonicalize and deduplicate parent SMILES before splitting."""
+    canonical_smiles: List[str] = []
+    seen_smiles: set[str] = set()
+    n_collapsed = 0
+
+    for smi in parent_smiles:
+        canonical_smi = smi
+        mol = Chem.MolFromSmiles(smi)
+        if mol is not None:
+            try:
+                Chem.SanitizeMol(mol)
+                canonical_smi = Chem.MolToSmiles(mol, canonical=True)
+            except Exception:
+                canonical_smi = smi
+
+        if canonical_smi in seen_smiles:
+            n_collapsed += 1
+            continue
+
+        seen_smiles.add(canonical_smi)
+        canonical_smiles.append(canonical_smi)
+
+    if n_collapsed:
+        logger.info(
+            "Collapsed %d duplicate/synonymous parent SMILES before splitting",
+            n_collapsed,
+        )
+
+    return canonical_smiles
+
+
 def _expand_smiles_within_split(
     parent_smiles: List[str],
     config: PretrainConfig,
@@ -377,6 +411,7 @@ def _prepare_split_smiles(
     config: PretrainConfig,
 ) -> Tuple[List[str], np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Split parent molecules first, then expand isoforms within each split."""
+    parent_smiles = _canonicalize_parent_smiles(parent_smiles)
     parent_splits = split_data(len(parent_smiles), config.split_ratios, seed=config.seed)
 
     if len(parent_splits) == 3:
@@ -427,6 +462,42 @@ def _prepare_split_smiles(
     return all_smiles, train_idx, val_idx, test_idx
 
 
+def _validate_training_batch_configuration(
+    train_size: int,
+    config: PretrainConfig,
+) -> None:
+    """Reject batch-norm training setups that would create singleton batches."""
+    if config.model.norm.lower() not in _BATCH_NORM_NAMES:
+        return
+    if train_size == 0:
+        return
+
+    singleton_final_batch = config.batch_size == 1 or train_size % config.batch_size == 1
+    if not singleton_final_batch:
+        return
+
+    suggested_batch_sizes: list[int] = []
+    for candidate in (config.batch_size - 1, config.batch_size + 1, train_size):
+        if 1 < candidate <= train_size and train_size % candidate != 1:
+            if candidate not in suggested_batch_sizes:
+                suggested_batch_sizes.append(candidate)
+
+    suggestion = ""
+    if suggested_batch_sizes:
+        suggestion = " Try batch_size=" + " or ".join(
+            str(candidate) for candidate in suggested_batch_sizes
+        ) + "."
+
+    raise ValueError(
+        "batch_size="
+        f"{config.batch_size} with {train_size} training samples would create a "
+        "singleton final training batch, which is incompatible with "
+        f"model.norm={config.model.norm!r}. Choose a batch size where "
+        "train_size % batch_size != 1, adjust the split/subsample, or switch "
+        f"away from batch norm.{suggestion}"
+    )
+
+
 def pretrain(
     smiles_path: str,
     config: PretrainConfig,
@@ -441,7 +512,8 @@ def pretrain(
         config: Resolved ``PretrainConfig``.
         output_dir: Directory for checkpoints, logs, metrics.
         subsample: If set, randomly subsample this fraction of SMILES
-            before processing (e.g. 0.1 for 10%).
+            before processing (e.g. 0.1 for 10%). Explicit function
+            arguments override ``config.subsample`` and must be in ``(0, 1]``.
         verbose: If True, show DEBUG-level logs on console.
 
     Returns:
@@ -473,7 +545,9 @@ def pretrain(
     logger.info("Device: %s", device)
 
     seed_everything(config.seed)
-    effective_subsample = config.subsample if config.subsample is not None else subsample
+    effective_subsample = subsample if subsample is not None else config.subsample
+    if effective_subsample is not None and not (0.0 < effective_subsample <= 1.0):
+        raise ValueError("subsample must be in the interval (0.0, 1.0].")
 
     if config.max_epochs > 0 and config.warmup_epochs >= config.max_epochs:
         logger.warning(
@@ -582,6 +656,7 @@ def pretrain(
         desc_valid[train_idx],
         fingerprint_bits=train_fp,
     )
+    _validate_training_batch_configuration(len(train_data), config)
     val_data = _build_pyg_dataset(
         val_smiles,
         desc_values[val_idx],

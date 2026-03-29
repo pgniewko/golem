@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field, asdict, fields
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Any, List, Optional, Tuple
 
 import yaml
@@ -107,6 +107,21 @@ def _validate_integer_field(name: str, value: Any, *, minimum: int) -> None:
         raise ValueError(f"{name} must be an integer.")
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}.")
+
+
+def _validate_fraction_field(
+    name: str,
+    value: Any,
+    *,
+    minimum_exclusive: float,
+    maximum_inclusive: float,
+) -> None:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a real number.")
+    if not (minimum_exclusive < float(value) <= maximum_inclusive):
+        raise ValueError(
+            f"{name} must be in the interval ({minimum_exclusive}, {maximum_inclusive}]."
+        )
 
 
 @dataclass
@@ -247,7 +262,15 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     )
     if config.descriptors.loss_weight < 0:
         raise ValueError("descriptors.loss_weight must be >= 0.")
+    _validate_integer_field("batch_size", config.batch_size, minimum=1)
     _validate_integer_field("conformers.n_generate", config.conformers.n_generate, minimum=1)
+    if config.subsample is not None:
+        _validate_fraction_field(
+            "subsample",
+            config.subsample,
+            minimum_exclusive=0.0,
+            maximum_inclusive=1.0,
+        )
     return config
 
 
