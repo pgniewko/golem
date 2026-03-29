@@ -96,7 +96,7 @@ descriptors:
   include_3d_targets: true
 ```
 
-Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. If 3D targets are enabled and a molecule times out during conformer generation or has an incomplete 3D descriptor ensemble, that molecule is skipped before training, validation, and test evaluation. ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ETKDGv3`, conformer optimization uses fixed `MMFF` with `UFF` fallback, and all conformers within `conformers.energy_window_kcal` of the lowest-energy conformer are retained.
+Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ETKDGv3`, conformer optimization uses fixed `MMFF` with `UFF` fallback, and the single lowest-energy conformer from `conformers.n_generate` attempts is used for 3D descriptors. If conformer generation or a 3D descriptor family fails, the molecule is kept and the affected 3D targets are masked the same way invalid 2D descriptor entries are masked.
 
 ### CLI options
 
@@ -160,7 +160,7 @@ golem report experiments/pretrain --output path/to/report.html
 pytest tests -q
 ```
 
-The tests cover isoform enumeration, 2D/3D descriptor computation, the NaN-aware scaler, config loading, data splitting, and SMILES file loading. Note: descriptor tests require `mordredcommunity` and may take a few seconds.
+The tests cover isoform enumeration, 2D descriptor computation, the NaN-aware scaler, config loading, data splitting, and SMILES file loading. Note: descriptor tests require `mordredcommunity` and may take a few seconds.
 
 ### Key module responsibilities
 
@@ -168,7 +168,7 @@ The tests cover isoform enumeration, 2D/3D descriptor computation, the NaN-aware
 |--------|-------------|
 | `cli.py` | Parses CLI args, merges config, calls `pretrain()` |
 | `config.py` | Defines `PretrainConfig` dataclass tree; merges defaults / YAML overrides / CLI |
-| `conformers.py` | Builds RDKit conformer ensembles for optional 3D descriptor targets |
+| `conformers.py` | Builds the lowest-energy RDKit conformer used for optional 3D descriptor targets |
 | `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
 | `descriptors.py` | Computes 2D/3D descriptor targets; provides `NaNAwareStandardScaler` |
 | `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; isoforms &rarr; descriptors &rarr; split &rarr; scale &rarr; train &rarr; checkpoint |

@@ -17,12 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ConformerEnsemble:
-    """Retained conformers and their relative energies."""
+class LowestEnergyConformer:
+    """The single optimized conformer used for 3D descriptor targets."""
 
     mol: Chem.Mol
-    conformer_ids: list[int]
-    relative_energies_kcal: np.ndarray
+    conformer_id: int
 
 
 def _molecule_seed(smiles: str, seed: int) -> int:
@@ -54,13 +53,13 @@ def _optimize_conformers(mol: Chem.Mol, method: str) -> dict[int, float] | None:
     return energies or None
 
 
-def generate_conformer_ensemble(
+def generate_lowest_energy_conformer(
     smiles: str,
     config: ConformerConfig,
     *,
     seed: int,
-) -> tuple[ConformerEnsemble | None, str | None]:
-    """Generate a low-energy conformer ensemble."""
+) -> tuple[LowestEnergyConformer | None, str | None]:
+    """Generate conformers and keep only the lowest-energy optimized conformer."""
     started_at = time.monotonic()
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -92,33 +91,12 @@ def generate_conformer_ensemble(
             return None, "timeout"
         return None, "optimization_failed"
 
-    min_energy = min(energies.values())
-    kept = [
-        (conf_id, energy - min_energy)
-        for conf_id, energy in sorted(energies.items(), key=lambda item: item[1])
-    ]
-    kept = [
-        (conf_id, rel_energy)
-        for conf_id, rel_energy in kept
-        # The default window of 2.73 kcal/mol corresponds to a Boltzmann factor
-        # of about 0.01 relative to the lowest-energy conformer at room temperature.
-        if rel_energy <= config.energy_window_kcal
-    ]
-
-    if not kept:
-        raise RuntimeError(
-            "No conformers remained after non-negative energy-window filtering; "
-            "this should be unreachable with a valid config."
-        )
+    best_conformer_id = min(energies.items(), key=lambda item: item[1])[0]
 
     return (
-        ConformerEnsemble(
+        LowestEnergyConformer(
             mol=mol,
-            conformer_ids=[conf_id for conf_id, _ in kept],
-            relative_energies_kcal=np.asarray(
-                [rel_energy for _, rel_energy in kept],
-                dtype=np.float64,
-            ),
+            conformer_id=best_conformer_id,
         ),
         None,
     )

@@ -11,7 +11,6 @@ from golem.config import (
 from golem.descriptors import NaNAwareStandardScaler
 from golem.pretrain import (
     _checkpoint_library_versions,
-    _filter_target_rows,
     _make_warmup_cosine_scheduler,
     _prepare_split_smiles,
     _save_checkpoint,
@@ -65,22 +64,31 @@ class TestConfig:
     def test_load_config_rejects_removed_conformer_knobs(self, tmp_path):
         """Removed conformer keys should fail fast."""
         yaml_file = tmp_path / "test.yaml"
-        yaml_file.write_text("conformers:\n  n_keep: 4\n  prune_rms: 0.75\n")
+        yaml_file.write_text(
+            "conformers:\n"
+            "  energy_window_kcal: 2.73\n"
+            "  n_keep: 4\n"
+            "  prune_rms: 0.75\n"
+        )
         with pytest.raises(ValueError, match="Removed config keys"):
             load_config(yaml_path=str(yaml_file))
 
-    def test_load_config_rejects_negative_energy_window(self, tmp_path):
-        """energy_window_kcal must be non-negative."""
+    def test_load_config_rejects_unknown_conformer_key(self, tmp_path):
+        """Unknown conformer keys should fail fast."""
         yaml_file = tmp_path / "test.yaml"
-        yaml_file.write_text("conformers:\n  energy_window_kcal: -1.0\n")
-        with pytest.raises(ValueError, match="energy_window_kcal must be >= 0"):
+        yaml_file.write_text("conformers:\n  energy_window_kcl: 2.73\n")
+        with pytest.raises(ValueError, match="Unknown config keys"):
             load_config(yaml_path=str(yaml_file))
 
-    def test_load_config_rejects_non_finite_energy_window(self, tmp_path):
-        """energy_window_kcal must be finite."""
+    def test_load_config_rejects_unknown_three_d_setting_key(self, tmp_path):
+        """Unknown 3D descriptor settings should fail fast."""
         yaml_file = tmp_path / "test.yaml"
-        yaml_file.write_text("conformers:\n  energy_window_kcal: .nan\n")
-        with pytest.raises(ValueError, match="energy_window_kcal must be finite"):
+        yaml_file.write_text(
+            "descriptors:\n"
+            "  three_d_settings:\n"
+            "    rdkit_include_getway: true\n"
+        )
+        with pytest.raises(ValueError, match="Unknown config keys"):
             load_config(yaml_path=str(yaml_file))
 
 
@@ -369,33 +377,6 @@ class TestParentLevelSplit:
 
         with pytest.raises(ValueError, match="empty"):
             _prepare_split_smiles(parent_smiles, cfg)
-
-
-class TestTargetRowFiltering:
-    def test_filter_target_rows_remaps_nontrivial_three_way_split(self):
-        smiles = ["a", "b", "c", "d", "e", "f"]
-        values = np.arange(12, dtype=np.float32).reshape(6, 2)
-        mask = np.ones((6, 2), dtype=np.bool_)
-        keep = np.array([True, False, True, False, True, True], dtype=np.bool_)
-
-        out = _filter_target_rows(
-            smiles,
-            values,
-            mask,
-            keep,
-            train_idx=np.array([0, 1, 2]),
-            val_idx=np.array([3, 4]),
-            test_idx=np.array([5]),
-        )
-
-        filtered_smiles, filtered_values, filtered_mask, train_idx, val_idx, test_idx = out
-        assert filtered_smiles == ["a", "c", "e", "f"]
-        np.testing.assert_array_equal(filtered_values, values[[0, 2, 4, 5]])
-        np.testing.assert_array_equal(filtered_mask, mask[[0, 2, 4, 5]])
-        np.testing.assert_array_equal(train_idx, np.array([0, 1]))
-        np.testing.assert_array_equal(val_idx, np.array([2]))
-        np.testing.assert_array_equal(test_idx, np.array([3]))
-
 
 class TestCheckpointMetadata:
     """Checkpoint metadata should include training library versions."""

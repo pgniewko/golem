@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from copy import deepcopy
 from dataclasses import dataclass, field, asdict, fields
 from typing import Any, List, Optional, Tuple
@@ -81,17 +80,17 @@ class DescriptorConfig:
 
 @dataclass
 class ConformerConfig:
-    """Offline conformer generation settings for 3D descriptor targets.
-
-    All optimized conformers within ``energy_window_kcal`` of the
-    lowest-energy conformer are retained. The default cutoff of 2.73 keeps
-    conformers whose Boltzmann factor is at least about 0.01 at
-    ``kT = 0.593`` kcal/mol.
-    """
+    """Offline conformer generation settings for 3D descriptor targets."""
 
     n_generate: int = 8
     timeout_seconds: int = 15
-    energy_window_kcal: float = 2.73
+
+
+def _reject_unknown_keys(section_name: str, values: dict, allowed_keys: set[str]) -> None:
+    unknown_keys = sorted(set(values) - allowed_keys)
+    if unknown_keys:
+        unknown = ", ".join(f"{section_name}.{key}" for key in unknown_keys)
+        raise ValueError(f"Unknown config keys: {unknown}.")
 
 
 @dataclass
@@ -161,12 +160,14 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         fb = isoform_d.pop("rdkit_fallback")
         isoform_d["rdkit_fallback"] = fb.get("enabled", False)
 
-    removed_conformer_keys = {"n_keep", "prune_rms"} & set(conformers_d)
+    removed_conformer_keys = {"energy_window_kcal", "n_keep", "prune_rms"} & set(
+        conformers_d
+    )
     if removed_conformer_keys:
         removed = ", ".join(f"conformers.{key}" for key in sorted(removed_conformer_keys))
         raise ValueError(
             f"Removed config keys: {removed}. "
-            "Use conformers.energy_window_kcal to control conformer retention."
+            "Generate conformers with conformers.n_generate; the lowest-energy conformer is kept."
         )
 
     # Remove keys not in dataclass.
@@ -177,6 +178,9 @@ def _dict_to_config(d: dict) -> PretrainConfig:
     conformer_fields = {f.name for f in fields(ConformerConfig)}
     alignment_fields = {f.name for f in fields(ECFPLatentAlignmentConfig)}
     pretrain_fields = {f.name for f in fields(PretrainConfig)}
+
+    _reject_unknown_keys("conformers", conformers_d, conformer_fields)
+    _reject_unknown_keys("descriptors.three_d_settings", descriptor3d_d, descriptor3d_fields)
 
     model_d = {k: v for k, v in model_d.items() if k in model_fields}
     isoform_d = {k: v for k, v in isoform_d.items() if k in isoform_fields}
@@ -218,10 +222,6 @@ def _dict_to_config(d: dict) -> PretrainConfig:
         raise ValueError("descriptors.loss_weight must be >= 0.")
     if config.conformers.timeout_seconds < 0:
         raise ValueError("conformers.timeout_seconds must be >= 0.")
-    if not math.isfinite(config.conformers.energy_window_kcal):
-        raise ValueError("conformers.energy_window_kcal must be finite.")
-    if config.conformers.energy_window_kcal < 0:
-        raise ValueError("conformers.energy_window_kcal must be >= 0.")
     return config
 
 

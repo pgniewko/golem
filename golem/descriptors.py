@@ -23,11 +23,10 @@ from rdkit import Chem
 from tqdm import tqdm
 
 from golem.config import ConformerConfig, DescriptorConfig, Descriptor3DSettings
-from golem.conformers import generate_conformer_ensemble
+from golem.conformers import generate_lowest_energy_conformer
 
 logger = logging.getLogger(__name__)
 
-_BOLTZMANN_KT_KCAL = 0.593
 _THREE_D_FAMILIES = ("rdkit3d", "usrcat", "electroshape")
 
 
@@ -128,31 +127,14 @@ def _calculator_columns(calculator: object) -> List[str]:
     return list(columns)
 
 
-def _aggregate_boltzmann_mean(
-    descriptor_values: np.ndarray,
-    validity_mask: np.ndarray,
-    relative_energies_kcal: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    weights = np.exp(-relative_energies_kcal / _BOLTZMANN_KT_KCAL)
-    weighted_mask = validity_mask * weights[:, None]
-    weight_sum = weighted_mask.sum(axis=0)
-    aggregated = np.divide(
-        np.where(validity_mask, descriptor_values * weights[:, None], 0.0).sum(axis=0),
-        weight_sum,
-        out=np.zeros(descriptor_values.shape[1], dtype=np.float64),
-        where=weight_sum > 0,
-    )
-    return aggregated.astype(np.float32), weight_sum > 0
-
-
-def compute_aggregated_3d_descriptors(
+def compute_3d_descriptors(
     smiles_list: List[str],
     three_d_settings: Descriptor3DSettings,
     conformers: ConformerConfig,
     *,
     seed: int,
-) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray]:
-    """Compute and aggregate the fixed 3D descriptor pack."""
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Compute the fixed 3D descriptor pack on the lowest-energy conformer."""
     calculators = _build_3d_calculators(three_d_settings)
     columns_by_family = {
         family: _calculator_columns(calculators[family]) for family in _THREE_D_FAMILIES
@@ -165,64 +147,48 @@ def compute_aggregated_3d_descriptors(
     total_width = len(descriptor_names)
     values = np.zeros((len(smiles_list), total_width), dtype=np.float32)
     validity_mask = np.zeros((len(smiles_list), total_width), dtype=np.bool_)
-    keep_mask = np.ones(len(smiles_list), dtype=np.bool_)
-    dropped_timeout = 0
-    dropped_conformer_failures = 0
-    dropped_invalid_descriptors = 0
+    conformer_timeouts = 0
+    conformer_failures = 0
+    descriptor_failures = 0
 
     for row_idx, smiles in enumerate(
         tqdm(smiles_list, desc="3D descriptors", unit="mol")
     ):
-        ensemble, failure_reason = generate_conformer_ensemble(
+        conformer, failure_reason = generate_lowest_energy_conformer(
             smiles,
             conformers,
             seed=seed,
         )
-        if ensemble is None:
-            keep_mask[row_idx] = False
+        if conformer is None:
             if failure_reason == "timeout":
-                dropped_timeout += 1
+                conformer_timeouts += 1
             else:
-                dropped_conformer_failures += 1
+                conformer_failures += 1
             continue
 
         offset = 0
-        row_is_valid = True
         for family in _THREE_D_FAMILIES:
             width = len(columns_by_family[family])
             try:
-                rows = []
-                masks = []
-                for conformer_id in ensemble.conformer_ids:
-                    row = np.asarray(
-                        calculators[family](ensemble.mol, conformer_id=conformer_id),
-                        dtype=np.float64,
-                    )
-                    if row.shape != (width,):
-                        raise RuntimeError(
-                            f"{family} returned shape {row.shape}, expected {(width,)}"
-                        )
-                    mask = np.isfinite(row)
-                    rows.append(np.where(mask, row, 0.0))
-                    masks.append(mask)
-                family_values, family_mask = _aggregate_boltzmann_mean(
-                    np.vstack(rows),
-                    np.vstack(masks),
-                    ensemble.relative_energies_kcal,
+                row = np.asarray(
+                    calculators[family](conformer.mol, conformer_id=conformer.conformer_id),
+                    dtype=np.float64,
                 )
+                if row.shape != (width,):
+                    raise RuntimeError(
+                        f"{family} returned shape {row.shape}, expected {(width,)}"
+                    )
+                family_mask = np.isfinite(row)
+                family_values = np.where(family_mask, row, 0.0).astype(np.float32)
             except Exception:
                 logger.debug("3D descriptor family %s failed for %s", family, smiles, exc_info=True)
                 family_values = np.zeros(width, dtype=np.float32)
                 family_mask = np.zeros(width, dtype=np.bool_)
+                descriptor_failures += 1
 
             values[row_idx, offset : offset + width] = family_values
             validity_mask[row_idx, offset : offset + width] = family_mask
             offset += width
-            row_is_valid &= bool(family_mask.all())
-
-        if not row_is_valid:
-            keep_mask[row_idx] = False
-            dropped_invalid_descriptors += 1
 
     logger.info(
         "3D descriptors: %d molecules × %d descriptors (%.1f%% valid entries)",
@@ -230,16 +196,15 @@ def compute_aggregated_3d_descriptors(
         values.shape[1],
         validity_mask.mean() * 100 if validity_mask.size else 0.0,
     )
-    if dropped_timeout or dropped_conformer_failures or dropped_invalid_descriptors:
+    if conformer_timeouts or conformer_failures or descriptor_failures:
         logger.info(
-            "Dropped %d molecules during 3D target generation "
-            "(%d timeouts, %d other conformer failures, %d invalid descriptor ensembles)",
-            int((~keep_mask).sum()),
-            dropped_timeout,
-            dropped_conformer_failures,
-            dropped_invalid_descriptors,
+            "3D target generation kept all molecules in-place "
+            "(%d conformer timeouts, %d other conformer failures, %d descriptor-family failures; invalid entries were masked)",
+            conformer_timeouts,
+            conformer_failures,
+            descriptor_failures,
         )
-    return values, validity_mask, descriptor_names, keep_mask
+    return values, validity_mask, descriptor_names
 
 
 def compute_descriptor_targets(
@@ -248,7 +213,7 @@ def compute_descriptor_targets(
     conformers: ConformerConfig,
     *,
     seed: int,
-) -> Tuple[np.ndarray, np.ndarray, List[str], np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """Compute the configured 2D/3D descriptor target matrix."""
     if not descriptors.include_2d_targets and not descriptors.include_3d_targets:
         raise ValueError("At least one descriptor target family must be enabled.")
@@ -256,7 +221,6 @@ def compute_descriptor_targets(
     values_blocks = []
     mask_blocks = []
     name_blocks = []
-    keep_mask = np.ones(len(smiles_list), dtype=np.bool_)
 
     if descriptors.include_2d_targets:
         values_2d, mask_2d, names_2d = compute_mordred_descriptors(smiles_list)
@@ -265,7 +229,7 @@ def compute_descriptor_targets(
         name_blocks.append(names_2d)
 
     if descriptors.include_3d_targets:
-        values_3d, mask_3d, names_3d, keep_3d = compute_aggregated_3d_descriptors(
+        values_3d, mask_3d, names_3d = compute_3d_descriptors(
             smiles_list,
             descriptors.three_d_settings,
             conformers,
@@ -274,16 +238,14 @@ def compute_descriptor_targets(
         values_blocks.append(values_3d)
         mask_blocks.append(mask_3d)
         name_blocks.append(names_3d)
-        keep_mask &= keep_3d
 
     if len(values_blocks) == 1:
-        return values_blocks[0], mask_blocks[0], name_blocks[0], keep_mask
+        return values_blocks[0], mask_blocks[0], name_blocks[0]
 
     return (
         np.concatenate(values_blocks, axis=1),
         np.concatenate(mask_blocks, axis=1),
         [name for block in name_blocks for name in block],
-        keep_mask,
     )
 
 

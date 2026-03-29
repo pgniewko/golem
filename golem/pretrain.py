@@ -337,68 +337,6 @@ def _build_pyg_dataset(
     return data_list
 
 
-# ---------------------------------------------------------------------------
-# Main pretrain function
-# ---------------------------------------------------------------------------
-
-
-def _filter_target_rows(
-    smiles_list: List[str],
-    descriptor_values: np.ndarray,
-    validity_mask: np.ndarray,
-    keep_mask: np.ndarray,
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
-    test_idx: Optional[np.ndarray],
-) -> Tuple[List[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    """Drop rows excluded by target generation and remap split indices."""
-    if keep_mask.all():
-        return smiles_list, descriptor_values, validity_mask, train_idx, val_idx, test_idx
-
-    old_to_new = np.full(len(smiles_list), -1, dtype=np.int64)
-    old_to_new[keep_mask] = np.arange(int(keep_mask.sum()), dtype=np.int64)
-
-    def _remap(split_idx: np.ndarray) -> np.ndarray:
-        kept = split_idx[keep_mask[split_idx]]
-        return old_to_new[kept]
-
-    new_train_idx = _remap(train_idx)
-    new_val_idx = _remap(val_idx)
-    new_test_idx = _remap(test_idx) if test_idx is not None else None
-
-    if new_train_idx.size == 0 or new_val_idx.size == 0:
-        raise ValueError(
-            "Skipping molecules with failed 3D descriptor generation emptied the "
-            "train or validation split. Disable 3D targets or use a larger dataset."
-        )
-
-    logger.info(
-        "Skipped %d molecules with failed 3D descriptor generation (train=%d, val=%d, test=%d)",
-        int((~keep_mask).sum()),
-        int(train_idx.size - new_train_idx.size),
-        int(val_idx.size - new_val_idx.size),
-        int(test_idx.size - new_test_idx.size) if new_test_idx is not None else 0,
-    )
-
-    if new_test_idx is not None and new_test_idx.size == 0:
-        logger.warning("All test molecules were skipped due to failed 3D descriptor generation")
-        new_test_idx = None
-
-    filtered_smiles = [
-        smiles
-        for smiles, keep in zip(smiles_list, keep_mask, strict=False)
-        if keep
-    ]
-    return (
-        filtered_smiles,
-        descriptor_values[keep_mask],
-        validity_mask[keep_mask],
-        new_train_idx,
-        new_val_idx,
-        new_test_idx,
-    )
-
-
 def _expand_smiles_within_split(
     parent_smiles: List[str],
     config: PretrainConfig,
@@ -577,30 +515,12 @@ def pretrain(
         config.descriptors.include_2d_targets,
         config.descriptors.include_3d_targets,
     )
-    desc_values, desc_valid, descriptor_names, keep_rows = compute_descriptor_targets(
+    desc_values, desc_valid, descriptor_names = compute_descriptor_targets(
         smiles_list,
         config.descriptors,
         config.conformers,
         seed=config.seed,
     )
-
-    if config.descriptors.include_3d_targets:
-        (
-            smiles_list,
-            desc_values,
-            desc_valid,
-            train_idx,
-            val_idx,
-            test_idx,
-        ) = _filter_target_rows(
-            smiles_list,
-            desc_values,
-            desc_valid,
-            keep_rows,
-            train_idx,
-            val_idx,
-            test_idx,
-        )
 
     num_descriptors = desc_values.shape[1]
     logger.info("Descriptor matrix: %d molecules × %d descriptors", desc_values.shape[0], num_descriptors)
