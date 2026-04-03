@@ -84,6 +84,13 @@ golem pretrain \
 Config files in `configs/` are intended to contain overrides over the defaults in
 `golem.config.PretrainConfig`, not a full copy of every setting.
 
+Input SMILES are exact-string deduplicated before splitting. Train/validation/test
+splits are then built on shuffled `core_smiles` groups, where each core is the
+canonicalized, sanitized, neutralized, non-isomeric form of the input SMILES.
+That grouping intentionally ignores chirality and alkene E/Z geometry so related
+stereoisomers stay in the same split, and split boundaries are snapped to whole-core
+group boundaries before isoform expansion.
+
 Optional ECFP-latent alignment can be enabled in YAML:
 
 ```yaml
@@ -165,15 +172,15 @@ golem report experiments/pretrain --output path/to/report.html
 | `conformers.py` | Builds the lowest-energy RDKit conformer used for optional 3D descriptor targets |
 | `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
 | `descriptors.py` | Computes 2D/3D descriptor targets; provides `NaNAwareStandardScaler` |
-| `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; split parents &rarr; expand isoforms within each split &rarr; descriptors &rarr; scale &rarr; train &rarr; checkpoint |
-| `utils.py` | Shared utilities: seeding, train/val/test splitting, PyG DataLoader creation, SMILES file loading |
+| `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; deduplicate exact inputs &rarr; split shuffled neutralized core groups &rarr; expand isoforms within each split &rarr; descriptors &rarr; scale &rarr; train &rarr; checkpoint |
+| `utils.py` | Shared utilities: seeding, train/val/test splitting helpers, PyG DataLoader creation, SMILES file loading |
 
 ### Where things live
 
 | Looking for... | Go to |
 |----------------|-------|
 | How the model is constructed | `pretrain.py` model creation section |
-| The masked MSE pretraining loss | `pretrain.py:_train_one_epoch()` |
+| The masked MSE pretraining loss | `pretrain.py:_run_epoch()` |
 | NaN handling / validity masking | `descriptors.py:compute_mordred_descriptors()` |
 | Scaler fit (train-only, no leakage) | `pretrain.py:pretrain()` step 5 |
 | Config defaults | `config.py` dataclass definitions |

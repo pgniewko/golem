@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from rdkit import Chem
+from rdkit.Chem.MolStandardize import rdMolStandardize
 
 from golem.config import (
     ECFPLatentAlignmentConfig,
@@ -35,7 +36,7 @@ from golem.ecfp_latent_alignment import (
 )
 from golem.isoforms import enumerate_isoforms_batch
 from golem.report import generate_report
-from golem.utils import load_smiles, make_loader, seed_everything, split_data
+from golem.utils import load_smiles, make_loader, seed_everything
 
 logger = logging.getLogger(__name__)
 
@@ -275,63 +276,115 @@ def _build_pyg_dataset(
     return data_list
 
 
-def _prepare_parent_smiles(parent_smiles: list[str]) -> list[str]:
-    """Drop invalid parents, canonicalize valid ones, and deduplicate synonyms."""
-    canonical_smiles: list[str] = []
-    seen_smiles: set[str] = set()
-    n_filtered = 0
-    n_collapsed = 0
-
-    for smiles in parent_smiles:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            logger.debug("Filtered unparseable SMILES: %s", smiles)
-            n_filtered += 1
-            continue
-        try:
-            Chem.SanitizeMol(mol)
-            canonical_smiles_value = Chem.MolToSmiles(mol, canonical=True)
-        except Exception:
-            logger.debug("Filtered invalid SMILES: %s", smiles)
-            n_filtered += 1
-            continue
-        if canonical_smiles_value in seen_smiles:
-            n_collapsed += 1
-            continue
-        seen_smiles.add(canonical_smiles_value)
-        canonical_smiles.append(canonical_smiles_value)
-
-    if n_filtered:
-        logger.info(
-            "Filtered %d invalid SMILES (%d remain)",
-            n_filtered,
-            len(parent_smiles) - n_filtered,
+def _derive_core_smiles(smiles: str) -> str:
+    """Return the neutralized non-isomeric canonical core used for split grouping."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        logger.warning(
+            "Could not parse SMILES for core grouping; using raw input as its own core: %s",
+            smiles,
         )
-    if n_collapsed:
-        logger.info(
-            "Collapsed %d duplicate/synonymous parent SMILES before splitting",
-            n_collapsed,
+        return smiles
+
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception:
+        logger.warning(
+            "Could not sanitize SMILES for core grouping; using raw input as its own core: %s",
+            smiles,
         )
-    return canonical_smiles
+        return smiles
+
+    canonical_smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)
+    try:
+        uncharged = rdMolStandardize.Uncharger().uncharge(mol)
+        if uncharged is None:
+            return canonical_smiles
+        return Chem.MolToSmiles(uncharged, canonical=True, isomericSmiles=False)
+    except Exception:
+        logger.debug(
+            "Neutralization failed while deriving core SMILES; falling back to canonical sanitized SMILES for %s",
+            smiles,
+            exc_info=True,
+        )
+        return canonical_smiles
+
+
+def _split_counts(total: int, fractions: list[float]) -> list[int]:
+    """Convert fractional split ratios into item counts using the existing rounding rule."""
+    counts: list[int] = []
+    start = 0
+    for index, fraction in enumerate(fractions):
+        if index == len(fractions) - 1:
+            counts.append(total - start)
+            continue
+        end = start + int(total * fraction)
+        counts.append(end - start)
+        start = end
+    return counts
+
+
+def _choose_split_boundaries(
+    group_sizes: list[int],
+    fractions: list[float],
+) -> list[int]:
+    """Choose nearest block boundaries to the ideal split cut positions."""
+    n_groups = len(group_sizes)
+    n_splits = len(fractions)
+    if n_groups < n_splits:
+        raise ValueError(
+            "Need at least as many unique core groups as requested splits. "
+            f"Got {n_groups} unique cores for {n_splits} splits."
+        )
+
+    cumulative_sizes = np.cumsum(group_sizes).tolist()
+    ideal_counts = _split_counts(sum(group_sizes), fractions)
+    ideal_cuts = np.cumsum(ideal_counts[:-1]).tolist()
+
+    boundary_group_counts = list(range(1, n_groups))
+    chosen_boundaries: list[int] = []
+    previous_group_count = 0
+    for cut_index, ideal_cut in enumerate(ideal_cuts):
+        min_group_count = previous_group_count + 1
+        max_group_count = n_groups - (len(ideal_cuts) - cut_index)
+        feasible_group_counts = [
+            group_count
+            for group_count in boundary_group_counts
+            if min_group_count <= group_count <= max_group_count
+        ]
+        if not feasible_group_counts:
+            raise ValueError("Could not place split boundaries without breaking core groups.")
+
+        chosen_group_count = min(
+            feasible_group_counts,
+            key=lambda group_count: (
+                abs(cumulative_sizes[group_count - 1] - ideal_cut),
+                cumulative_sizes[group_count - 1],
+            ),
+        )
+        chosen_boundaries.append(cumulative_sizes[chosen_group_count - 1])
+        previous_group_count = chosen_group_count
+
+    return chosen_boundaries
 
 
 def _expand_smiles_within_split(
-    parent_smiles: list[str],
+    original_smiles: list[str],
     config: PretrainConfig,
     seen_smiles: set[str],
 ) -> list[str]:
-    """Expand parent SMILES within one split and deduplicate across splits."""
-    if not parent_smiles:
+    """Expand original SMILES within one split and deduplicate across splits."""
+    if not original_smiles:
         return []
 
     expanded = (
-        enumerate_isoforms_batch(parent_smiles, config.isoforms)
+        enumerate_isoforms_batch(original_smiles, config.isoforms)
         if config.isoforms.enabled
-        else {smiles: [smiles] for smiles in parent_smiles}
+        else {smiles: [smiles] for smiles in original_smiles}
     )
     split_smiles: list[str] = []
-    for parent_smiles_value in parent_smiles:
-        for smiles in expanded[parent_smiles_value]:
+    for original_smiles_value in original_smiles:
+        for smiles in expanded[original_smiles_value]:
             if smiles in seen_smiles:
                 continue
             seen_smiles.add(smiles)
@@ -350,36 +403,64 @@ def _log_split_sizes(label: str, splits: dict[str, list[str]], *, has_test: bool
 
 
 def _prepare_split_smiles(
-    parent_smiles: list[str],
+    original_smiles: list[str],
     config: PretrainConfig,
 ) -> tuple[list[str], SplitIndices]:
-    """Split parent molecules first, then expand isoforms within each split."""
-    parent_smiles = _prepare_parent_smiles(parent_smiles)
-    parent_splits = split_data(len(parent_smiles), config.split_ratios, seed=config.seed)
-    split_parent_indices: SplitIndices = {
-        "train": parent_splits[0],
-        "val": parent_splits[1],
-        "test": parent_splits[2] if len(parent_splits) == 3 else None,
-    }
-    has_test = split_parent_indices["test"] is not None
-    split_parents = {
-        name: [parent_smiles[index] for index in indices]
-        if indices is not None
-        else []
-        for name, indices in split_parent_indices.items()
-    }
-    _log_split_sizes("Parent", split_parents, has_test=has_test)
+    """Split shuffled core blocks first, then expand isoforms within each split."""
+    core_to_originals: dict[str, list[str]] = {}
+    for smiles in original_smiles:
+        core_smiles = _derive_core_smiles(smiles)
+        core_to_originals.setdefault(core_smiles, []).append(smiles)
+
+    core_items = list(core_to_originals.items())
+    rng = np.random.RandomState(config.seed)
+    rng.shuffle(core_items)
+
+    shuffled_originals: list[str] = []
+    core_counts = {name: 0 for name in _SPLIT_NAMES}
+    for _, core_originals in core_items:
+        shuffled_originals.extend(core_originals)
+
+    group_sizes = [len(core_originals) for _, core_originals in core_items]
+    cumulative_group_sizes = np.cumsum(group_sizes).tolist()
+    boundaries = _choose_split_boundaries(group_sizes, config.split_ratios)
+    split_offsets = [0, *boundaries, len(shuffled_originals)]
+
+    split_originals: dict[str, list[str]] = {}
+    enabled_split_names = _SPLIT_NAMES[: len(config.split_ratios)]
+    for split_index, name in enumerate(enabled_split_names):
+        start = split_offsets[split_index]
+        end = split_offsets[split_index + 1]
+        split_originals[name] = shuffled_originals[start:end]
+    for name in _SPLIT_NAMES[len(enabled_split_names):]:
+        split_originals[name] = []
+
+    offset = 0
+    for split_index, name in enumerate(enabled_split_names):
+        split_end = split_offsets[split_index + 1]
+        while offset < len(core_items) and split_end >= cumulative_group_sizes[offset]:
+            core_counts[name] += 1
+            offset += 1
+
+    has_test = len(config.split_ratios) == 3
+    logger.info(
+        "Core split: train=%d  val=%d%s",
+        core_counts["train"],
+        core_counts["val"],
+        f"  test={core_counts['test']}" if has_test else "  (no test)",
+    )
+    _log_split_sizes("Original", split_originals, has_test=has_test)
 
     seen_smiles: set[str] = set()
     split_smiles = {
-        name: _expand_smiles_within_split(split_parents[name], config, seen_smiles)
+        name: _expand_smiles_within_split(split_originals[name], config, seen_smiles)
         for name in _SPLIT_NAMES
     }
     if not split_smiles["train"] or not split_smiles["val"] or (
         has_test and not split_smiles["test"]
     ):
         raise ValueError(
-            "One or more data splits became empty after parent-level splitting and "
+            "One or more data splits became empty after core-group splitting and "
             "within-split isoform deduplication. Increase dataset size, adjust "
             "split ratios, or disable aggressive subsampling."
         )
@@ -388,7 +469,7 @@ def _prepare_split_smiles(
     all_smiles: list[str] = []
     split_indices: SplitIndices = {}
     for name in _SPLIT_NAMES:
-        if split_parent_indices[name] is None:
+        if name not in enabled_split_names:
             split_indices[name] = None
             continue
         start = len(all_smiles)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import List, Tuple
 import numpy as np
 import torch
 from torch_geometric.loader import DataLoader
+
+logger = logging.getLogger(__name__)
 
 
 def seed_everything(seed: int) -> None:
@@ -89,7 +92,8 @@ def load_smiles(path: str) -> List[str]:
         path: Path to SMILES file.
 
     Returns:
-        List of SMILES strings.
+        List of SMILES strings with exact-string duplicates removed while
+        preserving first-seen order.
 
     Raises:
         ValueError: For unsupported file extensions.
@@ -105,7 +109,6 @@ def load_smiles(path: str) -> List[str]:
                 if line and not line.startswith("#"):
                     # Take first whitespace-delimited token (SMILES may be followed by name)
                     smiles.append(line.split()[0])
-        return smiles
 
     elif ext == ".csv":
         import pandas as pd
@@ -116,9 +119,19 @@ def load_smiles(path: str) -> List[str]:
                 f"CSV file {path} does not have a 'SMILES' column. "
                 f"Available columns: {list(df.columns)}"
             )
-        return df["SMILES"].dropna().tolist()
+        smiles = df["SMILES"].dropna().tolist()
 
     else:
         raise ValueError(
             f"Unsupported file extension '{ext}'. Use .smi or .csv"
         )
+
+    deduped_smiles = list(dict.fromkeys(smiles))
+    removed_duplicates = len(smiles) - len(deduped_smiles)
+    if removed_duplicates:
+        logger.info(
+            "Removed %d exact duplicate input SMILES while loading %s",
+            removed_duplicates,
+            path,
+        )
+    return deduped_smiles
