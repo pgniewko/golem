@@ -276,6 +276,44 @@ def _build_pyg_dataset(
     return data_list
 
 
+def _filter_valid_smiles(original_smiles: list[str]) -> list[str]:
+    """Drop invalid SMILES before split planning while preserving valid originals."""
+    valid_smiles: list[str] = []
+    invalid_examples: list[str] = []
+    parse_failures = 0
+    sanitize_failures = 0
+
+    for smiles in original_smiles:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            parse_failures += 1
+            if len(invalid_examples) < 5:
+                invalid_examples.append(smiles)
+            continue
+
+        try:
+            Chem.SanitizeMol(mol)
+        except Exception:
+            sanitize_failures += 1
+            if len(invalid_examples) < 5:
+                invalid_examples.append(smiles)
+            continue
+
+        valid_smiles.append(smiles)
+
+    filtered_count = parse_failures + sanitize_failures
+    if filtered_count:
+        logger.info(
+            "Filtered %d invalid SMILES before splitting (%d parse failures, %d sanitize failures). "
+            "Examples: %s",
+            filtered_count,
+            parse_failures,
+            sanitize_failures,
+            invalid_examples,
+        )
+    return valid_smiles
+
+
 def _derive_core_smiles(smiles: str) -> str:
     """Return the neutralized non-isomeric canonical core used for split grouping."""
     mol = Chem.MolFromSmiles(smiles)
@@ -407,6 +445,7 @@ def _prepare_split_smiles(
     config: PretrainConfig,
 ) -> tuple[list[str], SplitIndices]:
     """Split shuffled core blocks first, then expand isoforms within each split."""
+    original_smiles = _filter_valid_smiles(original_smiles)
     core_to_originals: dict[str, list[str]] = {}
     for smiles in original_smiles:
         core_smiles = _derive_core_smiles(smiles)
