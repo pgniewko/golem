@@ -84,6 +84,10 @@ golem pretrain \
 Config files in `configs/` are intended to contain overrides over the defaults in
 `golem.config.PretrainConfig`, not a full copy of every setting.
 
+The tracked example dataset in this repo lives under
+`data/openadmet/expansion_rx/`. Additional experiment inputs should stay local to
+your checkout rather than being committed to the repository.
+
 Input SMILES are exact-string deduplicated before splitting. Train/validation/test
 splits are then built on shuffled `core_smiles` groups, where each core is the
 canonicalized, sanitized, neutralized, non-isomeric form of the input SMILES.
