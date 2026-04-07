@@ -366,7 +366,16 @@ def _choose_split_boundaries(
     group_sizes: list[int],
     fractions: list[float],
 ) -> list[int]:
-    """Choose nearest block boundaries to the ideal split cut positions."""
+    """Snap ideal split cuts to feasible core-group boundaries.
+
+    ``group_sizes`` describes the shuffled contiguous core blocks that must stay
+    intact. We first compute the ideal item counts implied by ``fractions`` and
+    convert those counts into cumulative cut positions. Each ideal cut is then
+    moved to the nearest group boundary that still leaves at least one whole
+    core group available for every remaining split. When two boundaries are
+    equally close, we prefer the earlier one so we do not overfill the current
+    split.
+    """
     n_groups = len(group_sizes)
     n_splits = len(fractions)
     if n_groups < n_splits:
@@ -383,6 +392,8 @@ def _choose_split_boundaries(
     chosen_boundaries: list[int] = []
     previous_group_count = 0
     for cut_index, ideal_cut in enumerate(ideal_cuts):
+        # Keep boundaries increasing and reserve at least one group for each
+        # later split, since groups cannot be broken apart.
         min_group_count = previous_group_count + 1
         max_group_count = n_groups - (len(ideal_cuts) - cut_index)
         feasible_group_counts = [
