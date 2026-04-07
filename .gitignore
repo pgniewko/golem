@@ -15,6 +15,7 @@ experiments/test/
 # Temp files
 tmp*
 run.sh
+*pxr*
 
 # Old planning docs (retired, consolidated into docs/audit.html)
 PLAN.md
