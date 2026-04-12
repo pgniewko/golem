@@ -34,6 +34,12 @@ def main() -> None:
 @click.option("--lr", default=None, type=float, help="Override learning rate.")
 @click.option("--num-workers", default=None, type=int, help="Override data loading workers.")
 @click.option(
+    "--device",
+    default=None,
+    type=click.Choice(["auto", "cpu", "cuda", "mps"], case_sensitive=False),
+    help="Execution device override.",
+)
+@click.option(
     "--subsample", default=None, type=float,
     help="Subsample fraction of SMILES (e.g. 0.1 for 10%%).",
 )
@@ -54,6 +60,7 @@ def pretrain_cmd(
     batch_size: int | None,
     lr: float | None,
     num_workers: int | None,
+    device: str | None,
     subsample: float | None,
     seed: int | None,
     no_isoforms: bool,
@@ -70,6 +77,8 @@ def pretrain_cmd(
         overrides["lr"] = lr
     if num_workers is not None:
         overrides["num_workers"] = num_workers
+    if device is not None:
+        overrides["device"] = device
     if subsample is not None:
         overrides["subsample"] = subsample
     if seed is not None:

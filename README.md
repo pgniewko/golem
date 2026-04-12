@@ -84,6 +84,11 @@ golem pretrain \
 Config files in `configs/` are intended to contain overrides over the defaults in
 `golem.config.PretrainConfig`, not a full copy of every setting.
 
+Device selection defaults to `auto`, which resolves to `cuda` when available,
+otherwise `mps`, otherwise `cpu`. You can force a backend explicitly with
+`--device mps` or `device: mps` in YAML; explicit backend requests fail fast if
+that backend is unavailable.
+
 The tracked example dataset in this repo lives under
 `data/openadmet/expansion_rx/`.
 
@@ -121,6 +126,7 @@ Set `descriptors.include_2d_targets: false` together with `descriptors.include_3
 | `--batch-size` | Override batch size | 128 |
 | `--lr` | Override learning rate | 1e-4 |
 | `--num-workers` | Override PyG data loading workers | 0 |
+| `--device` | Device override: `auto`, `cpu`, `cuda`, or `mps` | `auto` |
 | `--subsample` | Subsample fraction (e.g. 0.1 for 10%) | None (use all) |
 | `--seed` | Override random seed | 42 |
 | `--no-isoforms` | Disable isoform enumeration | Enabled |
