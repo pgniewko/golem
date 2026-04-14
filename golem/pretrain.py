@@ -36,7 +36,7 @@ from golem.ecfp_latent_alignment import (
 )
 from golem.isoforms import enumerate_isoforms_batch
 from golem.report import generate_report
-from golem.utils import load_smiles, make_loader, seed_everything
+from golem.utils import load_smiles, make_loader, resolve_torch_device, seed_everything
 
 logger = logging.getLogger(__name__)
 
@@ -628,6 +628,11 @@ def pretrain(
     verbose: bool = False,
 ) -> Path:
     """Full pretraining pipeline."""
+    effective_subsample = subsample if subsample is not None else config.subsample
+    resolved_config = replace(config, subsample=effective_subsample)
+    validate_pretrain_config(resolved_config)
+    device = resolve_torch_device(resolved_config.device)
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     for artifact_name in (
@@ -652,13 +657,10 @@ def pretrain(
         except Exception:
             pass
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("Device: %s", device)
+    logger.info("Configured device: %s", resolved_config.device)
+    logger.info("Resolved device: %s", device)
 
-    seed_everything(config.seed)
-    effective_subsample = subsample if subsample is not None else config.subsample
-    resolved_config = replace(config, subsample=effective_subsample)
-    validate_pretrain_config(resolved_config)
+    seed_everything(resolved_config.seed, enable_cuda=device.type == "cuda")
 
     if resolved_config.warmup_epochs >= resolved_config.max_epochs:
         logger.warning(

@@ -1,4 +1,4 @@
-"""Utility functions: seeding, data splitting, DataLoader creation, SMILES loading."""
+"""Utility functions: seeding, device selection, data splitting, and I/O."""
 
 from __future__ import annotations
 
@@ -15,15 +15,55 @@ from torch_geometric.loader import DataLoader
 logger = logging.getLogger(__name__)
 
 
-def seed_everything(seed: int) -> None:
+def _get_mps_backend():
+    return getattr(torch.backends, "mps", None)
+
+
+def resolve_torch_device(requested: str) -> torch.device:
+    """Resolve a configured device choice to a concrete torch.device."""
+    choice = requested.strip().lower()
+    mps_backend = _get_mps_backend()
+
+    if choice == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if mps_backend is not None and mps_backend.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    if choice == "cpu":
+        return torch.device("cpu")
+    if choice == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        raise RuntimeError("Requested device 'cuda' is not available.")
+    if choice == "mps":
+        if mps_backend is None or not mps_backend.is_built():
+            raise RuntimeError(
+                "Requested device 'mps' is not available because the current "
+                "PyTorch install was not built with MPS support."
+            )
+        if not mps_backend.is_available():
+            raise RuntimeError(
+                "Requested device 'mps' is not available on this machine. "
+                "MPS requires macOS 12.3+ and Apple Silicon or another MPS-enabled device."
+            )
+        return torch.device("mps")
+
+    raise ValueError(f"Unsupported device choice: {requested!r}")
+
+
+def seed_everything(seed: int, *, enable_cuda: bool = False) -> None:
     """Set random seeds for reproducibility across all libraries."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+
+    if enable_cuda:
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def split_data(

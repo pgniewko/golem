@@ -105,10 +105,15 @@ class PretrainConfig:
     weight_decay: float = 1e-5
     warmup_epochs: int = 25
     num_workers: int = 0
+    device: str = "auto"
     subsample: float | None = None
     winsorize_range: Tuple[float, float] = (-6.0, 6.0)
     split_ratios: List[float] = field(default_factory=lambda: [0.7, 0.2, 0.1])
     seed: int = 42  # pretrain seed (finetune notebooks use 1928374650)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.device, str):
+            self.device = self.device.strip().lower()
 
 
 _SECTION_TYPES = {
@@ -179,6 +184,7 @@ _ISOFORM_BLOCK_RULES = {
     "desalting": ("isoforms.desalting", {"enabled"}, False),
     "rdkit_fallback": ("isoforms.rdkit_fallback", {"enabled"}, False),
 }
+_DEVICE_CHOICES = ("auto", "cpu", "cuda", "mps")
 
 
 def _reject_unknown_keys(
@@ -320,6 +326,10 @@ def validate_pretrain_config(config: PretrainConfig) -> PretrainConfig:
     for path, allow_equal in _RANGE_RULES.items():
         _validate_range(path, _resolve_path(config, path), allow_equal=allow_equal)
     _validate_split_ratios("split_ratios", config.split_ratios)
+
+    if config.device not in _DEVICE_CHOICES:
+        allowed = ", ".join(_DEVICE_CHOICES)
+        raise ValueError(f"device must be one of {allowed}.")
 
     if config.model.hidden_dim % config.model.num_heads != 0:
         raise ValueError("model.hidden_dim must be divisible by model.num_heads.")
