@@ -167,3 +167,27 @@ def test_boltzmann_training_dataset_samples_one_cached_conformer_per_epoch() -> 
     assert observed_targets == expected_targets
     assert base_sample.y.tolist() == [[11.0, 0.0, 0.0]]
     assert base_sample.y_mask.tolist() == [[1.0, 0.0, 0.0]]
+
+
+def test_boltzmann_training_dataset_renormalizes_float32_sampling_weights() -> None:
+    base_sample = _DummySample(
+        y=torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+        y_mask=torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+    )
+    pool = _make_pool(
+        values=[[10.0], [20.0], [30.0]],
+        validity_mask=[[True], [True], [True]],
+        weights=[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+    )
+    dataset = _BoltzmannTrainingDataset([base_sample], [pool], slice(1, 2), seed=5)
+
+    dataset.set_epoch(0)
+    sample = dataset[0]
+
+    probabilities = np.asarray(pool.boltzmann_weights, dtype=np.float64)
+    probabilities /= probabilities.sum()
+    rng = np.random.default_rng(np.random.SeedSequence([5, 0, 0]))
+    expected_index = int(rng.choice(3, p=probabilities))
+
+    assert sample.y.tolist() == [[0.0, pool.values[expected_index, 0]]]
+    assert sample.y_mask.tolist() == [[0.0, 1.0]]

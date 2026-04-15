@@ -104,6 +104,22 @@ class _BoltzmannTrainingDataset:
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
 
+    def _sampling_probabilities(self, pool: Conformer3DPool) -> np.ndarray:
+        probabilities = pool.boltzmann_weights.astype(np.float64, copy=False)
+        if probabilities.ndim != 1 or probabilities.shape[0] != pool.values.shape[0]:
+            raise ValueError(
+                "Boltzmann conformer weights must be a 1D vector aligned with the pool rows."
+            )
+        if not np.all(np.isfinite(probabilities)):
+            raise ValueError("Boltzmann conformer weights must be finite.")
+        if np.any(probabilities < 0.0):
+            raise ValueError("Boltzmann conformer weights must be non-negative.")
+
+        total = float(probabilities.sum())
+        if total <= 0.0:
+            raise ValueError("Boltzmann conformer weights must sum to a positive value.")
+        return probabilities / total
+
     def _sample_conformer_index(self, index: int, pool: Conformer3DPool) -> int:
         rng = np.random.default_rng(
             np.random.SeedSequence([self._seed, self._epoch, int(index)])
@@ -111,7 +127,7 @@ class _BoltzmannTrainingDataset:
         return int(
             rng.choice(
                 pool.values.shape[0],
-                p=pool.boltzmann_weights.astype(np.float64, copy=False),
+                p=self._sampling_probabilities(pool),
             )
         )
 
