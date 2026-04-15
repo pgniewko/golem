@@ -6,7 +6,7 @@ import logging
 import os
 import random
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -100,25 +100,31 @@ def split_data(
 
 
 def make_loader(
-    dataset: list,
+    dataset: Sequence,
     batch_size: int,
     shuffle: bool = False,
     num_workers: int = 0,
+    persistent_workers: bool | None = None,
 ) -> DataLoader:
     """Create a PyG DataLoader.
 
     Args:
-        dataset: List of PyG Data objects.
+        dataset: Sequence or dataset-like object of PyG Data objects.
         batch_size: Batch size.
         shuffle: Whether to shuffle.
         num_workers: Number of data loading workers.
+        persistent_workers: Override whether worker processes persist across
+            epochs. Defaults to ``num_workers > 0``.
     """
+    if persistent_workers is None:
+        persistent_workers = num_workers > 0
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        persistent_workers=num_workers > 0,
+        persistent_workers=persistent_workers,
     )
 
 

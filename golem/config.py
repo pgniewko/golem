@@ -351,15 +351,6 @@ def validate_pretrain_config(config: PretrainConfig) -> PretrainConfig:
         config.descriptors.include_2d_targets or config.descriptors.include_3d_targets
     ):
         raise ValueError("At least one descriptor target family must be enabled.")
-    if (
-        config.descriptors.include_3d_targets
-        and config.descriptors.three_d_settings.target_mode == "boltzmann"
-        and config.num_workers != 0
-    ):
-        raise ValueError(
-            "Boltzmann 3D targets require num_workers=0 so per-sample conformer "
-            "sampling stays reproducible."
-        )
     if config.descriptors.loss_weight == 0.0 and (
         not config.ecfp_latent_alignment.enabled
         or config.ecfp_latent_alignment.weight == 0.0

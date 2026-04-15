@@ -84,7 +84,7 @@ class _BoltzmannTrainingDataset:
 
     def __init__(
         self,
-        dataset: list,
+        dataset: Sequence,
         conformer_pools: Sequence[Conformer3DPool],
         three_d_slice: slice,
         *,
@@ -95,10 +95,25 @@ class _BoltzmannTrainingDataset:
         self._dataset = dataset
         self._conformer_pools = list(conformer_pools)
         self._three_d_slice = three_d_slice
-        self._rng = np.random.RandomState(seed)
+        self._seed = int(seed)
+        self._epoch = 0
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def _sample_conformer_index(self, index: int, pool: Conformer3DPool) -> int:
+        rng = np.random.default_rng(
+            np.random.SeedSequence([self._seed, self._epoch, int(index)])
+        )
+        return int(
+            rng.choice(
+                pool.values.shape[0],
+                p=pool.boltzmann_weights.astype(np.float64, copy=False),
+            )
+        )
 
     def __getitem__(self, index: int):
         sample = _clone_data_object(self._dataset[index])
@@ -106,12 +121,7 @@ class _BoltzmannTrainingDataset:
         if pool.values.shape[0] == 0 or pool.values.shape[1] == 0:
             return sample
 
-        conformer_index = int(
-            self._rng.choice(
-                pool.values.shape[0],
-                p=pool.boltzmann_weights.astype(np.float64, copy=False),
-            )
-        )
+        conformer_index = self._sample_conformer_index(index, pool)
         sample.y[:, self._three_d_slice] = torch.from_numpy(
             pool.values[conformer_index]
         ).to(dtype=sample.y.dtype).unsqueeze(0)
@@ -692,6 +702,8 @@ def _make_split_loaders(
             config.batch_size,
             shuffle=name == "train",
             num_workers=config.num_workers,
+            persistent_workers=not isinstance(dataset, _BoltzmannTrainingDataset)
+            and config.num_workers > 0,
         )
         loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
         loaders[name] = loader
@@ -996,6 +1008,9 @@ def pretrain(
             metrics_file.flush()
 
             for epoch in range(config.max_epochs):
+                train_dataset = getattr(loaders["train"], "dataset", None)
+                if isinstance(train_dataset, _BoltzmannTrainingDataset):
+                    train_dataset.set_epoch(epoch)
                 lr = scheduler.get_last_lr()[0]
                 train_metrics = _run_epoch(
                     model,

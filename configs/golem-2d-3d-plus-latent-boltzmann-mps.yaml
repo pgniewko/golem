@@ -1,0 +1,24 @@
+# Apple Silicon / MPS preset for 2D + Boltzmann-sampled 3D descriptors
+# with ECFP latent alignment enabled.
+
+model:
+  dropout: 0.2
+  head_dropout: 0.2
+
+pretrain:
+  max_epochs: 5000
+  patience: 100
+  lr: 3.0e-4
+  num_workers: 1
+  device: mps
+
+isoforms:
+  desalting: { enabled: true }
+
+descriptors:
+  include_3d_targets: true
+  three_d_settings:
+    target_mode: boltzmann
+
+ecfp_latent_alignment:
+  enabled: true

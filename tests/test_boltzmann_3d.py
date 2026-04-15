@@ -50,14 +50,15 @@ def test_pretrain_config_defaults_include_boltzmann_controls() -> None:
     assert config.conformers.max_delta_energy_kcal == pytest.approx(3.0)
 
 
-def test_validate_pretrain_config_rejects_boltzmann_workers() -> None:
+def test_validate_pretrain_config_allows_boltzmann_workers() -> None:
     config = PretrainConfig()
     config.descriptors.include_3d_targets = True
     config.descriptors.three_d_settings.target_mode = "boltzmann"
     config.num_workers = 1
 
-    with pytest.raises(ValueError, match="num_workers=0"):
-        validate_pretrain_config(config)
+    validated = validate_pretrain_config(config)
+
+    assert validated.num_workers == 1
 
 
 def test_load_config_rejects_legacy_conformer_n_keep(tmp_path) -> None:
@@ -140,7 +141,7 @@ def test_compute_boltzmann_weighted_3d_statistics_uses_pool_weights_and_masks() 
     assert std[1] == pytest.approx(np.sqrt(expected_var_1))
 
 
-def test_boltzmann_training_dataset_samples_one_cached_conformer_per_fetch() -> None:
+def test_boltzmann_training_dataset_samples_one_cached_conformer_per_epoch() -> None:
     base_sample = _DummySample(
         y=torch.tensor([[11.0, 0.0, 0.0]], dtype=torch.float32),
         y_mask=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
@@ -152,13 +153,16 @@ def test_boltzmann_training_dataset_samples_one_cached_conformer_per_fetch() -> 
     )
     dataset = _BoltzmannTrainingDataset([base_sample], [pool], slice(1, 3), seed=7)
 
-    rng = np.random.RandomState(7)
-    expected_indices = [
-        int(rng.choice(2, p=np.asarray([0.25, 0.75], dtype=np.float64)))
-        for _ in range(4)
-    ]
-    observed_targets = [dataset[0].y[0, 1:].tolist() for _ in range(4)]
-    expected_targets = [pool.values[index].tolist() for index in expected_indices]
+    observed_targets = []
+    expected_targets = []
+    for epoch in range(4):
+        dataset.set_epoch(epoch)
+        observed_targets.append(dataset[0].y[0, 1:].tolist())
+        observed_targets.append(dataset[0].y[0, 1:].tolist())
+        rng = np.random.default_rng(np.random.SeedSequence([7, epoch, 0]))
+        expected_index = int(rng.choice(2, p=np.asarray([0.25, 0.75], dtype=np.float64)))
+        expected_targets.append(pool.values[expected_index].tolist())
+        expected_targets.append(pool.values[expected_index].tolist())
 
     assert observed_targets == expected_targets
     assert base_sample.y.tolist() == [[11.0, 0.0, 0.0]]
