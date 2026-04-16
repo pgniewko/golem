@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import warnings
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -15,7 +18,18 @@ from golem.descriptors import (
     compute_boltzmann_weighted_3d_statistics,
     materialize_boltzmann_mean_targets,
 )
-from golem.pretrain import _BoltzmannTrainingDataset
+from golem.pretrain import (
+    _advance_scheduler,
+    _assert_resume_architecture_compatible,
+    _BoltzmannTrainingDataset,
+    _build_smiles_metadata,
+    _make_warmup_cosine_scheduler,
+    _resolve_resume_checkpoint_path,
+    _summarize_metrics_rows,
+    _truncate_metrics_rows,
+    _validate_resume_config,
+    _validate_resume_smiles_metadata,
+)
 
 
 class _DummySample:
@@ -191,3 +205,125 @@ def test_boltzmann_training_dataset_renormalizes_float32_sampling_weights() -> N
 
     assert sample.y.tolist() == [[0.0, pool.values[expected_index, 0]]]
     assert sample.y_mask.tolist() == [[0.0, 1.0]]
+
+
+def test_summarize_metrics_rows_recovers_best_epoch_and_patience() -> None:
+    rows = [
+        {"epoch": "0", "val_loss": "0.50"},
+        {"epoch": "1", "val_loss": "0.40"},
+        {"epoch": "2", "val_loss": "0.45"},
+        {"epoch": "3", "val_loss": ""},
+    ]
+
+    best_val_objective, best_epoch, patience_counter = _summarize_metrics_rows(rows)
+
+    assert best_val_objective == pytest.approx(0.40)
+    assert best_epoch == 1
+    assert patience_counter == 2
+
+
+def test_truncate_metrics_rows_drops_epochs_after_checkpoint() -> None:
+    rows = [
+        {"epoch": "0", "val_loss": "0.50"},
+        {"epoch": "1", "val_loss": "0.40"},
+        {"epoch": "2", "val_loss": "0.45"},
+    ]
+
+    truncated = _truncate_metrics_rows(rows, max_epoch=1)
+
+    assert truncated == rows[:2]
+
+
+def test_advance_scheduler_reconstructs_learning_rate_from_epoch() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+    optimizer = torch.optim.AdamW([parameter], lr=2e-4)
+    scheduler = _make_warmup_cosine_scheduler(
+        optimizer,
+        warmup_epochs=100,
+        max_epochs=10000,
+    )
+
+    _advance_scheduler(scheduler, 1258)
+
+    reference_parameter = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+    reference_optimizer = torch.optim.AdamW([reference_parameter], lr=2e-4)
+    reference_scheduler = _make_warmup_cosine_scheduler(
+        reference_optimizer,
+        warmup_epochs=100,
+        max_epochs=10000,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UserWarning)
+        for _ in range(1258):
+            reference_scheduler.step()
+
+    assert scheduler.get_last_lr()[0] == pytest.approx(reference_scheduler.get_last_lr()[0])
+
+
+def test_resolve_resume_checkpoint_path_accepts_directory(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "last_checkpoint.pt"
+    checkpoint_path.write_bytes(b"checkpoint")
+
+    resolved = _resolve_resume_checkpoint_path(tmp_path)
+
+    assert resolved == checkpoint_path.resolve()
+
+
+def test_resolve_resume_checkpoint_path_requires_last_checkpoint_for_directory(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(FileNotFoundError, match="last_checkpoint.pt"):
+        _resolve_resume_checkpoint_path(tmp_path)
+
+
+def test_validate_resume_smiles_metadata_requires_force_for_content_drift() -> None:
+    saved_smiles_metadata = _build_smiles_metadata("saved.smi", ["CCO", "CCC"])
+    current_smiles_metadata = _build_smiles_metadata("current.smi", ["CCO", "CCN"])
+
+    with pytest.raises(RuntimeError, match="SMILES input mismatch"):
+        _validate_resume_smiles_metadata(
+            saved_smiles_metadata,
+            current_smiles_metadata,
+            force=False,
+        )
+
+    warnings_list = _validate_resume_smiles_metadata(
+        saved_smiles_metadata,
+        current_smiles_metadata,
+        force=True,
+    )
+
+    assert len(warnings_list) == 1
+    assert "sha256" in warnings_list[0]
+
+
+def test_validate_resume_config_requires_force_for_non_arch_changes() -> None:
+    saved_config = {"lr": 1e-4, "device": "auto", "model": {"hidden_dim": 128}}
+    current_config = {"lr": 2e-4, "device": "auto", "model": {"hidden_dim": 128}}
+
+    with pytest.raises(RuntimeError, match="config mismatch"):
+        _validate_resume_config(saved_config, current_config, force=False)
+
+    warnings_list = _validate_resume_config(saved_config, current_config, force=True)
+
+    assert warnings_list == [
+        "Resume config mismatch with checkpoint: top-level sections differ: lr"
+    ]
+
+
+def test_validate_resume_config_never_allows_model_section_drift() -> None:
+    saved_config = {"lr": 1e-4, "model": {"hidden_dim": 128}}
+    current_config = {"lr": 1e-4, "model": {"hidden_dim": 256}}
+
+    with pytest.raises(RuntimeError, match="architecture mismatch"):
+        _validate_resume_config(saved_config, current_config, force=True)
+
+
+def test_assert_resume_architecture_compatible_rejects_descriptor_name_drift() -> None:
+    with pytest.raises(RuntimeError, match="descriptor target mismatch"):
+        _assert_resume_architecture_compatible(
+            {"hidden_dim": 128, "num_tasks": 2},
+            {"hidden_dim": 128, "num_tasks": 2},
+            ["desc_a", "desc_b"],
+            ["desc_a", "desc_c"],
+        )

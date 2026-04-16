@@ -81,6 +81,28 @@ golem pretrain \
   --output experiments/pretrain
 ```
 
+Resume a killed/interrupted run from its last saved checkpoint:
+
+```bash
+golem pretrain \
+  --smiles data/openadmet/expansion_rx/train_test_smiles.smi \
+  --config experiments/pretrain/resolved_config.yaml \
+  --output experiments/pretrain \
+  --resume-from experiments/pretrain
+```
+
+`--resume-from` accepts either a checkpoint file or a directory. If you pass a
+directory, Golem uses `<dir>/last_checkpoint.pt`.
+
+Resume safety checks compare the requested run against the checkpoint:
+
+- SMILES input drift requires `--force`.
+- Config drift requires `--force`.
+- Model architecture or descriptor-target mismatch is never allowed.
+
+If you intentionally want to resume from the checkpoint while changing the
+SMILES source or non-architecture config, add `--force`.
+
 Config files in `configs/` are intended to contain overrides over the defaults in
 `golem.config.PretrainConfig`, not a full copy of every setting.
 
@@ -140,6 +162,8 @@ ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ET
 | `--seed` | Override random seed | 42 |
 | `--no-isoforms` | Disable isoform enumeration | Enabled |
 | `--verbose` | Show DEBUG-level logs on console | Disabled |
+| `--resume-from` | Resume from a checkpoint file or directory | None |
+| `--force` | Allow resume when SMILES/config differ | Disabled |
 
 ### What pretraining produces
 

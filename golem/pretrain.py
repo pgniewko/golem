@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 import inspect
 import json
 import logging
 import math
+import re
 import time
+import warnings
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -67,6 +70,7 @@ METRICS_FIELDNAMES = [
     "val_alignment_kendall",
 ]
 SplitIndices = dict[str, np.ndarray | None]
+_SMILES_LOG_PATTERN = re.compile(r"Loaded (?P<count>\d+) SMILES from (?P<path>.+)$")
 
 
 @dataclass
@@ -160,7 +164,350 @@ def _format_optional_metric(value: float) -> str:
     return f"{value:.6f}" if math.isfinite(value) else ""
 
 
-def _setup_logging(output_dir: Path, verbose: bool = False) -> None:
+def _parse_optional_float(value: str | None) -> float:
+    if value in (None, ""):
+        return math.nan
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _read_metrics_rows(metrics_path: Path) -> list[dict[str, str]]:
+    if not metrics_path.exists():
+        return []
+    with open(metrics_path, newline="") as metrics_file:
+        return list(csv.DictReader(metrics_file))
+
+
+def _truncate_metrics_rows(
+    rows: Sequence[dict[str, str]],
+    max_epoch: int | None,
+) -> list[dict[str, str]]:
+    if max_epoch is None:
+        return [dict(row) for row in rows]
+    truncated_rows: list[dict[str, str]] = []
+    for row in rows:
+        epoch = int(row["epoch"])
+        if epoch <= max_epoch:
+            truncated_rows.append(dict(row))
+    return truncated_rows
+
+
+def _write_metrics_rows(metrics_path: Path, rows: Sequence[dict[str, str]]) -> None:
+    with open(metrics_path, "w", newline="") as metrics_file:
+        metrics_writer = csv.DictWriter(metrics_file, fieldnames=METRICS_FIELDNAMES)
+        metrics_writer.writeheader()
+        metrics_writer.writerows(rows)
+
+
+def _summarize_metrics_rows(
+    rows: Sequence[dict[str, str]],
+) -> tuple[float, int, int]:
+    best_val_objective = float("inf")
+    best_epoch = -1
+    last_epoch = -1
+    for row in rows:
+        epoch = int(row["epoch"])
+        last_epoch = max(last_epoch, epoch)
+        val_loss = _parse_optional_float(row.get("val_loss"))
+        if math.isfinite(val_loss) and val_loss < best_val_objective:
+            best_val_objective = val_loss
+            best_epoch = epoch
+
+    patience_counter = 0
+    if best_epoch >= 0 and last_epoch >= 0:
+        patience_counter = max(0, last_epoch - best_epoch)
+    return best_val_objective, best_epoch, patience_counter
+
+
+def _top_level_config_differences(
+    saved_config: dict[str, Any],
+    current_config: dict[str, Any],
+) -> list[str]:
+    keys = sorted(set(saved_config) | set(current_config))
+    return [key for key in keys if saved_config.get(key) != current_config.get(key)]
+
+
+def _resolve_resume_checkpoint_path(resume_from: str | Path) -> Path:
+    resume_path = Path(resume_from).expanduser().resolve()
+    if resume_path.is_dir():
+        checkpoint_path = resume_path / "last_checkpoint.pt"
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Resume directory {resume_path} does not contain last_checkpoint.pt"
+            )
+        return checkpoint_path
+    if not resume_path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint {resume_path} does not exist")
+    return resume_path
+
+
+def _mapping_difference_lines(
+    saved: dict[str, Any],
+    current: dict[str, Any],
+) -> list[str]:
+    differences: list[str] = []
+    for key in sorted(set(saved) | set(current)):
+        saved_value = saved.get(key)
+        current_value = current.get(key)
+        if saved_value != current_value:
+            differences.append(
+                f"{key}: checkpoint={saved_value!r} current={current_value!r}"
+            )
+    return differences
+
+
+def _smiles_digest(smiles_list: Sequence[str]) -> str:
+    digest = hashlib.sha256()
+    for smiles in smiles_list:
+        digest.update(smiles.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _build_smiles_metadata(
+    smiles_path: str,
+    smiles_list: Sequence[str],
+) -> dict[str, object]:
+    return {
+        "path": smiles_path,
+        "resolved_path": str(Path(smiles_path).expanduser().resolve()),
+        "count": len(smiles_list),
+        "sha256": _smiles_digest(smiles_list),
+    }
+
+
+def _extract_logged_smiles_metadata(pretrain_log_path: Path) -> dict[str, object] | None:
+    if not pretrain_log_path.exists():
+        return None
+
+    for line in reversed(pretrain_log_path.read_text(errors="replace").splitlines()):
+        match = _SMILES_LOG_PATTERN.search(line)
+        if match is None:
+            continue
+
+        source_path = match.group("path").strip()
+        metadata: dict[str, object] = {
+            "path": source_path,
+            "count": int(match.group("count")),
+        }
+        resolved_path = Path(source_path).expanduser().resolve()
+        metadata["resolved_path"] = str(resolved_path)
+        if resolved_path.exists():
+            try:
+                logged_smiles = load_smiles(str(resolved_path))
+            except Exception:
+                logger.warning(
+                    "Could not fingerprint SMILES file referenced in %s",
+                    pretrain_log_path,
+                    exc_info=True,
+                )
+            else:
+                metadata["count"] = len(logged_smiles)
+                metadata["sha256"] = _smiles_digest(logged_smiles)
+        return metadata
+
+    return None
+
+
+def _load_saved_resume_config(
+    checkpoint_extra: dict[str, Any] | None,
+    checkpoint_path: Path,
+) -> dict[str, Any] | None:
+    if isinstance(checkpoint_extra, dict):
+        saved_config = checkpoint_extra.get("config")
+        if isinstance(saved_config, dict):
+            return saved_config
+
+    resolved_config_path = checkpoint_path.parent / "resolved_config.yaml"
+    if not resolved_config_path.exists():
+        return None
+    with open(resolved_config_path) as handle:
+        loaded = yaml.safe_load(handle)
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _load_saved_smiles_metadata(
+    checkpoint_extra: dict[str, Any] | None,
+    checkpoint_path: Path,
+) -> dict[str, object] | None:
+    if isinstance(checkpoint_extra, dict):
+        saved_smiles_metadata = checkpoint_extra.get("smiles_metadata")
+        if isinstance(saved_smiles_metadata, dict):
+            return dict(saved_smiles_metadata)
+    return _extract_logged_smiles_metadata(checkpoint_path.parent / "pretrain.log")
+
+
+def _resume_mismatch_warning_or_error(
+    subject: str,
+    details: str,
+    *,
+    force: bool,
+) -> list[str]:
+    message = f"Resume {subject} mismatch with checkpoint: {details}"
+    if force:
+        return [message]
+    raise RuntimeError(f"{message}. Re-run with --force to continue.")
+
+
+def _validate_resume_config(
+    saved_config: dict[str, Any] | None,
+    current_config: dict[str, Any],
+    *,
+    force: bool,
+) -> list[str]:
+    if saved_config is None:
+        return _resume_mismatch_warning_or_error(
+            "config",
+            "checkpoint has no saved config metadata",
+            force=force,
+        )
+
+    changed_sections = _top_level_config_differences(saved_config, current_config)
+    if not changed_sections:
+        return []
+    if "model" in changed_sections:
+        raise RuntimeError(
+            "Resume architecture mismatch: checkpoint model config differs from the "
+            "requested run. Use a matching config; --force does not bypass this."
+        )
+    return _resume_mismatch_warning_or_error(
+        "config",
+        f"top-level sections differ: {', '.join(changed_sections)}",
+        force=force,
+    )
+
+
+def _validate_resume_smiles_metadata(
+    saved_smiles_metadata: dict[str, object] | None,
+    current_smiles_metadata: dict[str, object],
+    *,
+    force: bool,
+) -> list[str]:
+    if saved_smiles_metadata is None:
+        return _resume_mismatch_warning_or_error(
+            "SMILES input",
+            "checkpoint has no usable SMILES metadata",
+            force=force,
+        )
+
+    saved_digest = saved_smiles_metadata.get("sha256")
+    current_digest = current_smiles_metadata.get("sha256")
+    saved_path = str(saved_smiles_metadata.get("resolved_path", saved_smiles_metadata.get("path")))
+    current_path = str(
+        current_smiles_metadata.get("resolved_path", current_smiles_metadata.get("path"))
+    )
+
+    if saved_digest and current_digest:
+        if saved_digest != current_digest:
+            return _resume_mismatch_warning_or_error(
+                "SMILES input",
+                f"checkpoint path={saved_path} sha256={saved_digest} but current path={current_path} sha256={current_digest}",
+                force=force,
+            )
+        if saved_path != current_path:
+            return [
+                "Resume SMILES path differs from checkpoint metadata, but loaded "
+                f"contents match: checkpoint={saved_path} current={current_path}"
+            ]
+        return []
+
+    if saved_path != current_path:
+        return _resume_mismatch_warning_or_error(
+            "SMILES input",
+            f"checkpoint path={saved_path} but current path={current_path} "
+            "(checkpoint did not preserve SMILES digests)",
+            force=force,
+        )
+    return []
+
+
+def _describe_descriptor_name_mismatch(
+    saved_descriptor_names: Sequence[str],
+    current_descriptor_names: Sequence[str],
+) -> str:
+    if len(saved_descriptor_names) != len(current_descriptor_names):
+        return (
+            "descriptor count differs: "
+            f"checkpoint={len(saved_descriptor_names)} current={len(current_descriptor_names)}"
+        )
+
+    for index, (saved_name, current_name) in enumerate(
+        zip(saved_descriptor_names, current_descriptor_names)
+    ):
+        if saved_name != current_name:
+            return (
+                "descriptor order/name differs at index "
+                f"{index}: checkpoint={saved_name!r} current={current_name!r}"
+            )
+    return "descriptor names differ"
+
+
+def _assert_resume_architecture_compatible(
+    checkpoint_model_config: dict[str, Any] | None,
+    current_model_config: dict[str, Any],
+    checkpoint_descriptor_names: Sequence[str] | None,
+    current_descriptor_names: Sequence[str],
+) -> None:
+    if checkpoint_model_config is None:
+        raise RuntimeError(
+            "Resume architecture mismatch: checkpoint does not contain model_config metadata."
+        )
+
+    model_differences = _mapping_difference_lines(
+        checkpoint_model_config,
+        current_model_config,
+    )
+    if model_differences:
+        details = "\n".join(f"- {line}" for line in model_differences)
+        raise RuntimeError(
+            "Resume architecture mismatch between checkpoint and current run:\n"
+            f"{details}"
+        )
+
+    if checkpoint_descriptor_names is None:
+        raise RuntimeError(
+            "Resume descriptor target mismatch: checkpoint does not contain descriptor metadata."
+        )
+    if list(checkpoint_descriptor_names) != list(current_descriptor_names):
+        raise RuntimeError(
+            "Resume descriptor target mismatch: "
+            + _describe_descriptor_name_mismatch(
+                checkpoint_descriptor_names,
+                current_descriptor_names,
+            )
+        )
+
+
+def _move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def _advance_scheduler(
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    steps: int,
+) -> None:
+    if steps <= 0:
+        return
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UserWarning)
+        for _ in range(steps):
+            scheduler.step()
+
+
+def _setup_logging(
+    output_dir: Path,
+    verbose: bool = False,
+    *,
+    append: bool = False,
+) -> None:
     """Configure logging to both stdout and file."""
     golem_logger = logging.getLogger("golem")
     golem_logger.setLevel(logging.DEBUG)
@@ -177,7 +524,10 @@ def _setup_logging(output_dir: Path, verbose: bool = False) -> None:
     console_handler.setFormatter(formatter)
     golem_logger.addHandler(console_handler)
 
-    file_handler = logging.FileHandler(output_dir / "pretrain.log", mode="w")
+    file_handler = logging.FileHandler(
+        output_dir / "pretrain.log",
+        mode="a" if append else "w",
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     golem_logger.addHandler(file_handler)
@@ -766,12 +1116,14 @@ def _checkpoint_extra(
     descriptor_names: list[str],
     num_descriptors: int,
     split_indices: SplitIndices,
+    smiles_metadata: dict[str, object],
 ) -> dict[str, object]:
     return {
         "scaler_state": scaler.state_dict(),
         "descriptor_names": descriptor_names,
         "descriptor_count": num_descriptors,
         "config": asdict(config),
+        "smiles_metadata": smiles_metadata,
         "library_versions": _checkpoint_library_versions(),
         "split_indices": {
             name: indices.tolist() if indices is not None else None
@@ -786,6 +1138,8 @@ def pretrain(
     output_dir: str,
     subsample: float | None = None,
     verbose: bool = False,
+    resume_from: str | None = None,
+    force: bool = False,
 ) -> Path:
     """Full pretraining pipeline."""
     effective_subsample = subsample if subsample is not None else config.subsample
@@ -795,16 +1149,29 @@ def pretrain(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    for artifact_name in (
-        "best_checkpoint.pt",
-        "last_checkpoint.pt",
-        "metrics.csv",
-        "pretrain_report.html",
-    ):
-        artifact_path = output_dir / artifact_name
-        if artifact_path.exists():
-            artifact_path.unlink()
-    _setup_logging(output_dir, verbose=verbose)
+    resume_path = (
+        _resolve_resume_checkpoint_path(resume_from)
+        if resume_from is not None
+        else None
+    )
+    resume_same_output = (
+        resume_path is not None and resume_path.parent == output_dir.resolve()
+    )
+    if not resume_same_output:
+        for artifact_name in (
+            "best_checkpoint.pt",
+            "last_checkpoint.pt",
+            "metrics.csv",
+            "pretrain_report.html",
+        ):
+            artifact_path = output_dir / artifact_name
+            if artifact_path.exists():
+                artifact_path.unlink()
+    _setup_logging(
+        output_dir,
+        verbose=verbose,
+        append=resume_same_output and (output_dir / "pretrain.log").exists(),
+    )
 
     if verbose:
         try:
@@ -829,16 +1196,62 @@ def pretrain(
             resolved_config.max_epochs,
         )
 
-    with open(output_dir / "resolved_config.yaml", "w") as handle:
-        yaml.dump(
-            json.loads(json.dumps(asdict(resolved_config))),
-            handle,
-            default_flow_style=False,
-            sort_keys=False,
+    checkpoint: dict[str, Any] | None = None
+    checkpoint_extra: dict[str, Any] | None = None
+    checkpoint_model_config: dict[str, Any] | None = None
+    checkpoint_descriptor_names: list[str] | None = None
+    saved_resume_config: dict[str, Any] | None = None
+    saved_smiles_metadata: dict[str, object] | None = None
+    resume_warnings: list[str] = []
+    checkpoint_epoch = -1
+    optimizer_state_loaded = False
+
+    if resume_path is not None:
+        from gt_pyg.nn.checkpoint import load_checkpoint
+
+        checkpoint = load_checkpoint(
+            resume_path,
+            map_location="cpu",
+            version_check="warn",
         )
+        checkpoint_epoch = int(checkpoint.get("epoch", -1))
+        if checkpoint_epoch < 0:
+            raise RuntimeError(
+                f"Resume checkpoint {resume_path} has no valid epoch metadata."
+            )
+        checkpoint_extra = checkpoint.get("extra")
+        checkpoint_extra = checkpoint_extra if isinstance(checkpoint_extra, dict) else None
+        checkpoint_model_config = checkpoint.get("model_config")
+        checkpoint_model_config = (
+            checkpoint_model_config
+            if isinstance(checkpoint_model_config, dict)
+            else None
+        )
+        saved_resume_config = _load_saved_resume_config(checkpoint_extra, resume_path)
+        resume_warnings.extend(
+            _validate_resume_config(
+                saved_resume_config,
+                asdict(resolved_config),
+                force=force,
+            )
+        )
+        saved_smiles_metadata = _load_saved_smiles_metadata(checkpoint_extra, resume_path)
+        if checkpoint_extra is not None:
+            saved_descriptor_names_value = checkpoint_extra.get("descriptor_names")
+            if isinstance(saved_descriptor_names_value, list):
+                checkpoint_descriptor_names = list(saved_descriptor_names_value)
 
     smiles_list = load_smiles(smiles_path)
     logger.info("Loaded %d SMILES from %s", len(smiles_list), smiles_path)
+    smiles_metadata = _build_smiles_metadata(smiles_path, smiles_list)
+    if resume_path is not None:
+        resume_warnings.extend(
+            _validate_resume_smiles_metadata(
+                saved_smiles_metadata,
+                smiles_metadata,
+                force=force,
+            )
+        )
     if effective_subsample is not None and 0 < effective_subsample < 1:
         rng = np.random.RandomState(config.seed)
         n_subsampled = max(1, int(len(smiles_list) * effective_subsample))
@@ -944,10 +1357,19 @@ def pretrain(
             raise RuntimeError(
                 "model.head_dropout is set, but the installed gt-pyg "
                 "GraphTransformerNet does not accept head_dropout."
-            )
+        )
         model_kwargs["head_dropout"] = model_config.head_dropout
 
     model = GraphTransformerNet(**model_kwargs).to(device)
+    if resume_path is not None:
+        _assert_resume_architecture_compatible(
+            checkpoint_model_config,
+            model_kwargs,
+            checkpoint_descriptor_names,
+            descriptor_names,
+        )
+        assert checkpoint is not None
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     if alignment_cfg.enabled and "return_latent" not in inspect.signature(
         model.forward
     ).parameters:
@@ -970,9 +1392,18 @@ def pretrain(
         optimizer, config.warmup_epochs, config.max_epochs
     )
 
-    best_val_objective = float("inf")
-    best_epoch = -1
-    patience_counter = 0
+    if resume_warnings:
+        for warning_message in resume_warnings:
+            logger.warning("%s", warning_message)
+
+    with open(output_dir / "resolved_config.yaml", "w") as handle:
+        yaml.dump(
+            json.loads(json.dumps(asdict(resolved_config))),
+            handle,
+            default_flow_style=False,
+            sort_keys=False,
+        )
+
     start_time = time.time()
     best_ckpt_path = output_dir / "best_checkpoint.pt"
     last_ckpt_path = output_dir / "last_checkpoint.pt"
@@ -980,6 +1411,10 @@ def pretrain(
     last_val_loss = math.nan
     last_completed_epoch: int | None = None
     last_saved_epoch: int | None = None
+    best_val_objective = float("inf")
+    best_epoch = -1
+    patience_counter = 0
+    start_epoch = 0
 
     def _save_checkpoint(
         path: Path,
@@ -989,6 +1424,8 @@ def pretrain(
     ) -> None:
         model.save_checkpoint(
             path=path,
+            optimizer=optimizer,
+            scheduler=scheduler,
             epoch=epoch,
             best_metric=best_metric,
             extra=_checkpoint_extra(
@@ -997,7 +1434,75 @@ def pretrain(
                 descriptor_names,
                 num_descriptors,
                 split_indices,
+                smiles_metadata,
             ),
+        )
+
+    if resume_path is not None:
+        from gt_pyg.nn.checkpoint import get_checkpoint_info
+
+        assert checkpoint is not None
+
+        optimizer_state = checkpoint.get("optimizer_state_dict")
+        if isinstance(optimizer_state, dict):
+            optimizer.load_state_dict(optimizer_state)
+            _move_optimizer_state_to_device(optimizer, device)
+            optimizer_state_loaded = True
+
+        _advance_scheduler(scheduler, checkpoint_epoch + 1)
+
+        existing_metric_rows = (
+            _read_metrics_rows(metrics_path) if resume_same_output else []
+        )
+        if existing_metric_rows:
+            truncated_metric_rows = _truncate_metrics_rows(
+                existing_metric_rows,
+                checkpoint_epoch,
+            )
+            if len(truncated_metric_rows) != len(existing_metric_rows):
+                _write_metrics_rows(metrics_path, truncated_metric_rows)
+                logger.warning(
+                    "Trimmed %d stale metric rows newer than checkpoint epoch %d",
+                    len(existing_metric_rows) - len(truncated_metric_rows),
+                    checkpoint_epoch + 1,
+                )
+            existing_metric_rows = truncated_metric_rows
+            best_val_objective, best_epoch, patience_counter = _summarize_metrics_rows(
+                existing_metric_rows
+            )
+            if existing_metric_rows:
+                last_val_loss = _parse_optional_float(
+                    existing_metric_rows[-1].get("val_loss")
+                )
+        else:
+            checkpoint_best_metric = checkpoint.get("best_metric")
+            if checkpoint_best_metric is not None:
+                best_val_objective = float(checkpoint_best_metric)
+
+            best_epoch = -1
+            if best_ckpt_path.exists():
+                best_checkpoint_info = get_checkpoint_info(best_ckpt_path)
+                best_epoch = int(best_checkpoint_info.get("epoch", -1))
+            patience_counter = (
+                max(0, checkpoint_epoch - best_epoch) if best_epoch >= 0 else 0
+            )
+
+        start_epoch = checkpoint_epoch + 1
+        last_completed_epoch = checkpoint_epoch
+        last_saved_epoch = checkpoint_epoch
+        logger.info(
+            "Resuming from %s at epoch %d/%d",
+            resume_path,
+            start_epoch + 1,
+            config.max_epochs,
+        )
+        logger.info(
+            "Resume state: best_val_objective=%s  best_epoch=%s  patience_counter=%d  optimizer_state=%s  scheduler_state=%s",
+            f"{best_val_objective:.4f}" if math.isfinite(best_val_objective) else "nan",
+            str(best_epoch + 1) if best_epoch >= 0 else "unknown",
+            patience_counter,
+            "loaded" if optimizer_state_loaded else "fresh",
+            "reconstructed",
         )
 
     def _save_last_checkpoint(epoch_to_save: int) -> None:
@@ -1016,14 +1521,15 @@ def pretrain(
         config.masking_ratio,
     )
 
-    epoch = 0
+    epoch = max(start_epoch - 1, 0)
     try:
-        with open(metrics_path, "w", newline="") as metrics_file:
+        with open(metrics_path, "a" if resume_same_output else "w", newline="") as metrics_file:
             metrics_writer = csv.writer(metrics_file)
-            metrics_writer.writerow(METRICS_FIELDNAMES)
-            metrics_file.flush()
+            if metrics_file.tell() == 0:
+                metrics_writer.writerow(METRICS_FIELDNAMES)
+                metrics_file.flush()
 
-            for epoch in range(config.max_epochs):
+            for epoch in range(start_epoch, config.max_epochs):
                 train_dataset = getattr(loaders["train"], "dataset", None)
                 if isinstance(train_dataset, _BoltzmannTrainingDataset):
                     train_dataset.set_epoch(epoch)
