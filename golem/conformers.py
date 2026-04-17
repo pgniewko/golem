@@ -66,8 +66,8 @@ def _optimize_conformers(mol: Chem.Mol, method: str) -> dict[int, float] | None:
 
     energies = {
         conformer.GetId(): float(energy)
-        for conformer, (_, energy) in zip(mol.GetConformers(), results, strict=False)
-        if np.isfinite(energy)
+        for conformer, (status, energy) in zip(mol.GetConformers(), results, strict=False)
+        if status == 0 and np.isfinite(energy)
     }
     return energies or None
 

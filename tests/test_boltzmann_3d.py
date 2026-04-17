@@ -6,11 +6,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from rdkit import Chem
+from rdkit.Chem import AllChem
 
 from golem.config import ConformerConfig, PretrainConfig, load_config, validate_pretrain_config
 from golem.conformers import (
     OptimizedConformer,
     OptimizedConformerPool,
+    _optimize_conformers,
+    generate_optimized_conformer_pool,
     retain_boltzmann_conformers,
 )
 from golem.descriptors import (
@@ -104,6 +108,92 @@ def test_retain_boltzmann_conformers_filters_by_delta_energy_and_best_n() -> Non
     retained = retain_boltzmann_conformers(pool, config)
 
     assert [conformer.conformer_id for conformer in retained.conformers] == [0, 1, 2]
+
+
+def test_optimize_conformers_keeps_only_converged_finite_results(monkeypatch) -> None:
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
+    AllChem.EmbedMultipleConfs(mol, numConfs=3, randomSeed=7)
+
+    monkeypatch.setattr(AllChem, "MMFFHasAllMoleculeParams", lambda mol: True)
+
+    def fake_mmff_optimize(mol, numThreads=0):
+        assert numThreads == 0
+        return [
+            (0, -1.5),
+            (1, -9.0),
+            (0, float("inf")),
+        ]
+
+    monkeypatch.setattr(AllChem, "MMFFOptimizeMoleculeConfs", fake_mmff_optimize)
+
+    energies = _optimize_conformers(mol, "MMFF")
+
+    assert energies == {0: pytest.approx(-1.5)}
+
+
+def test_generate_optimized_conformer_pool_discards_nonconverged_mmff_conformers(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(AllChem, "MMFFHasAllMoleculeParams", lambda mol: True)
+
+    def fake_mmff_optimize(mol, numThreads=0):
+        assert numThreads == 0
+        return [
+            (1, -50.0),
+            (0, -40.0),
+            (0, -30.0),
+        ]
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("UFF fallback should not run when MMFF yields converged conformers")
+
+    monkeypatch.setattr(AllChem, "MMFFOptimizeMoleculeConfs", fake_mmff_optimize)
+    monkeypatch.setattr(AllChem, "UFFOptimizeMoleculeConfs", fail_if_called)
+
+    pool = generate_optimized_conformer_pool(
+        "CCO",
+        ConformerConfig(n_generate=3, n_keep_best=3, max_delta_energy_kcal=3.0),
+        seed=7,
+    )
+
+    assert pool is not None
+    assert [conformer.conformer_id for conformer in pool.conformers] == [1, 2]
+    assert [conformer.energy for conformer in pool.conformers] == pytest.approx([-40.0, -30.0])
+    assert [conformer.delta_energy for conformer in pool.conformers] == pytest.approx([0.0, 10.0])
+
+
+def test_generate_optimized_conformer_pool_falls_back_to_uff_when_mmff_has_no_converged(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(AllChem, "MMFFHasAllMoleculeParams", lambda mol: True)
+    calls: list[str] = []
+
+    def fake_mmff_optimize(mol, numThreads=0):
+        assert numThreads == 0
+        calls.append("MMFF")
+        return [(1, -10.0) for _ in mol.GetConformers()]
+
+    def fake_uff_optimize(mol, numThreads=0):
+        assert numThreads == 0
+        calls.append("UFF")
+        return [
+            (0, 3.0 + idx)
+            for idx, _ in enumerate(mol.GetConformers())
+        ]
+
+    monkeypatch.setattr(AllChem, "MMFFOptimizeMoleculeConfs", fake_mmff_optimize)
+    monkeypatch.setattr(AllChem, "UFFOptimizeMoleculeConfs", fake_uff_optimize)
+
+    pool = generate_optimized_conformer_pool(
+        "CCO",
+        ConformerConfig(n_generate=3, n_keep_best=3, max_delta_energy_kcal=3.0),
+        seed=7,
+    )
+
+    assert pool is not None
+    assert calls == ["MMFF", "UFF"]
+    assert len(pool.conformers) == 3
+    assert [conformer.energy for conformer in pool.conformers] == pytest.approx([3.0, 4.0, 5.0])
 
 
 def test_materialize_boltzmann_mean_targets_renormalizes_over_valid_conformers() -> None:
