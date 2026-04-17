@@ -40,8 +40,6 @@ def _make_pool(
         values=np.asarray(values, dtype=np.float32),
         validity_mask=np.asarray(validity_mask, dtype=np.bool_),
         boltzmann_weights=np.asarray(weights, dtype=np.float32),
-        energies=np.zeros(len(weights), dtype=np.float32),
-        delta_energies=np.zeros(len(weights), dtype=np.float32),
     )
 
 
@@ -229,6 +227,19 @@ def test_compute_boltzmann_weighted_3d_statistics_uses_pool_weights_and_masks() 
     assert mean[1] == pytest.approx(expected_mean_1)
     assert std[0] == pytest.approx(np.sqrt(expected_var_0))
     assert std[1] == pytest.approx(np.sqrt(expected_var_1))
+
+
+def test_compute_boltzmann_weighted_3d_statistics_defaults_invalid_and_constant_columns() -> None:
+    pool = _make_pool(
+        values=[[5.0, 0.0]],
+        validity_mask=[[True, False]],
+        weights=[1.0],
+    )
+
+    mean, std = compute_boltzmann_weighted_3d_statistics([pool])
+
+    assert mean.tolist() == pytest.approx([5.0, 0.0])
+    assert std.tolist() == pytest.approx([1.0, 1.0])
 
 
 def test_boltzmann_training_dataset_samples_one_cached_conformer_per_epoch() -> None:

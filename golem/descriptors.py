@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Literal, Sequence, Tuple
 
 import numpy as np
 from rdkit import Chem
@@ -29,7 +29,6 @@ from tqdm import tqdm
 from golem.config import ConformerConfig, DescriptorConfig, Descriptor3DSettings
 from golem.conformers import (
     compute_boltzmann_weights,
-    generate_lowest_energy_conformer,
     generate_optimized_conformer_pool,
     retain_boltzmann_conformers,
 )
@@ -46,8 +45,6 @@ class Conformer3DPool:
     values: np.ndarray
     validity_mask: np.ndarray
     boltzmann_weights: np.ndarray
-    energies: np.ndarray
-    delta_energies: np.ndarray
 
 
 @dataclass
@@ -81,8 +78,6 @@ def _empty_conformer_3d_pool(width: int) -> Conformer3DPool:
         values=np.zeros((0, width), dtype=np.float32),
         validity_mask=np.zeros((0, width), dtype=np.bool_),
         boltzmann_weights=np.zeros(0, dtype=np.float32),
-        energies=np.zeros(0, dtype=np.float32),
-        delta_energies=np.zeros(0, dtype=np.float32),
     )
 
 
@@ -247,8 +242,6 @@ def _drop_invalid_3d_columns(
             values=pool.values[:, global_valid],
             validity_mask=pool.validity_mask[:, global_valid],
             boltzmann_weights=pool.boltzmann_weights.copy(),
-            energies=pool.energies.copy(),
-            delta_energies=pool.delta_energies.copy(),
         )
         for pool in pools
     ]
@@ -326,25 +319,11 @@ def compute_boltzmann_weighted_3d_statistics(
         where=weight_sum > 0.0,
     )
     std = np.sqrt(np.maximum(second_moment - np.square(mean), 0.0))
-
-    all_invalid = weight_sum == 0.0
-    if all_invalid.any():
-        logger.info(
-            "Setting mean=0.0, std=1.0 for %d all-invalid Boltzmann 3D descriptors in train",
-            int(all_invalid.sum()),
-        )
-        mean[all_invalid] = 0.0
-        std[all_invalid] = 1.0
-
-    zero_std = std < 1e-12
-    if zero_std.any():
-        logger.info(
-            "Setting std=1.0 for %d constant/near-constant Boltzmann 3D descriptors",
-            int(zero_std.sum()),
-        )
-        std[zero_std] = 1.0
-
-    return mean, std
+    return NaNAwareStandardScaler._finalize_stats(
+        mean,
+        std,
+        invalid_mask=weight_sum == 0.0,
+    )
 
 
 def scale_boltzmann_3d_pools(
@@ -370,11 +349,101 @@ def scale_boltzmann_3d_pools(
                 values=scaled_values,
                 validity_mask=pool.validity_mask.copy(),
                 boltzmann_weights=pool.boltzmann_weights.copy(),
-                energies=pool.energies.copy(),
-                delta_energies=pool.delta_energies.copy(),
             )
         )
     return scaled_pools
+
+
+def _compute_3d_targets(
+    smiles_list: List[str],
+    three_d_settings: Descriptor3DSettings,
+    conformers: ConformerConfig,
+    *,
+    seed: int,
+    target_mode: Literal["lowest_energy", "boltzmann"],
+) -> tuple[np.ndarray, np.ndarray, List[str], list[Conformer3DPool], int, int, list[int]]:
+    calculators = _build_3d_calculators(three_d_settings)
+    columns_by_family = {
+        family: _calculator_columns(calculators[family]) for family in _THREE_D_FAMILIES
+    }
+    descriptor_names = [
+        f"{family}:{column}"
+        for family in _THREE_D_FAMILIES
+        for column in columns_by_family[family]
+    ]
+    pools: list[Conformer3DPool] = []
+    conformer_failures = 0
+    descriptor_failures = 0
+    retained_counts: list[int] = []
+    progress_label = "3D descriptor pools" if target_mode == "boltzmann" else "3D descriptors"
+
+    for smiles in tqdm(smiles_list, desc=progress_label, unit="mol"):
+        optimized_pool = generate_optimized_conformer_pool(smiles, conformers, seed=seed)
+        if optimized_pool is None:
+            conformer_failures += 1
+            pools.append(_empty_conformer_3d_pool(len(descriptor_names)))
+            continue
+
+        selected_conformers = (
+            retain_boltzmann_conformers(optimized_pool, conformers).conformers
+            if target_mode == "boltzmann"
+            else optimized_pool.conformers[:1]
+        )
+        if not selected_conformers:
+            pools.append(_empty_conformer_3d_pool(len(descriptor_names)))
+            continue
+
+        conformer_rows: list[np.ndarray] = []
+        conformer_masks: list[np.ndarray] = []
+        delta_energies: list[float] = []
+        for conformer in selected_conformers:
+            row, row_mask, row_failures = _compute_3d_descriptor_row(
+                optimized_pool.mol,
+                conformer.conformer_id,
+                calculators,
+                columns_by_family,
+                smiles=smiles,
+            )
+            descriptor_failures += row_failures
+            if not row_mask.any():
+                continue
+            conformer_rows.append(row)
+            conformer_masks.append(row_mask)
+            delta_energies.append(conformer.delta_energy)
+
+        if not conformer_rows:
+            pools.append(_empty_conformer_3d_pool(len(descriptor_names)))
+            continue
+
+        if target_mode == "boltzmann":
+            weights = compute_boltzmann_weights(
+                np.asarray(delta_energies, dtype=np.float64)
+            ).astype(np.float32)
+        else:
+            weights = np.ones(len(conformer_rows), dtype=np.float32)
+        pool_values = np.stack(conformer_rows).astype(np.float32)
+        pool_masks = np.stack(conformer_masks).astype(np.bool_)
+        pools.append(
+            Conformer3DPool(
+                values=pool_values,
+                validity_mask=pool_masks,
+                boltzmann_weights=weights,
+            )
+        )
+        if target_mode == "boltzmann":
+            retained_counts.append(pool_values.shape[0])
+
+    pools, descriptor_names = _drop_invalid_3d_columns(pools, descriptor_names)
+    values, validity_mask = materialize_boltzmann_mean_targets(pools)
+    return (
+        values,
+        validity_mask,
+        descriptor_names,
+        pools,
+        conformer_failures,
+        descriptor_failures,
+        retained_counts,
+    )
 
 
 def compute_3d_descriptors(
@@ -385,54 +454,21 @@ def compute_3d_descriptors(
     seed: int,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """Compute the fixed 3D descriptor pack on the lowest-energy conformer."""
-    calculators = _build_3d_calculators(three_d_settings)
-    columns_by_family = {
-        family: _calculator_columns(calculators[family]) for family in _THREE_D_FAMILIES
-    }
-    descriptor_names = [
-        f"{family}:{column}"
-        for family in _THREE_D_FAMILIES
-        for column in columns_by_family[family]
-    ]
-    values = np.zeros((len(smiles_list), len(descriptor_names)), dtype=np.float32)
-    validity_mask = np.zeros((len(smiles_list), len(descriptor_names)), dtype=np.bool_)
-    conformer_failures = 0
-    descriptor_failures = 0
-
-    for row_idx, smiles in enumerate(
-        tqdm(smiles_list, desc="3D descriptors", unit="mol")
-    ):
-        conformer = generate_lowest_energy_conformer(
-            smiles,
-            conformers,
-            seed=seed,
-        )
-        if conformer is None:
-            conformer_failures += 1
-            continue
-
-        row, row_mask, row_failures = _compute_3d_descriptor_row(
-            conformer.mol,
-            conformer.conformer_id,
-            calculators,
-            columns_by_family,
-            smiles=smiles,
-        )
-        values[row_idx] = row
-        validity_mask[row_idx] = row_mask
-        descriptor_failures += row_failures
-
-    all_invalid = ~validity_mask.any(axis=0)
-    if all_invalid.any():
-        logger.info("Dropping %d all-invalid 3D descriptor columns", int(all_invalid.sum()))
-        keep_columns = ~all_invalid
-        values = values[:, keep_columns]
-        validity_mask = validity_mask[:, keep_columns]
-        descriptor_names = [
-            name
-            for name, keep in zip(descriptor_names, keep_columns, strict=False)
-            if keep
-        ]
+    (
+        values,
+        validity_mask,
+        descriptor_names,
+        _,
+        conformer_failures,
+        descriptor_failures,
+        _,
+    ) = _compute_3d_targets(
+        smiles_list,
+        three_d_settings,
+        conformers,
+        seed=seed,
+        target_mode="lowest_energy",
+    )
 
     logger.info(
         "3D descriptors: %d molecules × %d descriptors (%.1f%% valid entries)",
@@ -458,74 +494,21 @@ def compute_boltzmann_3d_descriptors(
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, List[str], list[Conformer3DPool]]:
     """Build retained Boltzmann conformer pools and deterministic mean targets."""
-    calculators = _build_3d_calculators(three_d_settings)
-    columns_by_family = {
-        family: _calculator_columns(calculators[family]) for family in _THREE_D_FAMILIES
-    }
-    descriptor_names = [
-        f"{family}:{column}"
-        for family in _THREE_D_FAMILIES
-        for column in columns_by_family[family]
-    ]
-
-    pools: list[Conformer3DPool] = []
-    conformer_failures = 0
-    descriptor_failures = 0
-    retained_counts: list[int] = []
-
-    for smiles in tqdm(smiles_list, desc="3D descriptor pools", unit="mol"):
-        pool = generate_optimized_conformer_pool(smiles, conformers, seed=seed)
-        if pool is None:
-            conformer_failures += 1
-            pools.append(_empty_conformer_3d_pool(len(descriptor_names)))
-            continue
-
-        retained_pool = retain_boltzmann_conformers(pool, conformers)
-        if not retained_pool.conformers:
-            pools.append(_empty_conformer_3d_pool(len(descriptor_names)))
-            continue
-
-        conformer_rows: list[np.ndarray] = []
-        conformer_masks: list[np.ndarray] = []
-        energies: list[float] = []
-        delta_energies: list[float] = []
-        for conformer in retained_pool.conformers:
-            row, row_mask, row_failures = _compute_3d_descriptor_row(
-                retained_pool.mol,
-                conformer.conformer_id,
-                calculators,
-                columns_by_family,
-                smiles=smiles,
-            )
-            descriptor_failures += row_failures
-            if not row_mask.any():
-                continue
-            conformer_rows.append(row)
-            conformer_masks.append(row_mask)
-            energies.append(conformer.energy)
-            delta_energies.append(conformer.delta_energy)
-
-        if not conformer_rows:
-            pools.append(_empty_conformer_3d_pool(len(descriptor_names)))
-            continue
-
-        delta_array = np.asarray(delta_energies, dtype=np.float64)
-        weights = compute_boltzmann_weights(delta_array).astype(np.float32)
-        pool_values = np.stack(conformer_rows).astype(np.float32)
-        pool_masks = np.stack(conformer_masks).astype(np.bool_)
-        pools.append(
-            Conformer3DPool(
-                values=pool_values,
-                validity_mask=pool_masks,
-                boltzmann_weights=weights,
-                energies=np.asarray(energies, dtype=np.float32),
-                delta_energies=delta_array.astype(np.float32),
-            )
-        )
-        retained_counts.append(pool_values.shape[0])
-
-    pools, descriptor_names = _drop_invalid_3d_columns(pools, descriptor_names)
-    values, validity_mask = materialize_boltzmann_mean_targets(pools)
+    (
+        values,
+        validity_mask,
+        descriptor_names,
+        pools,
+        conformer_failures,
+        descriptor_failures,
+        retained_counts,
+    ) = _compute_3d_targets(
+        smiles_list,
+        three_d_settings,
+        conformers,
+        seed=seed,
+        target_mode="boltzmann",
+    )
 
     logger.info(
         "Boltzmann 3D descriptor means: %d molecules × %d descriptors (%.1f%% valid entries)",
@@ -726,19 +709,6 @@ class NaNAwareStandardScaler:
             "std": self.std_.tolist() if self.std_ is not None else None,
             "winsorize_range": list(self.winsorize_range),
         }
-
-    @classmethod
-    def from_stats(
-        cls,
-        mean: np.ndarray,
-        std: np.ndarray,
-        *,
-        winsorize_range: Tuple[float, float],
-    ) -> "NaNAwareStandardScaler":
-        scaler = cls(winsorize_range=winsorize_range)
-        scaler.mean_ = np.array(mean, dtype=np.float64)
-        scaler.std_ = np.array(std, dtype=np.float64)
-        return scaler
 
     @classmethod
     def from_state_dict(cls, d: Dict[str, object]) -> "NaNAwareStandardScaler":

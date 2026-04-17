@@ -35,14 +35,6 @@ class OptimizedConformerPool:
     conformers: list[OptimizedConformer]
 
 
-@dataclass
-class LowestEnergyConformer:
-    """The single optimized conformer used for lowest-energy 3D targets."""
-
-    mol: Chem.Mol
-    conformer_id: int
-
-
 def _molecule_seed(smiles: str, seed: int) -> int:
     digest = hashlib.sha256(smiles.encode()).digest()
     return (seed ^ int.from_bytes(digest[:4], byteorder="little")) & 0x7FFFFFFF
@@ -149,20 +141,3 @@ def compute_boltzmann_weights(
     if not np.isfinite(total) or total <= 0.0:
         raise ValueError("Could not normalize Boltzmann weights from the conformer energies.")
     return weights / total
-
-
-def generate_lowest_energy_conformer(
-    smiles: str,
-    config: ConformerConfig,
-    *,
-    seed: int,
-) -> LowestEnergyConformer | None:
-    """Generate conformers and keep only the lowest-energy optimized conformer."""
-    pool = generate_optimized_conformer_pool(smiles, config, seed=seed)
-    if pool is None or not pool.conformers:
-        return None
-
-    return LowestEnergyConformer(
-        mol=pool.mol,
-        conformer_id=pool.conformers[0].conformer_id,
-    )

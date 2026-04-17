@@ -95,6 +95,9 @@ class _BoltzmannTrainingDataset:
         self._dataset = dataset
         self._conformer_pools = list(conformer_pools)
         self._three_d_slice = three_d_slice
+        self._sampling_probabilities = [
+            self._normalize_sampling_probabilities(pool) for pool in self._conformer_pools
+        ]
         self._seed = int(seed)
         self._epoch = 0
 
@@ -104,8 +107,15 @@ class _BoltzmannTrainingDataset:
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
 
-    def _sampling_probabilities(self, pool: Conformer3DPool) -> np.ndarray:
+    @staticmethod
+    def _normalize_sampling_probabilities(pool: Conformer3DPool) -> np.ndarray:
         probabilities = pool.boltzmann_weights.astype(np.float64, copy=False)
+        if pool.values.shape[0] == 0:
+            if probabilities.ndim != 1 or probabilities.shape[0] != 0:
+                raise ValueError(
+                    "Boltzmann conformer weights must be a 1D vector aligned with the pool rows."
+                )
+            return np.zeros(0, dtype=np.float64)
         if probabilities.ndim != 1 or probabilities.shape[0] != pool.values.shape[0]:
             raise ValueError(
                 "Boltzmann conformer weights must be a 1D vector aligned with the pool rows."
@@ -120,14 +130,14 @@ class _BoltzmannTrainingDataset:
             raise ValueError("Boltzmann conformer weights must sum to a positive value.")
         return probabilities / total
 
-    def _sample_conformer_index(self, index: int, pool: Conformer3DPool) -> int:
+    def _sample_conformer_index(self, index: int) -> int:
         rng = np.random.default_rng(
             np.random.SeedSequence([self._seed, self._epoch, int(index)])
         )
         return int(
             rng.choice(
-                pool.values.shape[0],
-                p=self._sampling_probabilities(pool),
+                self._conformer_pools[index].values.shape[0],
+                p=self._sampling_probabilities[index],
             )
         )
 
@@ -137,7 +147,7 @@ class _BoltzmannTrainingDataset:
         if pool.values.shape[0] == 0 or pool.values.shape[1] == 0:
             return sample
 
-        conformer_index = self._sample_conformer_index(index, pool)
+        conformer_index = self._sample_conformer_index(index)
         sample.y[:, self._three_d_slice] = torch.from_numpy(
             pool.values[conformer_index]
         ).to(dtype=sample.y.dtype).unsqueeze(0)
@@ -370,67 +380,69 @@ def _prepare_scaled_descriptor_targets(
     np.ndarray,
     list[Conformer3DPool] | None,
 ]:
-    if not prepared_targets.has_boltzmann_3d:
-        scaler = NaNAwareStandardScaler(winsorize_range=config.winsorize_range)
-        scaler.fit(
-            prepared_targets.values[train_indices],
-            prepared_targets.validity_mask[train_indices],
-        )
-        logger.info("Scaler fit on train split (%d samples)", len(train_indices))
-        return (
-            scaler,
-            scaler.transform(prepared_targets.values),
-            prepared_targets.validity_mask.copy(),
-            prepared_targets.boltzmann_3d_pools,
-        )
-
-    two_d_width = prepared_targets.num_2d_descriptors
-    three_d_slice = prepared_targets.three_d_slice
-    three_d_width = prepared_targets.num_3d_descriptors
     winsorize_range = config.winsorize_range
-
-    means: list[np.ndarray] = []
-    stds: list[np.ndarray] = []
+    total_width = prepared_targets.values.shape[1]
+    mean = np.zeros(total_width, dtype=np.float64)
+    std = np.ones(total_width, dtype=np.float64)
     scaled_values = prepared_targets.values.copy()
     scaled_validity = prepared_targets.validity_mask.copy()
+    scaled_pools = prepared_targets.boltzmann_3d_pools
+    used_boltzmann_3d_stats = False
 
-    if two_d_width > 0:
+    two_d_slice = slice(0, prepared_targets.num_2d_descriptors)
+    if prepared_targets.num_2d_descriptors > 0:
         two_d_scaler = NaNAwareStandardScaler(winsorize_range=winsorize_range)
         two_d_scaler.fit(
-            prepared_targets.values[train_indices, :two_d_width],
-            prepared_targets.validity_mask[train_indices, :two_d_width],
+            prepared_targets.values[train_indices, two_d_slice],
+            prepared_targets.validity_mask[train_indices, two_d_slice],
         )
-        scaled_values[:, :two_d_width] = two_d_scaler.transform(
-            prepared_targets.values[:, :two_d_width]
+        mean[two_d_slice] = two_d_scaler.mean_
+        std[two_d_slice] = two_d_scaler.std_
+        scaled_values[:, two_d_slice] = two_d_scaler.transform(
+            prepared_targets.values[:, two_d_slice]
         )
-        means.append(two_d_scaler.mean_)
-        stds.append(two_d_scaler.std_)
 
-    scaled_pools = prepared_targets.boltzmann_3d_pools
-    if three_d_width > 0 and scaled_pools is not None:
-        train_pools = [scaled_pools[index] for index in train_indices]
-        three_d_mean, three_d_std = compute_boltzmann_weighted_3d_statistics(train_pools)
-        scaled_pools = scale_boltzmann_3d_pools(
-            scaled_pools,
-            three_d_mean,
-            three_d_std,
-            winsorize_range,
-        )
-        mean_targets, mean_validity = materialize_boltzmann_mean_targets(scaled_pools)
-        scaled_values[:, three_d_slice] = mean_targets
-        scaled_validity[:, three_d_slice] = mean_validity
-        means.append(three_d_mean)
-        stds.append(three_d_std)
+    three_d_slice = prepared_targets.three_d_slice
+    if prepared_targets.num_3d_descriptors > 0:
+        if prepared_targets.has_boltzmann_3d and scaled_pools is not None:
+            train_pools = [scaled_pools[index] for index in train_indices]
+            three_d_mean, three_d_std = compute_boltzmann_weighted_3d_statistics(
+                train_pools
+            )
+            mean[three_d_slice] = three_d_mean
+            std[three_d_slice] = three_d_std
+            scaled_pools = scale_boltzmann_3d_pools(
+                scaled_pools,
+                three_d_mean,
+                three_d_std,
+                winsorize_range,
+            )
+            mean_targets, mean_validity = materialize_boltzmann_mean_targets(scaled_pools)
+            scaled_values[:, three_d_slice] = mean_targets
+            scaled_validity[:, three_d_slice] = mean_validity
+            used_boltzmann_3d_stats = True
+        else:
+            three_d_scaler = NaNAwareStandardScaler(winsorize_range=winsorize_range)
+            three_d_scaler.fit(
+                prepared_targets.values[train_indices, three_d_slice],
+                prepared_targets.validity_mask[train_indices, three_d_slice],
+            )
+            mean[three_d_slice] = three_d_scaler.mean_
+            std[three_d_slice] = three_d_scaler.std_
+            scaled_values[:, three_d_slice] = three_d_scaler.transform(
+                prepared_targets.values[:, three_d_slice]
+            )
 
-    scaler = NaNAwareStandardScaler.from_stats(
-        np.concatenate(means) if means else np.zeros(0, dtype=np.float64),
-        np.concatenate(stds) if stds else np.ones(0, dtype=np.float64),
-        winsorize_range=winsorize_range,
-    )
-    logger.info(
-        "Scaler fit on train split (%d samples) with Boltzmann-weighted 3D statistics",
-        len(train_indices),
-    )
+    scaler = NaNAwareStandardScaler(winsorize_range=winsorize_range)
+    scaler.mean_ = mean
+    scaler.std_ = std
+    if used_boltzmann_3d_stats:
+        logger.info(
+            "Scaler fit on train split (%d samples) with Boltzmann-weighted 3D statistics",
+            len(train_indices),
+        )
+    else:
+        logger.info("Scaler fit on train split (%d samples)", len(train_indices))
     return scaler, scaled_values, scaled_validity, scaled_pools
 
 
