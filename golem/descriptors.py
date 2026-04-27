@@ -81,6 +81,11 @@ def _empty_conformer_3d_pool(width: int) -> Conformer3DPool:
     )
 
 
+def _pool_effective_weights(pool: Conformer3DPool) -> np.ndarray:
+    weights = pool.boltzmann_weights.astype(np.float64, copy=False)[:, None]
+    return weights * pool.validity_mask.astype(np.float64, copy=False)
+
+
 # ---------------------------------------------------------------------------
 # Mordred descriptor computation
 # ---------------------------------------------------------------------------
@@ -264,9 +269,7 @@ def materialize_boltzmann_mean_targets(
         if pool.values.shape[0] == 0 or width == 0:
             continue
 
-        pool_weights = pool.boltzmann_weights.astype(np.float64, copy=False)[:, None]
-        pool_validity = pool.validity_mask.astype(np.bool_, copy=False)
-        effective_weights = pool_weights * pool_validity
+        effective_weights = _pool_effective_weights(pool)
         weight_sum = effective_weights.sum(axis=0)
         validity_mask[row_idx] = weight_sum > 0.0
         weighted_sum = (effective_weights * pool.values.astype(np.float64)).sum(axis=0)
@@ -298,9 +301,7 @@ def compute_boltzmann_weighted_3d_statistics(
     for pool in pools:
         if pool.values.shape[0] == 0:
             continue
-        pool_weights = pool.boltzmann_weights.astype(np.float64, copy=False)[:, None]
-        pool_validity = pool.validity_mask.astype(np.float64, copy=False)
-        effective_weights = pool_weights * pool_validity
+        effective_weights = _pool_effective_weights(pool)
         pool_values = pool.values.astype(np.float64, copy=False)
         weight_sum += effective_weights.sum(axis=0)
         weighted_sum += (effective_weights * pool_values).sum(axis=0)

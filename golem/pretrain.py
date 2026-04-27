@@ -110,16 +110,13 @@ class _BoltzmannTrainingDataset:
     @staticmethod
     def _normalize_sampling_probabilities(pool: Conformer3DPool) -> np.ndarray:
         probabilities = pool.boltzmann_weights.astype(np.float64, copy=False)
-        if pool.values.shape[0] == 0:
-            if probabilities.ndim != 1 or probabilities.shape[0] != 0:
-                raise ValueError(
-                    "Boltzmann conformer weights must be a 1D vector aligned with the pool rows."
-                )
-            return np.zeros(0, dtype=np.float64)
-        if probabilities.ndim != 1 or probabilities.shape[0] != pool.values.shape[0]:
+        row_count = pool.values.shape[0]
+        if probabilities.ndim != 1 or probabilities.shape[0] != row_count:
             raise ValueError(
                 "Boltzmann conformer weights must be a 1D vector aligned with the pool rows."
             )
+        if row_count == 0:
+            return np.zeros(0, dtype=np.float64)
         if not np.all(np.isfinite(probabilities)):
             raise ValueError("Boltzmann conformer weights must be finite.")
         if np.any(probabilities < 0.0):
@@ -389,18 +386,22 @@ def _prepare_scaled_descriptor_targets(
     scaled_pools = prepared_targets.boltzmann_3d_pools
     used_boltzmann_3d_stats = False
 
+    def scale_static_slice(descriptor_slice: slice) -> None:
+        slice_scaler = NaNAwareStandardScaler(winsorize_range=winsorize_range)
+        slice_scaler.fit(
+            prepared_targets.values[train_indices, descriptor_slice],
+            prepared_targets.validity_mask[train_indices, descriptor_slice],
+        )
+        assert slice_scaler.mean_ is not None and slice_scaler.std_ is not None
+        mean[descriptor_slice] = slice_scaler.mean_
+        std[descriptor_slice] = slice_scaler.std_
+        scaled_values[:, descriptor_slice] = slice_scaler.transform(
+            prepared_targets.values[:, descriptor_slice]
+        )
+
     two_d_slice = slice(0, prepared_targets.num_2d_descriptors)
     if prepared_targets.num_2d_descriptors > 0:
-        two_d_scaler = NaNAwareStandardScaler(winsorize_range=winsorize_range)
-        two_d_scaler.fit(
-            prepared_targets.values[train_indices, two_d_slice],
-            prepared_targets.validity_mask[train_indices, two_d_slice],
-        )
-        mean[two_d_slice] = two_d_scaler.mean_
-        std[two_d_slice] = two_d_scaler.std_
-        scaled_values[:, two_d_slice] = two_d_scaler.transform(
-            prepared_targets.values[:, two_d_slice]
-        )
+        scale_static_slice(two_d_slice)
 
     three_d_slice = prepared_targets.three_d_slice
     if prepared_targets.num_3d_descriptors > 0:
@@ -422,16 +423,7 @@ def _prepare_scaled_descriptor_targets(
             scaled_validity[:, three_d_slice] = mean_validity
             used_boltzmann_3d_stats = True
         else:
-            three_d_scaler = NaNAwareStandardScaler(winsorize_range=winsorize_range)
-            three_d_scaler.fit(
-                prepared_targets.values[train_indices, three_d_slice],
-                prepared_targets.validity_mask[train_indices, three_d_slice],
-            )
-            mean[three_d_slice] = three_d_scaler.mean_
-            std[three_d_slice] = three_d_scaler.std_
-            scaled_values[:, three_d_slice] = three_d_scaler.transform(
-                prepared_targets.values[:, three_d_slice]
-            )
+            scale_static_slice(three_d_slice)
 
     scaler = NaNAwareStandardScaler(winsorize_range=winsorize_range)
     scaler.mean_ = mean
