@@ -63,6 +63,38 @@ def test_validate_pretrain_config_allows_boltzmann_workers() -> None:
     assert validated.num_workers == 1
 
 
+def test_validate_pretrain_config_allows_small_2d_only_conformer_generation() -> None:
+    config = PretrainConfig()
+    config.conformers.n_generate = 1
+
+    validated = validate_pretrain_config(config)
+
+    assert validated.conformers.n_generate == 1
+    assert validated.conformers.n_keep_best == 3
+
+
+def test_validate_pretrain_config_allows_small_lowest_energy_3d_generation() -> None:
+    config = PretrainConfig()
+    config.descriptors.include_3d_targets = True
+    config.descriptors.three_d_settings.target_mode = "lowest_energy"
+    config.conformers.n_generate = 1
+
+    validated = validate_pretrain_config(config)
+
+    assert validated.conformers.n_generate == 1
+    assert validated.conformers.n_keep_best == 3
+
+
+def test_validate_pretrain_config_rejects_small_boltzmann_generation() -> None:
+    config = PretrainConfig()
+    config.descriptors.include_3d_targets = True
+    config.descriptors.three_d_settings.target_mode = "boltzmann"
+    config.conformers.n_generate = 1
+
+    with pytest.raises(ValueError, match="conformers.n_keep_best"):
+        validate_pretrain_config(config)
+
+
 def test_load_config_rejects_legacy_conformer_n_keep(tmp_path) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(

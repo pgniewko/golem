@@ -345,7 +345,14 @@ def validate_pretrain_config(config: PretrainConfig) -> PretrainConfig:
 
     if config.model.hidden_dim % config.model.num_heads != 0:
         raise ValueError("model.hidden_dim must be divisible by model.num_heads.")
-    if config.conformers.n_keep_best > config.conformers.n_generate:
+    uses_boltzmann_3d_targets = (
+        config.descriptors.include_3d_targets
+        and config.descriptors.three_d_settings.target_mode == "boltzmann"
+    )
+    if (
+        uses_boltzmann_3d_targets
+        and config.conformers.n_keep_best > config.conformers.n_generate
+    ):
         raise ValueError("conformers.n_keep_best must be <= conformers.n_generate.")
     if not (
         config.descriptors.include_2d_targets or config.descriptors.include_3d_targets
