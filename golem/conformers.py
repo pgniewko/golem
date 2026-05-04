@@ -40,7 +40,12 @@ def _molecule_seed(smiles: str, seed: int) -> int:
     return (seed ^ int.from_bytes(digest[:4], byteorder="little")) & 0x7FFFFFFF
 
 
-def _optimize_conformers(mol: Chem.Mol, method: str) -> dict[int, float] | None:
+def _optimize_conformers(
+    mol: Chem.Mol,
+    method: str,
+    *,
+    max_iters: int = 1000,
+) -> dict[int, float] | None:
     if method == "MMFF":
         if not AllChem.MMFFHasAllMoleculeParams(mol):
             return None
@@ -51,7 +56,7 @@ def _optimize_conformers(mol: Chem.Mol, method: str) -> dict[int, float] | None:
         raise ValueError(f"Unsupported optimization method: {method!r}")
 
     try:
-        results = optimize(mol, numThreads=0)
+        results = optimize(mol, numThreads=0, maxIters=max_iters)
     except Exception:
         logger.debug("Conformer optimization failed", exc_info=True)
         return None
@@ -91,7 +96,15 @@ def generate_optimized_conformer_pool(
     if not conf_ids:
         return None
 
-    energies = _optimize_conformers(mol, "MMFF") or _optimize_conformers(mol, "UFF")
+    energies = _optimize_conformers(
+        mol,
+        "MMFF",
+        max_iters=config.optimization_max_iters,
+    ) or _optimize_conformers(
+        mol,
+        "UFF",
+        max_iters=config.optimization_max_iters,
+    )
     if energies is None:
         return None
 

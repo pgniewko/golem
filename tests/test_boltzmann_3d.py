@@ -11,11 +11,13 @@ from golem.conformers import (
     OptimizedConformer,
     OptimizedConformerPool,
     _optimize_conformers,
+    compute_boltzmann_weights,
     generate_optimized_conformer_pool,
     retain_boltzmann_conformers,
 )
 from golem.descriptors import (
     Conformer3DPool,
+    _drop_invalid_3d_columns,
     compute_boltzmann_weighted_3d_statistics,
     materialize_boltzmann_mean_targets,
 )
@@ -50,6 +52,7 @@ def test_pretrain_config_defaults_include_boltzmann_controls() -> None:
     assert config.conformers.n_generate == 8
     assert config.conformers.n_keep_best == 3
     assert config.conformers.max_delta_energy_kcal == pytest.approx(3.0)
+    assert config.conformers.optimization_max_iters == 1000
 
 
 def test_validate_pretrain_config_allows_boltzmann_workers() -> None:
@@ -126,14 +129,37 @@ def test_retain_boltzmann_conformers_filters_by_delta_energy_and_best_n() -> Non
     assert [conformer.conformer_id for conformer in retained.conformers] == [0, 1, 2]
 
 
+def test_boltzmann_retention_accepts_fewer_than_requested_conformers() -> None:
+    pool = OptimizedConformerPool(
+        mol=None,  # type: ignore[arg-type]
+        conformers=[
+            OptimizedConformer(conformer_id=0, energy=-5.0, delta_energy=0.0),
+            OptimizedConformer(conformer_id=1, energy=-3.2, delta_energy=1.8),
+            OptimizedConformer(conformer_id=2, energy=0.0, delta_energy=5.0),
+        ],
+    )
+    config = ConformerConfig(n_generate=8, n_keep_best=3, max_delta_energy_kcal=3.0)
+
+    retained = retain_boltzmann_conformers(pool, config)
+    weights = compute_boltzmann_weights(
+        np.asarray([conformer.delta_energy for conformer in retained.conformers])
+    )
+
+    assert [conformer.conformer_id for conformer in retained.conformers] == [0, 1]
+    assert weights.shape == (2,)
+    assert weights.sum() == pytest.approx(1.0)
+    assert weights[0] > weights[1]
+
+
 def test_optimize_conformers_keeps_only_converged_finite_results(monkeypatch) -> None:
     mol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
     AllChem.EmbedMultipleConfs(mol, numConfs=3, randomSeed=7)
 
     monkeypatch.setattr(AllChem, "MMFFHasAllMoleculeParams", lambda mol: True)
 
-    def fake_mmff_optimize(mol, numThreads=0):
+    def fake_mmff_optimize(mol, numThreads=0, maxIters=200):
         assert numThreads == 0
+        assert maxIters == 1000
         return [
             (0, -1.5),
             (1, -9.0),
@@ -152,8 +178,9 @@ def test_generate_optimized_conformer_pool_discards_nonconverged_mmff_conformers
 ) -> None:
     monkeypatch.setattr(AllChem, "MMFFHasAllMoleculeParams", lambda mol: True)
 
-    def fake_mmff_optimize(mol, numThreads=0):
+    def fake_mmff_optimize(mol, numThreads=0, maxIters=200):
         assert numThreads == 0
+        assert maxIters == 1000
         return [
             (1, -50.0),
             (0, -40.0),
@@ -184,13 +211,15 @@ def test_generate_optimized_conformer_pool_falls_back_to_uff_when_mmff_has_no_co
     monkeypatch.setattr(AllChem, "MMFFHasAllMoleculeParams", lambda mol: True)
     calls: list[str] = []
 
-    def fake_mmff_optimize(mol, numThreads=0):
+    def fake_mmff_optimize(mol, numThreads=0, maxIters=200):
         assert numThreads == 0
+        assert maxIters == 1000
         calls.append("MMFF")
         return [(1, -10.0) for _ in mol.GetConformers()]
 
-    def fake_uff_optimize(mol, numThreads=0):
+    def fake_uff_optimize(mol, numThreads=0, maxIters=200):
         assert numThreads == 0
+        assert maxIters == 1000
         calls.append("UFF")
         return [
             (0, 3.0 + idx)
@@ -225,6 +254,42 @@ def test_materialize_boltzmann_mean_targets_renormalizes_over_valid_conformers()
     assert validity_mask.tolist() == [[True, True]]
     assert values[0, 0] == pytest.approx(1.5)
     assert values[0, 1] == pytest.approx(10.0)
+
+
+def test_drop_invalid_3d_columns_keeps_sparse_columns_if_any_conformer_is_valid() -> None:
+    pools = [
+        _make_pool(
+            values=[[1.0, 0.0, 99.0]],
+            validity_mask=[[True, False, False]],
+            weights=[1.0],
+        ),
+        _make_pool(
+            values=[[0.0, 2.0, 99.0]],
+            validity_mask=[[False, True, False]],
+            weights=[1.0],
+        ),
+    ]
+
+    trimmed_pools, names = _drop_invalid_3d_columns(pools, ["x", "y", "never_valid"])
+
+    assert names == ["x", "y"]
+    assert trimmed_pools[0].values.tolist() == [[1.0, 0.0]]
+    assert trimmed_pools[0].validity_mask.tolist() == [[True, False]]
+    assert trimmed_pools[1].values.tolist() == [[0.0, 2.0]]
+    assert trimmed_pools[1].validity_mask.tolist() == [[False, True]]
+
+
+def test_materialize_empty_boltzmann_pool_masks_all_3d_targets() -> None:
+    empty_pool = Conformer3DPool(
+        values=np.zeros((0, 2), dtype=np.float32),
+        validity_mask=np.zeros((0, 2), dtype=np.bool_),
+        boltzmann_weights=np.zeros(0, dtype=np.float32),
+    )
+
+    values, validity_mask = materialize_boltzmann_mean_targets([empty_pool])
+
+    assert values.tolist() == [[0.0, 0.0]]
+    assert validity_mask.tolist() == [[False, False]]
 
 
 def test_compute_boltzmann_weighted_3d_statistics_uses_pool_weights_and_masks() -> None:
@@ -324,3 +389,21 @@ def test_boltzmann_training_dataset_renormalizes_float32_sampling_weights() -> N
 
     assert sample.y.tolist() == [[0.0, pool.values[expected_index, 0]]]
     assert sample.y_mask.tolist() == [[0.0, 1.0]]
+
+
+def test_boltzmann_training_dataset_leaves_empty_conformer_pool_masked() -> None:
+    base_sample = _DummySample(
+        y=torch.tensor([[7.0, 0.0, 0.0]], dtype=torch.float32),
+        y_mask=torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32),
+    )
+    empty_pool = Conformer3DPool(
+        values=np.zeros((0, 2), dtype=np.float32),
+        validity_mask=np.zeros((0, 2), dtype=np.bool_),
+        boltzmann_weights=np.zeros(0, dtype=np.float32),
+    )
+    dataset = _BoltzmannTrainingDataset([base_sample], [empty_pool], slice(1, 3), seed=5)
+
+    sample = dataset[0]
+
+    assert sample.y.tolist() == [[7.0, 0.0, 0.0]]
+    assert sample.y_mask.tolist() == [[1.0, 0.0, 0.0]]

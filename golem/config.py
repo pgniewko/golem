@@ -87,6 +87,7 @@ class ConformerConfig:
     n_generate: int = 8
     n_keep_best: int = 3
     max_delta_energy_kcal: float = 3.0
+    optimization_max_iters: int = 1000
 
 
 @dataclass
@@ -151,6 +152,7 @@ _INTEGER_RULES = {
     "isoforms.max_protomers": 1,
     "conformers.n_generate": 1,
     "conformers.n_keep_best": 1,
+    "conformers.optimization_max_iters": 1,
     "ecfp_latent_alignment.fp_bits": 1,
     "ecfp_latent_alignment.fp_radius": 0,
     "ecfp_latent_alignment.num_pairs": 1,
