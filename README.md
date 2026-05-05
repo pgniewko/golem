@@ -111,9 +111,18 @@ Optional 3D descriptor targets can be enabled in YAML:
 ```yaml
 descriptors:
   include_3d_targets: true
+  three_d_settings:
+    target_mode: boltzmann
 ```
 
-Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ETKDGv3`, conformer optimization uses fixed `MMFF` with `UFF` fallback, and the single lowest-energy conformer from `conformers.n_generate` attempts is used for 3D descriptors. If conformer generation or a 3D descriptor family fails, the molecule is kept and the affected 3D targets are masked the same way invalid 2D descriptor entries are masked. 3D descriptor columns that are invalid for every molecule are dropped across the dataset, and the run fails if no descriptor columns remain.
+Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`.
+
+3D targets support two modes:
+
+- `lowest_energy` (default): compute descriptors from the single lowest-energy conformer.
+- `boltzmann`: generate `conformers.n_generate` conformers, drop conformers with `delta_E > conformers.max_delta_energy_kcal`, keep up to the best `conformers.n_keep_best` survivors, compute/store 3D descriptors once for those retained conformers, then sample one retained conformer target per fetched training example using Boltzmann weights. Validation/test use the Boltzmann-weighted expected descriptor vector, and the 3D scaler is fit against the full retained conformer distribution with those same Boltzmann weights.
+
+ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ETKDGv3`, and conformer optimization uses fixed `MMFF` with `UFF` fallback. Only converged conformers are retained; if `MMFF` yields none, `UFF` is tried before the molecule is treated as a conformer-generation failure. If conformer generation or a 3D descriptor family fails, the molecule is kept and the affected 3D targets are masked the same way invalid 2D descriptor entries are masked. 3D descriptor columns that are invalid for every molecule or retained conformer are dropped across the dataset, and the run fails if no descriptor columns remain. Boltzmann 3D sampling is deterministic per `(seed, epoch, sample index)`, so it remains reproducible with data-loader workers enabled.
 
 ### CLI options
 
@@ -178,9 +187,9 @@ golem report experiments/pretrain --output path/to/report.html
 |--------|-------------|
 | `cli.py` | Parses CLI args, merges config, calls `pretrain()` |
 | `config.py` | Defines `PretrainConfig` dataclass tree; merges defaults / YAML overrides / CLI |
-| `conformers.py` | Builds the lowest-energy RDKit conformer used for optional 3D descriptor targets |
+| `conformers.py` | Builds optimized RDKit conformer pools, retains low-energy subsets, and exposes the lowest-energy wrapper used for optional 3D descriptor targets |
 | `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
-| `descriptors.py` | Computes 2D/3D descriptor targets; provides `NaNAwareStandardScaler` |
+| `descriptors.py` | Computes 2D/3D descriptor targets, retained Boltzmann conformer pools, and provides `NaNAwareStandardScaler` |
 | `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; deduplicate exact inputs &rarr; split shuffled neutralized core groups &rarr; expand isoforms within each split &rarr; descriptors &rarr; scale &rarr; train &rarr; checkpoint |
 | `utils.py` | Shared utilities: seeding, train/val/test splitting helpers, PyG DataLoader creation, SMILES file loading |
 

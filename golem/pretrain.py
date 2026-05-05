@@ -6,6 +6,7 @@ model. The built-in ``mu_mlp`` serves as the descriptor prediction head.
 
 from __future__ import annotations
 
+import copy
 import csv
 import inspect
 import json
@@ -15,6 +16,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -28,7 +30,15 @@ from golem.config import (
     PretrainConfig,
     validate_pretrain_config,
 )
-from golem.descriptors import NaNAwareStandardScaler, compute_descriptor_targets
+from golem.descriptors import (
+    Conformer3DPool,
+    NaNAwareStandardScaler,
+    PreparedDescriptorTargets,
+    compute_boltzmann_weighted_3d_statistics,
+    materialize_boltzmann_mean_targets,
+    prepare_descriptor_targets,
+    scale_boltzmann_3d_pools,
+)
 from golem.ecfp_latent_alignment import (
     compute_alignment_batch,
     compute_alignment_metrics,
@@ -67,6 +77,81 @@ class EpochMetrics:
     alignment_loss: float = math.nan
     alignment_spearman: float = math.nan
     alignment_kendall: float = math.nan
+
+
+class _BoltzmannTrainingDataset:
+    """Dataset wrapper that samples one cached 3D conformer target per fetch."""
+
+    def __init__(
+        self,
+        dataset: Sequence,
+        conformer_pools: Sequence[Conformer3DPool],
+        three_d_slice: slice,
+        *,
+        seed: int,
+    ) -> None:
+        if len(dataset) != len(conformer_pools):
+            raise ValueError("Training dataset and Boltzmann conformer pools must align.")
+        self._dataset = dataset
+        self._conformer_pools = list(conformer_pools)
+        self._three_d_slice = three_d_slice
+        self._sampling_probabilities = [
+            self._normalize_sampling_probabilities(pool) for pool in self._conformer_pools
+        ]
+        self._seed = int(seed)
+        self._epoch = 0
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    @staticmethod
+    def _normalize_sampling_probabilities(pool: Conformer3DPool) -> np.ndarray:
+        probabilities = pool.boltzmann_weights.astype(np.float64, copy=False)
+        row_count = pool.values.shape[0]
+        if probabilities.ndim != 1 or probabilities.shape[0] != row_count:
+            raise ValueError(
+                "Boltzmann conformer weights must be a 1D vector aligned with the pool rows."
+            )
+        if row_count == 0:
+            return np.zeros(0, dtype=np.float64)
+        if not np.all(np.isfinite(probabilities)):
+            raise ValueError("Boltzmann conformer weights must be finite.")
+        if np.any(probabilities < 0.0):
+            raise ValueError("Boltzmann conformer weights must be non-negative.")
+
+        total = float(probabilities.sum())
+        if total <= 0.0:
+            raise ValueError("Boltzmann conformer weights must sum to a positive value.")
+        return probabilities / total
+
+    def _sample_conformer_index(self, index: int) -> int:
+        rng = np.random.default_rng(
+            np.random.SeedSequence([self._seed, self._epoch, int(index)])
+        )
+        return int(
+            rng.choice(
+                self._conformer_pools[index].values.shape[0],
+                p=self._sampling_probabilities[index],
+            )
+        )
+
+    def __getitem__(self, index: int):
+        sample = _clone_data_object(self._dataset[index])
+        pool = self._conformer_pools[index]
+        if pool.values.shape[0] == 0 or pool.values.shape[1] == 0:
+            return sample
+
+        conformer_index = self._sample_conformer_index(index)
+        sample.y[:, self._three_d_slice] = torch.from_numpy(
+            pool.values[conformer_index]
+        ).to(dtype=sample.y.dtype).unsqueeze(0)
+        sample.y_mask[:, self._three_d_slice] = torch.from_numpy(
+            pool.validity_mask[conformer_index].astype(np.float32, copy=False)
+        ).to(dtype=sample.y_mask.dtype).unsqueeze(0)
+        return sample
 
 
 def _checkpoint_library_versions() -> dict[str, str]:
@@ -274,6 +359,83 @@ def _build_pyg_dataset(
         if fingerprint_bits is not None:
             data.ecfp = torch.tensor(fingerprint_bits[index], dtype=torch.bool).unsqueeze(0)
     return data_list
+
+
+def _clone_data_object(data):
+    if hasattr(data, "clone") and callable(data.clone):
+        return data.clone()
+    return copy.deepcopy(data)
+
+
+def _prepare_scaled_descriptor_targets(
+    prepared_targets: PreparedDescriptorTargets,
+    train_indices: np.ndarray,
+    config: PretrainConfig,
+) -> tuple[
+    NaNAwareStandardScaler,
+    np.ndarray,
+    np.ndarray,
+    list[Conformer3DPool] | None,
+]:
+    winsorize_range = config.winsorize_range
+    total_width = prepared_targets.values.shape[1]
+    mean = np.zeros(total_width, dtype=np.float64)
+    std = np.ones(total_width, dtype=np.float64)
+    scaled_values = prepared_targets.values.copy()
+    scaled_validity = prepared_targets.validity_mask.copy()
+    scaled_pools = prepared_targets.boltzmann_3d_pools
+    used_boltzmann_3d_stats = False
+
+    def scale_static_slice(descriptor_slice: slice) -> None:
+        slice_scaler = NaNAwareStandardScaler(winsorize_range=winsorize_range)
+        slice_scaler.fit(
+            prepared_targets.values[train_indices, descriptor_slice],
+            prepared_targets.validity_mask[train_indices, descriptor_slice],
+        )
+        assert slice_scaler.mean_ is not None and slice_scaler.std_ is not None
+        mean[descriptor_slice] = slice_scaler.mean_
+        std[descriptor_slice] = slice_scaler.std_
+        scaled_values[:, descriptor_slice] = slice_scaler.transform(
+            prepared_targets.values[:, descriptor_slice]
+        )
+
+    two_d_slice = slice(0, prepared_targets.num_2d_descriptors)
+    if prepared_targets.num_2d_descriptors > 0:
+        scale_static_slice(two_d_slice)
+
+    three_d_slice = prepared_targets.three_d_slice
+    if prepared_targets.num_3d_descriptors > 0:
+        if prepared_targets.has_boltzmann_3d and scaled_pools is not None:
+            train_pools = [scaled_pools[index] for index in train_indices]
+            three_d_mean, three_d_std = compute_boltzmann_weighted_3d_statistics(
+                train_pools
+            )
+            mean[three_d_slice] = three_d_mean
+            std[three_d_slice] = three_d_std
+            scaled_pools = scale_boltzmann_3d_pools(
+                scaled_pools,
+                three_d_mean,
+                three_d_std,
+                winsorize_range,
+            )
+            mean_targets, mean_validity = materialize_boltzmann_mean_targets(scaled_pools)
+            scaled_values[:, three_d_slice] = mean_targets
+            scaled_validity[:, three_d_slice] = mean_validity
+            used_boltzmann_3d_stats = True
+        else:
+            scale_static_slice(three_d_slice)
+
+    scaler = NaNAwareStandardScaler(winsorize_range=winsorize_range)
+    scaler.mean_ = mean
+    scaler.std_ = std
+    if used_boltzmann_3d_stats:
+        logger.info(
+            "Scaler fit on train split (%d samples) with Boltzmann-weighted 3D statistics",
+            len(train_indices),
+        )
+    else:
+        logger.info("Scaler fit on train split (%d samples)", len(train_indices))
+    return scaler, scaled_values, scaled_validity, scaled_pools
 
 
 def _filter_valid_smiles(original_smiles: list[str]) -> list[str]:
@@ -560,6 +722,8 @@ def _make_split_loaders(
             config.batch_size,
             shuffle=name == "train",
             num_workers=config.num_workers,
+            persistent_workers=not isinstance(dataset, _BoltzmannTrainingDataset)
+            and config.num_workers > 0,
         )
         loader.ecfp_latent_alignment = alignment_cfg if alignment_cfg.enabled else None
         loaders[name] = loader
@@ -700,12 +864,15 @@ def pretrain(
         config.descriptors.include_2d_targets,
         config.descriptors.include_3d_targets,
     )
-    descriptor_values, descriptor_validity, descriptor_names = compute_descriptor_targets(
+    prepared_targets = prepare_descriptor_targets(
         smiles_list,
         config.descriptors,
         config.conformers,
         seed=config.seed,
     )
+    descriptor_values = prepared_targets.values
+    descriptor_validity = prepared_targets.validity_mask
+    descriptor_names = prepared_targets.descriptor_names
     num_descriptors = descriptor_values.shape[1]
     logger.info(
         "Descriptor matrix: %d molecules × %d descriptors",
@@ -723,10 +890,13 @@ def pretrain(
             fingerprint_bits.shape[1],
         )
 
-    scaler = NaNAwareStandardScaler(winsorize_range=config.winsorize_range)
-    scaler.fit(descriptor_values[train_idx], descriptor_validity[train_idx])
-    logger.info("Scaler fit on train split (%d samples)", len(train_idx))
-    descriptor_values = scaler.transform(descriptor_values)
+    scaler, descriptor_values, descriptor_validity, boltzmann_pools = (
+        _prepare_scaled_descriptor_targets(
+            prepared_targets,
+            train_idx,
+            config,
+        )
+    )
 
     datasets = _build_split_datasets(
         smiles_list,
@@ -735,6 +905,18 @@ def pretrain(
         split_indices,
         fingerprint_bits=fingerprint_bits,
     )
+    if (
+        prepared_targets.has_boltzmann_3d
+        and boltzmann_pools is not None
+        and prepared_targets.num_3d_descriptors > 0
+    ):
+        train_pool_slice = [boltzmann_pools[index] for index in train_idx]
+        datasets["train"] = _BoltzmannTrainingDataset(
+            datasets["train"],
+            train_pool_slice,
+            prepared_targets.three_d_slice,
+            seed=config.seed,
+        )
     _validate_training_batch_configuration(len(datasets["train"]), config)
     loaders = _make_split_loaders(datasets, config, alignment_cfg)
 
@@ -846,6 +1028,9 @@ def pretrain(
             metrics_file.flush()
 
             for epoch in range(config.max_epochs):
+                train_dataset = getattr(loaders["train"], "dataset", None)
+                if isinstance(train_dataset, _BoltzmannTrainingDataset):
+                    train_dataset.set_epoch(epoch)
                 lr = scheduler.get_last_lr()[0]
                 train_metrics = _run_epoch(
                     model,
