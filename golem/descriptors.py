@@ -46,6 +46,25 @@ class Conformer3DPool:
     validity_mask: np.ndarray
     boltzmann_weights: np.ndarray
 
+    def copy_with(
+        self,
+        *,
+        values: np.ndarray | None = None,
+        validity_mask: np.ndarray | None = None,
+        boltzmann_weights: np.ndarray | None = None,
+    ) -> "Conformer3DPool":
+        return Conformer3DPool(
+            values=self.values.copy() if values is None else values,
+            validity_mask=(
+                self.validity_mask.copy() if validity_mask is None else validity_mask
+            ),
+            boltzmann_weights=(
+                self.boltzmann_weights.copy()
+                if boltzmann_weights is None
+                else boltzmann_weights
+            ),
+        )
+
 
 @dataclass
 class PreparedDescriptorTargets:
@@ -243,10 +262,9 @@ def _drop_invalid_3d_columns(
         if keep
     ]
     trimmed_pools = [
-        Conformer3DPool(
+        pool.copy_with(
             values=pool.values[:, global_valid],
             validity_mask=pool.validity_mask[:, global_valid],
-            boltzmann_weights=pool.boltzmann_weights.copy(),
         )
         for pool in pools
     ]
@@ -345,13 +363,7 @@ def scale_boltzmann_3d_pools(
                 std,
                 winsorize_range=winsorize_range,
             )
-        scaled_pools.append(
-            Conformer3DPool(
-                values=scaled_values,
-                validity_mask=pool.validity_mask.copy(),
-                boltzmann_weights=pool.boltzmann_weights.copy(),
-            )
-        )
+        scaled_pools.append(pool.copy_with(values=scaled_values))
     return scaled_pools
 
 

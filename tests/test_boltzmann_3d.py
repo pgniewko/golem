@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -109,6 +111,42 @@ def test_load_config_rejects_legacy_conformer_n_keep(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="conformers.n_keep"):
         load_config(str(config_path))
+
+
+def test_checked_in_configs_load() -> None:
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+
+    for config_path in sorted(config_dir.glob("*.yaml")):
+        load_config(str(config_path))
+
+
+def test_load_config_keeps_pretrain_and_nested_isoform_compatibility(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "pretrain:\n"
+        "  max_epochs: 12\n"
+        "  lr: 2.0e-4\n"
+        "isoforms:\n"
+        "  desalting: { enabled: true }\n"
+        "  tautomers:\n"
+        "    enabled: false\n"
+        "    max_tautomers: 4\n"
+        "  protonation:\n"
+        "    enabled: true\n"
+        "    max_protomers: 5\n"
+        "    ph_range: [6.8, 7.6]\n"
+    )
+
+    config = load_config(str(config_path))
+
+    assert config.max_epochs == 12
+    assert config.lr == pytest.approx(2.0e-4)
+    assert config.isoforms.desalting is True
+    assert config.isoforms.tautomers is False
+    assert config.isoforms.max_tautomers == 4
+    assert config.isoforms.protonation is True
+    assert config.isoforms.max_protomers == 5
+    assert config.isoforms.ph_range == pytest.approx((6.8, 7.6))
 
 
 def test_retain_boltzmann_conformers_filters_by_delta_energy_and_best_n() -> None:
