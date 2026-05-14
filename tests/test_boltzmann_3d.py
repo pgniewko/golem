@@ -23,7 +23,12 @@ from golem.descriptors import (
     compute_boltzmann_weighted_3d_statistics,
     materialize_boltzmann_mean_targets,
 )
-from golem.pretrain import _BoltzmannTrainingDataset
+from golem.pretrain import (
+    _BoltzmannTrainingDataset,
+    _DescriptorFamilyLossConfig,
+    _compute_descriptor_loss,
+    _descriptor_objective_loss_value,
+)
 
 
 class _DummySample:
@@ -47,14 +52,155 @@ def _make_pool(
     )
 
 
+def _synthetic_descriptor_loss_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    pred = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [2.0, 3.0, 4.0, 5.0],
+        ],
+        dtype=torch.float32,
+    )
+    targets = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    mask = torch.tensor(
+        [
+            [True, True, True, True],
+            [False, True, True, True],
+        ],
+        dtype=torch.bool,
+    )
+    return pred, targets, mask
+
+
+def test_unset_descriptor_family_weights_use_legacy_elementwise_pooled_mse() -> None:
+    pred, targets, mask = _synthetic_descriptor_loss_inputs()
+    family_config = _DescriptorFamilyLossConfig(
+        num_2d_descriptors=3,
+        num_descriptors=4,
+    )
+
+    loss, stats = _compute_descriptor_loss(pred, targets, mask, family_config)
+
+    expected = torch.nn.functional.mse_loss(pred[mask], targets[mask])
+
+    assert loss.item() == pytest.approx(expected.item())
+    assert _descriptor_objective_loss_value(stats, family_config) == pytest.approx(
+        loss.item()
+    )
+
+
+def test_equal_descriptor_family_weights_average_2d_and_3d_losses() -> None:
+    pred, targets, mask = _synthetic_descriptor_loss_inputs()
+    family_config = _DescriptorFamilyLossConfig(
+        num_2d_descriptors=3,
+        num_descriptors=4,
+        two_d_loss_weight=1.0,
+        three_d_loss_weight=1.0,
+    )
+
+    loss, stats = _compute_descriptor_loss(pred, targets, mask, family_config)
+    two_d_loss = torch.nn.functional.mse_loss(
+        pred[:, :3][mask[:, :3]],
+        targets[:, :3][mask[:, :3]],
+    )
+    three_d_loss = torch.nn.functional.mse_loss(
+        pred[:, 3:][mask[:, 3:]],
+        targets[:, 3:][mask[:, 3:]],
+    )
+    expected = (two_d_loss + three_d_loss) / 2.0
+
+    assert loss.item() == pytest.approx(expected.item())
+    assert _descriptor_objective_loss_value(stats, family_config) == pytest.approx(
+        expected.item()
+    )
+
+
+def test_unequal_descriptor_family_weights_shift_descriptor_objective() -> None:
+    pred, targets, mask = _synthetic_descriptor_loss_inputs()
+    family_config = _DescriptorFamilyLossConfig(
+        num_2d_descriptors=3,
+        num_descriptors=4,
+        two_d_loss_weight=1.0,
+        three_d_loss_weight=3.0,
+    )
+
+    loss, stats = _compute_descriptor_loss(pred, targets, mask, family_config)
+    two_d_loss = torch.nn.functional.mse_loss(
+        pred[:, :3][mask[:, :3]],
+        targets[:, :3][mask[:, :3]],
+    )
+    three_d_loss = torch.nn.functional.mse_loss(
+        pred[:, 3:][mask[:, 3:]],
+        targets[:, 3:][mask[:, 3:]],
+    )
+    expected = (two_d_loss + 3.0 * three_d_loss) / 4.0
+
+    assert loss.item() == pytest.approx(expected.item())
+    assert _descriptor_objective_loss_value(stats, family_config) == pytest.approx(
+        expected.item()
+    )
+
+
+def test_zero_descriptor_family_weight_excludes_family_from_objective() -> None:
+    pred, targets, mask = _synthetic_descriptor_loss_inputs()
+    family_config = _DescriptorFamilyLossConfig(
+        num_2d_descriptors=3,
+        num_descriptors=4,
+        two_d_loss_weight=0.0,
+        three_d_loss_weight=1.0,
+    )
+
+    loss, stats = _compute_descriptor_loss(pred, targets, mask, family_config)
+    expected = torch.nn.functional.mse_loss(
+        pred[:, 3:][mask[:, 3:]],
+        targets[:, 3:][mask[:, 3:]],
+    )
+
+    assert loss.item() == pytest.approx(expected.item())
+    assert stats.two_d_count > 0
+    assert _descriptor_objective_loss_value(stats, family_config) == pytest.approx(
+        expected.item()
+    )
+
+
 def test_pretrain_config_defaults_include_boltzmann_controls() -> None:
     config = PretrainConfig()
 
     assert config.descriptors.three_d_settings.target_mode == "lowest_energy"
+    assert config.descriptors.two_d_loss_weight is None
+    assert config.descriptors.three_d_loss_weight is None
     assert config.conformers.n_generate == 8
     assert config.conformers.n_keep_best == 3
     assert config.conformers.max_delta_energy_kcal == pytest.approx(3.0)
     assert config.conformers.optimization_max_iters == 1000
+
+
+def test_load_config_accepts_descriptor_family_loss_weights(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "descriptors:\n"
+        "  include_3d_targets: true\n"
+        "  two_d_loss_weight: 0.25\n"
+        "  three_d_loss_weight: 2.0\n"
+    )
+
+    config = load_config(str(config_path))
+
+    assert config.descriptors.two_d_loss_weight == pytest.approx(0.25)
+    assert config.descriptors.three_d_loss_weight == pytest.approx(2.0)
+
+
+def test_validate_pretrain_config_rejects_negative_descriptor_family_weights() -> None:
+    config = PretrainConfig()
+    config.descriptors.two_d_loss_weight = -0.1
+
+    with pytest.raises(ValueError, match="descriptors.two_d_loss_weight"):
+        validate_pretrain_config(config)
 
 
 def test_validate_pretrain_config_allows_boltzmann_workers() -> None:

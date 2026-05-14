@@ -77,6 +77,8 @@ class DescriptorConfig:
     include_2d_targets: bool = True
     include_3d_targets: bool = False
     loss_weight: float = 1.0
+    two_d_loss_weight: float | None = None
+    three_d_loss_weight: float | None = None
     three_d_settings: Descriptor3DSettings = field(default_factory=Descriptor3DSettings)
 
 
@@ -165,6 +167,8 @@ _REAL_RULES = {
     "masking_ratio": (0.0, 1.0, False, True),
     "subsample": (0.0, 1.0, False, True),
     "descriptors.loss_weight": (0.0, None, True, True),
+    "descriptors.two_d_loss_weight": (0.0, None, True, True),
+    "descriptors.three_d_loss_weight": (0.0, None, True, True),
     "conformers.max_delta_energy_kcal": (0.0, None, False, True),
     "ecfp_latent_alignment.weight": (0.0, None, True, True),
     "ecfp_latent_alignment.temperature": (0.0, None, False, True),
@@ -360,7 +364,27 @@ def validate_pretrain_config(config: PretrainConfig) -> PretrainConfig:
         config.descriptors.include_2d_targets or config.descriptors.include_3d_targets
     ):
         raise ValueError("At least one descriptor target family must be enabled.")
-    if config.descriptors.loss_weight == 0.0 and (
+    uses_family_descriptor_weights = (
+        config.descriptors.two_d_loss_weight is not None
+        or config.descriptors.three_d_loss_weight is not None
+    )
+    if uses_family_descriptor_weights:
+        descriptor_objective_has_positive_weight = False
+        if config.descriptors.loss_weight > 0.0:
+            if config.descriptors.include_2d_targets and (
+                config.descriptors.two_d_loss_weight is None
+                or config.descriptors.two_d_loss_weight > 0.0
+            ):
+                descriptor_objective_has_positive_weight = True
+            if config.descriptors.include_3d_targets and (
+                config.descriptors.three_d_loss_weight is None
+                or config.descriptors.three_d_loss_weight > 0.0
+            ):
+                descriptor_objective_has_positive_weight = True
+    else:
+        descriptor_objective_has_positive_weight = config.descriptors.loss_weight > 0.0
+
+    if not descriptor_objective_has_positive_weight and (
         not config.ecfp_latent_alignment.enabled
         or config.ecfp_latent_alignment.weight == 0.0
     ):
