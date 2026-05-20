@@ -76,11 +76,11 @@ golem pretrain \
 ```bash
 golem pretrain \
   --smiles data/examples.smi \
-  --config config.yaml \
+  --config configs/config.yaml \
   --output experiments/pretrain
 ```
 
-The example `config.yaml` contains overrides over the defaults in
+The example `configs/config.yaml` contains overrides over the defaults in
 `golem.config.PretrainConfig`, not a full copy of every setting.
 
 Device selection defaults to `auto`, which resolves to `cuda` when available,
@@ -113,7 +113,7 @@ descriptors:
   include_3d_targets: true
 ```
 
-Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. By default, descriptor loss uses pooled elementwise MSE, so each valid descriptor feature is weighted uniformly. Set `descriptors.two_d_loss_weight` and `descriptors.three_d_loss_weight` only if you want to balance the 2D and 3D descriptor families by family-level MSE. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ETKDGv3`, conformer optimization uses fixed `MMFF` with `UFF` fallback, and the single lowest-energy conformer from `conformers.n_generate` attempts is used for 3D descriptors. If conformer generation or a 3D descriptor family fails, the molecule is kept and the affected 3D targets are masked the same way invalid 2D descriptor entries are masked. 3D descriptor columns that are invalid for every molecule are dropped across the dataset, and the run fails if no descriptor columns remain.
+Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. By default, descriptor loss uses pooled elementwise MSE, so each valid descriptor feature is weighted uniformly. Set `descriptors.two_d_loss_weight` and `descriptors.three_d_loss_weight` only if you want to balance the 2D and 3D descriptor families by family-level MSE; setting either one switches to family weighting, and an included family left as `null` uses effective weight `1.0`, not `0.0`. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ETKDGv3`, conformer optimization uses fixed `MMFF` with `UFF` fallback, and the single lowest-energy conformer from `conformers.n_generate` attempts is used for 3D descriptors. If conformer generation or a 3D descriptor family fails, the molecule is kept and the affected 3D targets are masked the same way invalid 2D descriptor entries are masked. 3D descriptor columns that are invalid for every molecule are dropped across the dataset, and the run fails if no descriptor columns remain.
 
 ### CLI options
 
@@ -193,5 +193,5 @@ golem report experiments/pretrain --output path/to/report.html
 | NaN handling / validity masking | `descriptors.py:compute_mordred_descriptors()` |
 | Scaler fit (train-only, no leakage) | `pretrain.py:pretrain()` step 5 |
 | Config defaults | `config.py` dataclass definitions |
-| Example config overrides | `config.yaml` |
+| Example config overrides | `configs/config.yaml` |
 | Pretraining pipeline flow | `pretrain.py` module docstring |

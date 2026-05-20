@@ -17,6 +17,8 @@ descriptors:
   include_2d_targets: true
   include_3d_targets: false
   loss_weight: 1.0
+  # Setting either family weight switches to family-level mean MSE; an included
+  # family left as null then uses effective weight 1.0, not 0.0.
   two_d_loss_weight: null
   three_d_loss_weight: null
 

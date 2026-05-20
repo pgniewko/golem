@@ -71,7 +71,12 @@ class Descriptor3DSettings:
 
 @dataclass
 class DescriptorConfig:
-    """Descriptor target settings for pretraining."""
+    """Descriptor target settings for pretraining.
+
+    Note: Setting either family loss weight switches descriptor loss to family-level
+    mean MSE; any included family left as None then uses an effective weight of
+    1.0, not 0.0.
+    """
 
     include_2d_targets: bool = True
     include_3d_targets: bool = False
