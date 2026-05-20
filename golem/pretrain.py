@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import random
+import shutil
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
@@ -814,17 +815,6 @@ def pretrain(
         for n in artifacts:
             (output_dir / n).unlink(missing_ok=True)
     _setup_logging(output_dir, verbose=verbose, append=resume_ckpt_path is not None)
-    if resume_ckpt_path is not None:
-        # Carry the source's best_checkpoint.pt into --output when resuming from
-        # another directory, so the restored best_val_objective/best_epoch
-        # actually correspond to a checkpoint that lives here. Otherwise the
-        # post-loop fallback writes the final (worse) weights as "best".
-        src_best = resume_ckpt_path.parent / "best_checkpoint.pt"
-        tgt_best = output_dir / "best_checkpoint.pt"
-        if src_best.exists() and not tgt_best.exists() and src_best.resolve() != tgt_best.resolve():
-            import shutil
-            shutil.copy2(src_best, tgt_best)
-            logger.info("Resume: copied %s to preserve original best.", src_best)
 
     if verbose:
         try:
@@ -845,17 +835,58 @@ def pretrain(
     # Load + validate resume checkpoint up front
     checkpoint_state: dict | None = None
     if resume_ckpt_path is not None:
-        checkpoint_state = torch.load(resume_ckpt_path, map_location="cpu", weights_only=False)
-        missing = [k for k in ("model_state_dict", "optimizer_state_dict", "scheduler_state_dict", "epoch")
-                   if k not in checkpoint_state]
+        checkpoint_state = torch.load(
+            resume_ckpt_path, map_location="cpu", weights_only=False
+        )
+        missing = [
+            k
+            for k in (
+                "model_state_dict",
+                "optimizer_state_dict",
+                "scheduler_state_dict",
+                "epoch",
+            )
+            if k not in checkpoint_state
+        ]
         if missing:
             raise RuntimeError(f"Resume checkpoint missing {missing}; produced before resume support.")
         stored_cfg = (checkpoint_state.get("extra") or {}).get("config") or {}
         current_cfg = asdict(resolved_config)
-        diffs = [k for k in _RESUME_STRICT_KEYS if stored_cfg.get(k) != current_cfg.get(k)]
+        diffs = [
+            k for k in _RESUME_STRICT_KEYS if stored_cfg.get(k) != current_cfg.get(k)
+        ]
         if diffs:
             raise RuntimeError(f"Resume aborted — config differs in {diffs}.")
-        logger.info("Resuming from %s at epoch %d", resume_ckpt_path, checkpoint_state["epoch"] + 1)
+        extra = checkpoint_state.get("extra") or {}
+        es = extra.get("early_stop_state") or {}
+        prior_best = es.get("best_val_objective")
+        has_prior_best = prior_best is not None and math.isfinite(float(prior_best))
+        src_best = resume_ckpt_path.parent / "best_checkpoint.pt"
+        tgt_best = output_dir / "best_checkpoint.pt"
+        external_best = src_best.resolve() != tgt_best.resolve()
+        if has_prior_best:
+            if external_best:
+                if not src_best.exists():
+                    raise RuntimeError(
+                        "Resume checkpoint records a prior best model, but "
+                        f"{src_best} is missing; cannot preserve best_checkpoint.pt."
+                    )
+                tmp_best = tgt_best.with_suffix(".tmp" + tgt_best.suffix)
+                shutil.copy2(src_best, tmp_best)
+                tmp_best.replace(tgt_best)
+                logger.info("Resume: copied %s to preserve original best.", src_best)
+            elif not tgt_best.exists():
+                raise RuntimeError(
+                    "Resume checkpoint records a prior best model, but "
+                    f"{tgt_best} is missing; cannot preserve best_checkpoint.pt."
+                )
+        elif external_best:
+            tgt_best.unlink(missing_ok=True)
+        logger.info(
+            "Resuming from %s at epoch %d",
+            resume_ckpt_path,
+            checkpoint_state["epoch"] + 1,
+        )
 
     if resolved_config.warmup_epochs >= resolved_config.max_epochs:
         logger.warning(
