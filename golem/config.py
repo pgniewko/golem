@@ -6,7 +6,7 @@ import math
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from numbers import Integral, Real
-from typing import Any, List, Literal, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import yaml
 
@@ -67,7 +67,6 @@ class Descriptor3DSettings:
     """Optional 3D descriptor-target settings."""
 
     rdkit_include_getaway: bool = False
-    target_mode: Literal["lowest_energy", "boltzmann"] = "lowest_energy"
 
 
 @dataclass
@@ -87,9 +86,6 @@ class ConformerConfig:
     """Offline conformer generation settings for 3D descriptor targets."""
 
     n_generate: int = 8
-    n_keep_best: int = 3
-    max_delta_energy_kcal: float = 3.0
-    optimization_max_iters: int = 1000
 
 
 @dataclass
@@ -153,8 +149,6 @@ _INTEGER_RULES = {
     "isoforms.max_tautomers": 1,
     "isoforms.max_protomers": 1,
     "conformers.n_generate": 1,
-    "conformers.n_keep_best": 1,
-    "conformers.optimization_max_iters": 1,
     "ecfp_latent_alignment.fp_bits": 1,
     "ecfp_latent_alignment.fp_radius": 0,
     "ecfp_latent_alignment.num_pairs": 1,
@@ -169,7 +163,6 @@ _REAL_RULES = {
     "descriptors.loss_weight": (0.0, None, True, True),
     "descriptors.two_d_loss_weight": (0.0, None, True, True),
     "descriptors.three_d_loss_weight": (0.0, None, True, True),
-    "conformers.max_delta_energy_kcal": (0.0, None, False, True),
     "ecfp_latent_alignment.weight": (0.0, None, True, True),
     "ecfp_latent_alignment.temperature": (0.0, None, False, True),
     "ecfp_latent_alignment.tie_epsilon": (0.0, None, True, True),
@@ -196,7 +189,6 @@ _ISOFORM_BLOCK_RULES = {
     "rdkit_fallback": ("isoforms.rdkit_fallback", {"enabled"}, False),
 }
 _DEVICE_CHOICES = ("auto", "cpu", "cuda", "mps")
-_THREE_D_TARGET_MODE_CHOICES = ("lowest_energy", "boltzmann")
 
 
 def _reject_unknown_keys(
@@ -342,24 +334,9 @@ def validate_pretrain_config(config: PretrainConfig) -> PretrainConfig:
     if config.device not in _DEVICE_CHOICES:
         allowed = ", ".join(_DEVICE_CHOICES)
         raise ValueError(f"device must be one of {allowed}.")
-    if config.descriptors.three_d_settings.target_mode not in _THREE_D_TARGET_MODE_CHOICES:
-        allowed = ", ".join(_THREE_D_TARGET_MODE_CHOICES)
-        raise ValueError(
-            "descriptors.three_d_settings.target_mode must be one of "
-            f"{allowed}."
-        )
 
     if config.model.hidden_dim % config.model.num_heads != 0:
         raise ValueError("model.hidden_dim must be divisible by model.num_heads.")
-    uses_boltzmann_3d_targets = (
-        config.descriptors.include_3d_targets
-        and config.descriptors.three_d_settings.target_mode == "boltzmann"
-    )
-    if (
-        uses_boltzmann_3d_targets
-        and config.conformers.n_keep_best > config.conformers.n_generate
-    ):
-        raise ValueError("conformers.n_keep_best must be <= conformers.n_generate.")
     if not (
         config.descriptors.include_2d_targets or config.descriptors.include_3d_targets
     ):
@@ -426,8 +403,7 @@ def _dict_to_config(values: dict[str, Any]) -> PretrainConfig:
         removed = ", ".join(f"conformers.{key}" for key in removed_conformer_keys)
         raise ValueError(
             f"Removed config keys: {removed}. "
-            "Use conformers.n_generate, conformers.n_keep_best, and "
-            "conformers.max_delta_energy_kcal instead."
+            "Generate conformers with conformers.n_generate; the lowest-energy conformer is kept."
         )
 
     _reject_unknown_keys("", values, _PRETRAIN_SCALAR_FIELDS)

@@ -14,8 +14,6 @@ isoforms:
 
 descriptors:
   include_3d_targets: true
-  three_d_settings:
-    target_mode: boltzmann
 
 ecfp_latent_alignment:
   enabled: true
