@@ -68,8 +68,7 @@ golem pretrain \
   --smiles data/examples.smi \
   --output experiments/test_pretrain \
   --max-epochs 10 \
-  --subsample 0.1 \
-  --no-isoforms
+  --subsample 0.1
 ```
 
 ### Production run
@@ -77,11 +76,11 @@ golem pretrain \
 ```bash
 golem pretrain \
   --smiles data/examples.smi \
-  --config configs/golem-2d.yaml \
+  --config configs/config.yaml \
   --output experiments/pretrain
 ```
 
-Config files in `configs/` are intended to contain overrides over the defaults in
+The example `configs/config.yaml` contains overrides over the defaults in
 `golem.config.PretrainConfig`, not a full copy of every setting.
 
 Device selection defaults to `auto`, which resolves to `cuda` when available,
@@ -95,7 +94,10 @@ splits are then built on shuffled `core_smiles` groups, where each core is the
 canonicalized, sanitized, neutralized, non-isomeric form of the input SMILES.
 That grouping intentionally ignores chirality and alkene E/Z geometry so related
 stereoisomers stay in the same split, and split boundaries are snapped to whole-core
-group boundaries before isoform expansion.
+group boundaries before optional isoform expansion.
+
+Isoform enumeration is disabled by default. Enable it with `--isoforms` or
+`isoforms.enabled: true` in YAML.
 
 Optional ECFP-latent alignment can be enabled in YAML:
 
@@ -111,7 +113,7 @@ descriptors:
   include_3d_targets: true
 ```
 
-Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ETKDGv3`, conformer optimization uses fixed `MMFF` with `UFF` fallback, and the single lowest-energy conformer from `conformers.n_generate` attempts is used for 3D descriptors. If conformer generation or a 3D descriptor family fails, the molecule is kept and the affected 3D targets are masked the same way invalid 2D descriptor entries are masked. 3D descriptor columns that are invalid for every molecule are dropped across the dataset, and the run fails if no descriptor columns remain.
+Set `descriptors.include_2d_targets: false` together with `descriptors.include_3d_targets: true` to train on 3D descriptors only. By default, descriptor loss uses pooled elementwise MSE, so each valid descriptor feature is weighted uniformly. Set `descriptors.two_d_loss_weight` and `descriptors.three_d_loss_weight` only if you want to balance the 2D and 3D descriptor families by family-level MSE; setting either one switches to family weighting, and an included family left as `null` uses effective weight `1.0`, not `0.0`. If you want the run to optimize only the ECFP-latent alignment objective while still keeping descriptor heads active, set `descriptors.loss_weight: 0.0` and enable `ecfp_latent_alignment`. ElectroShape uses fixed `gasteiger` charges, conformer embedding is fixed to `ETKDGv3`, conformer optimization uses fixed `MMFF` with `UFF` fallback, and the single lowest-energy conformer from `conformers.n_generate` attempts is used for 3D descriptors. If conformer generation or a 3D descriptor family fails, the molecule is kept and the affected 3D targets are masked the same way invalid 2D descriptor entries are masked. 3D descriptor columns that are invalid for every molecule are dropped across the dataset, and the run fails if no descriptor columns remain.
 
 ### CLI options
 
@@ -127,7 +129,7 @@ Set `descriptors.include_2d_targets: false` together with `descriptors.include_3
 | `--device` | Device override: `auto`, `cpu`, `cuda`, or `mps` | `auto` |
 | `--subsample` | Subsample fraction (e.g. 0.1 for 10%) | None (use all) |
 | `--seed` | Override random seed | 42 |
-| `--no-isoforms` | Disable isoform enumeration | Enabled |
+| `--isoforms` / `--no-isoforms` | Enable or disable isoform enumeration | Disabled |
 | `--verbose` | Show DEBUG-level logs on console | Disabled |
 
 ### What pretraining produces
@@ -179,7 +181,7 @@ golem report experiments/pretrain --output path/to/report.html
 | `conformers.py` | Builds the lowest-energy RDKit conformer used for optional 3D descriptor targets |
 | `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
 | `descriptors.py` | Computes 2D/3D descriptor targets; provides `NaNAwareStandardScaler` |
-| `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; deduplicate exact inputs &rarr; split shuffled neutralized core groups &rarr; expand isoforms within each split &rarr; descriptors &rarr; scale &rarr; train &rarr; checkpoint |
+| `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; deduplicate exact inputs &rarr; split shuffled neutralized core groups &rarr; optionally expand isoforms within each split &rarr; descriptors &rarr; scale &rarr; train &rarr; checkpoint |
 | `utils.py` | Shared utilities: seeding, train/val/test splitting helpers, PyG DataLoader creation, SMILES file loading |
 
 ### Where things live
@@ -191,5 +193,5 @@ golem report experiments/pretrain --output path/to/report.html
 | NaN handling / validity masking | `descriptors.py:compute_mordred_descriptors()` |
 | Scaler fit (train-only, no leakage) | `pretrain.py:pretrain()` step 5 |
 | Config defaults | `config.py` dataclass definitions |
-| Production config overrides | `configs/golem-2d.yaml` |
+| Example config overrides | `configs/config.yaml` |
 | Pretraining pipeline flow | `pretrain.py` module docstring |

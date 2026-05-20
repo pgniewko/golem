@@ -37,7 +37,7 @@ class ModelConfig:
 class IsoformConfig:
     """Isoform enumeration config."""
 
-    enabled: bool = True
+    enabled: bool = False
     desalting: bool = False
     tautomers: bool = True
     max_tautomers: int = 10
@@ -71,11 +71,18 @@ class Descriptor3DSettings:
 
 @dataclass
 class DescriptorConfig:
-    """Descriptor target settings for pretraining."""
+    """Descriptor target settings for pretraining.
+
+    Note: Setting either family loss weight switches descriptor loss to family-level
+    mean MSE; any included family left as None then uses an effective weight of
+    1.0, not 0.0.
+    """
 
     include_2d_targets: bool = True
     include_3d_targets: bool = False
     loss_weight: float = 1.0
+    two_d_loss_weight: float | None = None
+    three_d_loss_weight: float | None = None
     three_d_settings: Descriptor3DSettings = field(default_factory=Descriptor3DSettings)
 
 
@@ -151,6 +158,7 @@ _INTEGER_RULES = {
     "ecfp_latent_alignment.fp_radius": 0,
     "ecfp_latent_alignment.num_pairs": 1,
 }
+# Real-valued rules are (minimum, maximum, minimum_inclusive, maximum_inclusive).
 _REAL_RULES = {
     "model.dropout": (0.0, 1.0, True, False),
     "model.head_dropout": (0.0, 1.0, True, False),
@@ -159,6 +167,8 @@ _REAL_RULES = {
     "masking_ratio": (0.0, 1.0, False, True),
     "subsample": (0.0, 1.0, False, True),
     "descriptors.loss_weight": (0.0, None, True, True),
+    "descriptors.two_d_loss_weight": (0.0, None, True, True),
+    "descriptors.three_d_loss_weight": (0.0, None, True, True),
     "ecfp_latent_alignment.weight": (0.0, None, True, True),
     "ecfp_latent_alignment.temperature": (0.0, None, False, True),
     "ecfp_latent_alignment.tie_epsilon": (0.0, None, True, True),
@@ -337,7 +347,23 @@ def validate_pretrain_config(config: PretrainConfig) -> PretrainConfig:
         config.descriptors.include_2d_targets or config.descriptors.include_3d_targets
     ):
         raise ValueError("At least one descriptor target family must be enabled.")
-    if config.descriptors.loss_weight == 0.0 and (
+    family_weights = []
+    if config.descriptors.include_2d_targets:
+        family_weights.append(config.descriptors.two_d_loss_weight)
+    if config.descriptors.include_3d_targets:
+        family_weights.append(config.descriptors.three_d_loss_weight)
+
+    uses_family_descriptor_weights = any(weight is not None for weight in family_weights)
+    active_family_weights = [
+        1.0 if weight is None else float(weight)
+        for weight in family_weights
+    ]
+    descriptor_objective_has_positive_weight = config.descriptors.loss_weight > 0.0 and (
+        not uses_family_descriptor_weights
+        or any(weight > 0.0 for weight in active_family_weights)
+    )
+
+    if not descriptor_objective_has_positive_weight and (
         not config.ecfp_latent_alignment.enabled
         or config.ecfp_latent_alignment.weight == 0.0
     ):

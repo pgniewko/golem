@@ -28,7 +28,7 @@ from golem.config import (
     PretrainConfig,
     validate_pretrain_config,
 )
-from golem.descriptors import NaNAwareStandardScaler, compute_descriptor_targets
+from golem.descriptors import NaNAwareStandardScaler, prepare_descriptor_targets
 from golem.ecfp_latent_alignment import (
     compute_alignment_batch,
     compute_alignment_metrics,
@@ -67,6 +67,64 @@ class EpochMetrics:
     alignment_loss: float = math.nan
     alignment_spearman: float = math.nan
     alignment_kendall: float = math.nan
+
+
+@dataclass(frozen=True)
+class _DescriptorLossWeightingConfig:
+    num_2d_descriptors: int
+    num_descriptors: int
+    two_d_loss_weight: float | None = None
+    three_d_loss_weight: float | None = None
+
+    @property
+    def uses_family_mean_loss(self) -> bool:
+        return self.two_d_loss_weight is not None or self.three_d_loss_weight is not None
+
+    @property
+    def two_d_slice(self) -> slice:
+        return slice(0, self.num_2d_descriptors)
+
+    @property
+    def three_d_slice(self) -> slice:
+        return slice(self.num_2d_descriptors, self.num_descriptors)
+
+    @property
+    def num_3d_descriptors(self) -> int:
+        return self.num_descriptors - self.num_2d_descriptors
+
+    @staticmethod
+    def _effective_weight(weight: float | None) -> float:
+        return 1.0 if weight is None else float(weight)
+
+    def family_specs(self) -> tuple[tuple[str, slice, float], ...]:
+        specs: list[tuple[str, slice, float]] = []
+        if self.num_2d_descriptors > 0:
+            specs.append(
+                ("2d", self.two_d_slice, self._effective_weight(self.two_d_loss_weight))
+            )
+        if self.num_3d_descriptors > 0:
+            specs.append(
+                ("3d", self.three_d_slice, self._effective_weight(self.three_d_loss_weight))
+            )
+        return tuple(specs)
+
+
+@dataclass
+class _DescriptorLossStats:
+    pooled_squared_error: float = 0.0
+    pooled_count: int = 0
+    two_d_squared_error: float = 0.0
+    two_d_count: int = 0
+    three_d_squared_error: float = 0.0
+    three_d_count: int = 0
+
+    def add(self, other: "_DescriptorLossStats") -> None:
+        self.pooled_squared_error += other.pooled_squared_error
+        self.pooled_count += other.pooled_count
+        self.two_d_squared_error += other.two_d_squared_error
+        self.two_d_count += other.two_d_count
+        self.three_d_squared_error += other.three_d_squared_error
+        self.three_d_count += other.three_d_count
 
 
 def _checkpoint_library_versions() -> dict[str, str]:
@@ -144,10 +202,89 @@ def _forward_batch(
     return pred, latent
 
 
+def _zero_loss_like(pred: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return (pred - targets).sum() * 0.0
+
+
+def _compute_descriptor_loss(
+    pred: torch.Tensor,
+    targets: torch.Tensor,
+    descriptor_mask: torch.Tensor,
+    loss_weighting_config: _DescriptorLossWeightingConfig,
+) -> tuple[torch.Tensor, _DescriptorLossStats]:
+    """Compute descriptor MSE, preserving legacy pooled behavior by default."""
+    stats = _DescriptorLossStats()
+    if not bool(descriptor_mask.any().item()):
+        return _zero_loss_like(pred, targets), stats
+
+    if not loss_weighting_config.uses_family_mean_loss:
+        loss = F.mse_loss(pred[descriptor_mask], targets[descriptor_mask])
+        stats.pooled_count = int(descriptor_mask.sum().item())
+        stats.pooled_squared_error = loss.item() * stats.pooled_count
+        return loss, stats
+
+    weighted_terms: list[torch.Tensor] = []
+    active_weight_sum = 0.0
+    for family_name, family_slice, family_weight in loss_weighting_config.family_specs():
+        family_mask = descriptor_mask[:, family_slice]
+        if not bool(family_mask.any().item()):
+            continue
+
+        family_pred = pred[:, family_slice]
+        family_targets = targets[:, family_slice]
+        family_loss = F.mse_loss(family_pred[family_mask], family_targets[family_mask])
+        if family_weight > 0.0:
+            weighted_terms.append(family_loss * family_weight)
+            active_weight_sum += family_weight
+
+        family_count = int(family_mask.sum().item())
+        family_squared_error = family_loss.item() * family_count
+        if family_name == "2d":
+            stats.two_d_squared_error += family_squared_error
+            stats.two_d_count += family_count
+        else:
+            stats.three_d_squared_error += family_squared_error
+            stats.three_d_count += family_count
+
+    stats.pooled_squared_error = stats.two_d_squared_error + stats.three_d_squared_error
+    stats.pooled_count = stats.two_d_count + stats.three_d_count
+    if not weighted_terms or active_weight_sum == 0.0:
+        return _zero_loss_like(pred, targets), stats
+    return sum(weighted_terms) / active_weight_sum, stats
+
+
+def _descriptor_objective_loss_value(
+    stats: _DescriptorLossStats,
+    loss_weighting_config: _DescriptorLossWeightingConfig,
+) -> float:
+    if not loss_weighting_config.uses_family_mean_loss:
+        if stats.pooled_count:
+            return stats.pooled_squared_error / stats.pooled_count
+        return math.nan
+
+    weighted_terms: list[float] = []
+    active_weight_sum = 0.0
+    for family_name, _, family_weight in loss_weighting_config.family_specs():
+        if family_name == "2d":
+            family_count = stats.two_d_count
+            family_squared_error = stats.two_d_squared_error
+        else:
+            family_count = stats.three_d_count
+            family_squared_error = stats.three_d_squared_error
+        if family_count and family_weight > 0.0:
+            weighted_terms.append((family_squared_error / family_count) * family_weight)
+            active_weight_sum += family_weight
+
+    if not weighted_terms or active_weight_sum == 0.0:
+        return math.nan
+    return sum(weighted_terms) / active_weight_sum
+
+
 def _run_epoch(
     model: torch.nn.Module,
     loader,
     descriptor_loss_weight: float,
+    loss_weighting_config: _DescriptorLossWeightingConfig,
     device: torch.device,
     *,
     optimizer: torch.optim.Optimizer | None = None,
@@ -158,8 +295,7 @@ def _run_epoch(
     alignment_cfg: ECFPLatentAlignmentConfig | None = getattr(
         loader, "ecfp_latent_alignment", None
     )
-    descriptor_se = 0.0
-    descriptor_count = 0
+    descriptor_stats = _DescriptorLossStats()
     alignment_losses: list[float] = []
     spearmans: list[float] = []
     kendalls: list[float] = []
@@ -185,14 +321,13 @@ def _run_epoch(
                 descriptor_mask = valid_mask
                 masked_count = int(valid_mask.sum().item())
 
-            descriptor_loss = pred.sum() * 0.0
-            if masked_count:
-                masked_diff = pred[descriptor_mask] - targets[descriptor_mask]
-                descriptor_loss = F.mse_loss(
-                    pred[descriptor_mask], targets[descriptor_mask]
-                )
-                descriptor_se += masked_diff.pow(2).sum().item()
-                descriptor_count += masked_count
+            descriptor_loss, batch_descriptor_stats = _compute_descriptor_loss(
+                pred,
+                targets,
+                descriptor_mask,
+                loss_weighting_config,
+            )
+            descriptor_stats.add(batch_descriptor_stats)
 
             alignment_loss = pred.sum() * 0.0
             has_alignment_pairs = False
@@ -233,8 +368,11 @@ def _run_epoch(
             optimizer.step()
 
     descriptor_loss_value = math.nan
-    if descriptor_count:
-        descriptor_loss_value = descriptor_se / descriptor_count
+    if descriptor_stats.pooled_count:
+        descriptor_loss_value = _descriptor_objective_loss_value(
+            descriptor_stats,
+            loss_weighting_config,
+        )
     elif saw_optimization_step:
         descriptor_loss_value = 0.0
 
@@ -700,7 +838,12 @@ def pretrain(
         config.descriptors.include_2d_targets,
         config.descriptors.include_3d_targets,
     )
-    descriptor_values, descriptor_validity, descriptor_names = compute_descriptor_targets(
+    (
+        descriptor_values,
+        descriptor_validity,
+        descriptor_names,
+        num_2d_descriptors,
+    ) = prepare_descriptor_targets(
         smiles_list,
         config.descriptors,
         config.conformers,
@@ -712,6 +855,24 @@ def pretrain(
         descriptor_values.shape[0],
         num_descriptors,
     )
+    loss_weighting_config = _DescriptorLossWeightingConfig(
+        num_2d_descriptors=num_2d_descriptors,
+        num_descriptors=num_descriptors,
+        two_d_loss_weight=config.descriptors.two_d_loss_weight,
+        three_d_loss_weight=config.descriptors.three_d_loss_weight,
+    )
+    if loss_weighting_config.uses_family_mean_loss:
+        logger.info(
+            "Descriptor family loss weights: 2D=%s 3D=%s",
+            loss_weighting_config.two_d_loss_weight
+            if loss_weighting_config.two_d_loss_weight is not None
+            else 1.0,
+            loss_weighting_config.three_d_loss_weight
+            if loss_weighting_config.three_d_loss_weight is not None
+            else 1.0,
+        )
+    else:
+        logger.info("Descriptor loss uses legacy elementwise pooled MSE")
 
     alignment_cfg = config.ecfp_latent_alignment
     fingerprint_bits = None
@@ -851,6 +1012,7 @@ def pretrain(
                     model,
                     loaders["train"],
                     config.descriptors.loss_weight,
+                    loss_weighting_config,
                     device,
                     optimizer=optimizer,
                     masking_ratio=config.masking_ratio,
@@ -859,6 +1021,7 @@ def pretrain(
                     model,
                     loaders["val"],
                     config.descriptors.loss_weight,
+                    loss_weighting_config,
                     device,
                 )
                 last_val_loss = val_metrics.objective_loss
@@ -969,6 +1132,7 @@ def pretrain(
             model,
             test_loader,
             config.descriptors.loss_weight,
+            loss_weighting_config,
             device,
         )
         logger.info(

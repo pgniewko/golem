@@ -45,8 +45,10 @@ def main() -> None:
 )
 @click.option("--seed", default=None, type=int, help="Override random seed.")
 @click.option(
-    "--no-isoforms", is_flag=True, default=False,
-    help="Disable isoform enumeration.",
+    "--isoforms/--no-isoforms",
+    "isoforms_enabled",
+    default=None,
+    help="Enable or disable isoform enumeration.",
 )
 @click.option(
     "--verbose", is_flag=True, default=False,
@@ -63,7 +65,7 @@ def pretrain_cmd(
     device: str | None,
     subsample: float | None,
     seed: int | None,
-    no_isoforms: bool,
+    isoforms_enabled: bool | None,
     verbose: bool,
 ) -> None:
     """Run descriptor pretraining on molecular descriptors."""
@@ -83,8 +85,8 @@ def pretrain_cmd(
         overrides["subsample"] = subsample
     if seed is not None:
         overrides["seed"] = seed
-    if no_isoforms:
-        overrides["isoforms"] = {"enabled": False}
+    if isoforms_enabled is not None:
+        overrides["isoforms"] = {"enabled": isoforms_enabled}
 
     cfg = load_config(yaml_path=config_path, **overrides)
 

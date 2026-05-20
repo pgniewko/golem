@@ -213,20 +213,23 @@ def compute_3d_descriptors(
     return values, validity_mask, descriptor_names
 
 
-def compute_descriptor_targets(
+def prepare_descriptor_targets(
     smiles_list: List[str],
     descriptors: DescriptorConfig,
     conformers: ConformerConfig,
     *,
     seed: int,
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """Compute the configured 2D/3D descriptor target matrix."""
+) -> Tuple[np.ndarray, np.ndarray, List[str], int]:
+    """Compute the configured 2D/3D descriptor targets plus the 2D width."""
     if not descriptors.include_2d_targets and not descriptors.include_3d_targets:
         raise ValueError("At least one descriptor target family must be enabled.")
 
     blocks = []
+    num_2d_descriptors = 0
     if descriptors.include_2d_targets:
-        blocks.append(compute_mordred_descriptors(smiles_list))
+        two_d_values, two_d_mask, two_d_names = compute_mordred_descriptors(smiles_list)
+        num_2d_descriptors = len(two_d_names)
+        blocks.append((two_d_values, two_d_mask, two_d_names))
     if descriptors.include_3d_targets:
         blocks.append(
             compute_3d_descriptors(
@@ -248,7 +251,7 @@ def compute_descriptor_targets(
         raise ValueError(
             "No valid descriptor targets remained after dropping all-invalid columns."
         )
-    return values, masks, names
+    return values, masks, names, num_2d_descriptors
 
 
 # ---------------------------------------------------------------------------
