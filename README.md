@@ -68,8 +68,7 @@ golem pretrain \
   --smiles data/examples.smi \
   --output experiments/test_pretrain \
   --max-epochs 10 \
-  --subsample 0.1 \
-  --no-isoforms
+  --subsample 0.1
 ```
 
 ### Production run
@@ -77,11 +76,11 @@ golem pretrain \
 ```bash
 golem pretrain \
   --smiles data/examples.smi \
-  --config configs/golem-2d.yaml \
+  --config config.yaml \
   --output experiments/pretrain
 ```
 
-Config files in `configs/` are intended to contain overrides over the defaults in
+The example `config.yaml` contains overrides over the defaults in
 `golem.config.PretrainConfig`, not a full copy of every setting.
 
 Device selection defaults to `auto`, which resolves to `cuda` when available,
@@ -95,7 +94,10 @@ splits are then built on shuffled `core_smiles` groups, where each core is the
 canonicalized, sanitized, neutralized, non-isomeric form of the input SMILES.
 That grouping intentionally ignores chirality and alkene E/Z geometry so related
 stereoisomers stay in the same split, and split boundaries are snapped to whole-core
-group boundaries before isoform expansion.
+group boundaries before optional isoform expansion.
+
+Isoform enumeration is disabled by default. Enable it with `--isoforms` or
+`isoforms.enabled: true` in YAML.
 
 Optional ECFP-latent alignment can be enabled in YAML:
 
@@ -127,7 +129,7 @@ Set `descriptors.include_2d_targets: false` together with `descriptors.include_3
 | `--device` | Device override: `auto`, `cpu`, `cuda`, or `mps` | `auto` |
 | `--subsample` | Subsample fraction (e.g. 0.1 for 10%) | None (use all) |
 | `--seed` | Override random seed | 42 |
-| `--no-isoforms` | Disable isoform enumeration | Enabled |
+| `--isoforms` / `--no-isoforms` | Enable or disable isoform enumeration | Disabled |
 | `--verbose` | Show DEBUG-level logs on console | Disabled |
 
 ### What pretraining produces
@@ -179,7 +181,7 @@ golem report experiments/pretrain --output path/to/report.html
 | `conformers.py` | Builds the lowest-energy RDKit conformer used for optional 3D descriptor targets |
 | `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
 | `descriptors.py` | Computes 2D/3D descriptor targets; provides `NaNAwareStandardScaler` |
-| `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; deduplicate exact inputs &rarr; split shuffled neutralized core groups &rarr; expand isoforms within each split &rarr; descriptors &rarr; scale &rarr; train &rarr; checkpoint |
+| `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; deduplicate exact inputs &rarr; split shuffled neutralized core groups &rarr; optionally expand isoforms within each split &rarr; descriptors &rarr; scale &rarr; train &rarr; checkpoint |
 | `utils.py` | Shared utilities: seeding, train/val/test splitting helpers, PyG DataLoader creation, SMILES file loading |
 
 ### Where things live
@@ -191,5 +193,5 @@ golem report experiments/pretrain --output path/to/report.html
 | NaN handling / validity masking | `descriptors.py:compute_mordred_descriptors()` |
 | Scaler fit (train-only, no leakage) | `pretrain.py:pretrain()` step 5 |
 | Config defaults | `config.py` dataclass definitions |
-| Production config overrides | `configs/golem-2d.yaml` |
+| Example config overrides | `config.yaml` |
 | Pretraining pipeline flow | `pretrain.py` module docstring |

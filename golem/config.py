@@ -37,7 +37,7 @@ class ModelConfig:
 class IsoformConfig:
     """Isoform enumeration config."""
 
-    enabled: bool = True
+    enabled: bool = False
     desalting: bool = False
     tautomers: bool = True
     max_tautomers: int = 10
@@ -153,6 +153,7 @@ _INTEGER_RULES = {
     "ecfp_latent_alignment.fp_radius": 0,
     "ecfp_latent_alignment.num_pairs": 1,
 }
+# Real-valued rules are (minimum, maximum, minimum_inclusive, maximum_inclusive).
 _REAL_RULES = {
     "model.dropout": (0.0, 1.0, True, False),
     "model.head_dropout": (0.0, 1.0, True, False),
@@ -341,25 +342,21 @@ def validate_pretrain_config(config: PretrainConfig) -> PretrainConfig:
         config.descriptors.include_2d_targets or config.descriptors.include_3d_targets
     ):
         raise ValueError("At least one descriptor target family must be enabled.")
-    uses_family_descriptor_weights = (
-        config.descriptors.two_d_loss_weight is not None
-        or config.descriptors.three_d_loss_weight is not None
+    family_weights = []
+    if config.descriptors.include_2d_targets:
+        family_weights.append(config.descriptors.two_d_loss_weight)
+    if config.descriptors.include_3d_targets:
+        family_weights.append(config.descriptors.three_d_loss_weight)
+
+    uses_family_descriptor_weights = any(weight is not None for weight in family_weights)
+    active_family_weights = [
+        1.0 if weight is None else float(weight)
+        for weight in family_weights
+    ]
+    descriptor_objective_has_positive_weight = config.descriptors.loss_weight > 0.0 and (
+        not uses_family_descriptor_weights
+        or any(weight > 0.0 for weight in active_family_weights)
     )
-    if uses_family_descriptor_weights:
-        descriptor_objective_has_positive_weight = False
-        if config.descriptors.loss_weight > 0.0:
-            if config.descriptors.include_2d_targets and (
-                config.descriptors.two_d_loss_weight is None
-                or config.descriptors.two_d_loss_weight > 0.0
-            ):
-                descriptor_objective_has_positive_weight = True
-            if config.descriptors.include_3d_targets and (
-                config.descriptors.three_d_loss_weight is None
-                or config.descriptors.three_d_loss_weight > 0.0
-            ):
-                descriptor_objective_has_positive_weight = True
-    else:
-        descriptor_objective_has_positive_weight = config.descriptors.loss_weight > 0.0
 
     if not descriptor_objective_has_positive_weight and (
         not config.ecfp_latent_alignment.enabled

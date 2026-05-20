@@ -70,14 +70,14 @@ class EpochMetrics:
 
 
 @dataclass(frozen=True)
-class _DescriptorFamilyLossConfig:
+class _DescriptorLossWeightingConfig:
     num_2d_descriptors: int
     num_descriptors: int
     two_d_loss_weight: float | None = None
     three_d_loss_weight: float | None = None
 
     @property
-    def family_weighting_enabled(self) -> bool:
+    def uses_family_mean_loss(self) -> bool:
         return self.two_d_loss_weight is not None or self.three_d_loss_weight is not None
 
     @property
@@ -202,69 +202,69 @@ def _forward_batch(
     return pred, latent
 
 
-def _zero_descriptor_loss(pred: torch.Tensor) -> torch.Tensor:
-    return pred.sum() * 0.0
+def _zero_loss_like(pred: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return (pred - targets).sum() * 0.0
 
 
 def _compute_descriptor_loss(
     pred: torch.Tensor,
     targets: torch.Tensor,
     descriptor_mask: torch.Tensor,
-    family_loss_config: _DescriptorFamilyLossConfig,
+    loss_weighting_config: _DescriptorLossWeightingConfig,
 ) -> tuple[torch.Tensor, _DescriptorLossStats]:
     """Compute descriptor MSE, preserving legacy pooled behavior by default."""
     stats = _DescriptorLossStats()
     if not bool(descriptor_mask.any().item()):
-        return _zero_descriptor_loss(pred), stats
+        return _zero_loss_like(pred, targets), stats
 
-    if not family_loss_config.family_weighting_enabled:
-        masked_diff = pred[descriptor_mask] - targets[descriptor_mask]
+    if not loss_weighting_config.uses_family_mean_loss:
         loss = F.mse_loss(pred[descriptor_mask], targets[descriptor_mask])
-        stats.pooled_squared_error = masked_diff.pow(2).sum().item()
-        stats.pooled_count = int(masked_diff.numel())
+        stats.pooled_count = int(descriptor_mask.sum().item())
+        stats.pooled_squared_error = loss.item() * stats.pooled_count
         return loss, stats
 
     weighted_terms: list[torch.Tensor] = []
     active_weight_sum = 0.0
-    for family_name, family_slice, family_weight in family_loss_config.family_specs():
+    for family_name, family_slice, family_weight in loss_weighting_config.family_specs():
         family_mask = descriptor_mask[:, family_slice]
         if not bool(family_mask.any().item()):
             continue
 
         family_pred = pred[:, family_slice]
         family_targets = targets[:, family_slice]
-        family_diff = family_pred[family_mask] - family_targets[family_mask]
         family_loss = F.mse_loss(family_pred[family_mask], family_targets[family_mask])
         if family_weight > 0.0:
             weighted_terms.append(family_loss * family_weight)
             active_weight_sum += family_weight
 
+        family_count = int(family_mask.sum().item())
+        family_squared_error = family_loss.item() * family_count
         if family_name == "2d":
-            stats.two_d_squared_error += family_diff.pow(2).sum().item()
-            stats.two_d_count += int(family_diff.numel())
+            stats.two_d_squared_error += family_squared_error
+            stats.two_d_count += family_count
         else:
-            stats.three_d_squared_error += family_diff.pow(2).sum().item()
-            stats.three_d_count += int(family_diff.numel())
+            stats.three_d_squared_error += family_squared_error
+            stats.three_d_count += family_count
 
     stats.pooled_squared_error = stats.two_d_squared_error + stats.three_d_squared_error
     stats.pooled_count = stats.two_d_count + stats.three_d_count
     if not weighted_terms or active_weight_sum == 0.0:
-        return _zero_descriptor_loss(pred), stats
+        return _zero_loss_like(pred, targets), stats
     return sum(weighted_terms) / active_weight_sum, stats
 
 
 def _descriptor_objective_loss_value(
     stats: _DescriptorLossStats,
-    family_loss_config: _DescriptorFamilyLossConfig,
+    loss_weighting_config: _DescriptorLossWeightingConfig,
 ) -> float:
-    if not family_loss_config.family_weighting_enabled:
+    if not loss_weighting_config.uses_family_mean_loss:
         if stats.pooled_count:
             return stats.pooled_squared_error / stats.pooled_count
         return math.nan
 
     weighted_terms: list[float] = []
     active_weight_sum = 0.0
-    for family_name, _, family_weight in family_loss_config.family_specs():
+    for family_name, _, family_weight in loss_weighting_config.family_specs():
         if family_name == "2d":
             family_count = stats.two_d_count
             family_squared_error = stats.two_d_squared_error
@@ -284,7 +284,7 @@ def _run_epoch(
     model: torch.nn.Module,
     loader,
     descriptor_loss_weight: float,
-    family_loss_config: _DescriptorFamilyLossConfig,
+    loss_weighting_config: _DescriptorLossWeightingConfig,
     device: torch.device,
     *,
     optimizer: torch.optim.Optimizer | None = None,
@@ -325,7 +325,7 @@ def _run_epoch(
                 pred,
                 targets,
                 descriptor_mask,
-                family_loss_config,
+                loss_weighting_config,
             )
             descriptor_stats.add(batch_descriptor_stats)
 
@@ -371,7 +371,7 @@ def _run_epoch(
     if descriptor_stats.pooled_count:
         descriptor_loss_value = _descriptor_objective_loss_value(
             descriptor_stats,
-            family_loss_config,
+            loss_weighting_config,
         )
     elif saw_optimization_step:
         descriptor_loss_value = 0.0
@@ -855,20 +855,20 @@ def pretrain(
         descriptor_values.shape[0],
         num_descriptors,
     )
-    family_loss_config = _DescriptorFamilyLossConfig(
+    loss_weighting_config = _DescriptorLossWeightingConfig(
         num_2d_descriptors=num_2d_descriptors,
         num_descriptors=num_descriptors,
         two_d_loss_weight=config.descriptors.two_d_loss_weight,
         three_d_loss_weight=config.descriptors.three_d_loss_weight,
     )
-    if family_loss_config.family_weighting_enabled:
+    if loss_weighting_config.uses_family_mean_loss:
         logger.info(
             "Descriptor family loss weights: 2D=%s 3D=%s",
-            family_loss_config.two_d_loss_weight
-            if family_loss_config.two_d_loss_weight is not None
+            loss_weighting_config.two_d_loss_weight
+            if loss_weighting_config.two_d_loss_weight is not None
             else 1.0,
-            family_loss_config.three_d_loss_weight
-            if family_loss_config.three_d_loss_weight is not None
+            loss_weighting_config.three_d_loss_weight
+            if loss_weighting_config.three_d_loss_weight is not None
             else 1.0,
         )
     else:
@@ -1012,7 +1012,7 @@ def pretrain(
                     model,
                     loaders["train"],
                     config.descriptors.loss_weight,
-                    family_loss_config,
+                    loss_weighting_config,
                     device,
                     optimizer=optimizer,
                     masking_ratio=config.masking_ratio,
@@ -1021,7 +1021,7 @@ def pretrain(
                     model,
                     loaders["val"],
                     config.descriptors.loss_weight,
-                    family_loss_config,
+                    loss_weighting_config,
                     device,
                 )
                 last_val_loss = val_metrics.objective_loss
@@ -1132,7 +1132,7 @@ def pretrain(
             model,
             test_loader,
             config.descriptors.loss_weight,
-            family_loss_config,
+            loss_weighting_config,
             device,
         )
         logger.info(

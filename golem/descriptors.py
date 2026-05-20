@@ -254,23 +254,6 @@ def prepare_descriptor_targets(
     return values, masks, names, num_2d_descriptors
 
 
-def compute_descriptor_targets(
-    smiles_list: List[str],
-    descriptors: DescriptorConfig,
-    conformers: ConformerConfig,
-    *,
-    seed: int,
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """Backwards-compatible wrapper returning only the target matrix."""
-    values, masks, names, _ = prepare_descriptor_targets(
-        smiles_list,
-        descriptors,
-        conformers,
-        seed=seed,
-    )
-    return values, masks, names
-
-
 # ---------------------------------------------------------------------------
 # NaN-aware standard scaler
 # ---------------------------------------------------------------------------
