@@ -137,7 +137,7 @@ Set `descriptors.include_2d_targets: false` together with `descriptors.include_3
 After a run completes, the output directory contains:
 
 ```
-experiments/pretrain/
+path/to/model/
   best_checkpoint.pt        # Best model by validation objective
   last_checkpoint.pt        # Most recent completed-epoch weights
   resolved_config.yaml      # Full resolved config used for the run
@@ -151,10 +151,10 @@ experiments/pretrain/
 After a pretraining run completes, an HTML report with training curves is automatically generated in the output directory. You can also regenerate or create a report from any existing experiment directory:
 
 ```bash
-golem report experiments/pretrain
+golem report path/to/model
 ```
 
-This reads `metrics.csv` and `resolved_config.yaml` from the experiment directory and produces a single-file HTML dashboard (`pretrain_report.html`) with:
+This reads `metrics.csv` and `resolved_config.yaml` from the model's directory and produces a single-file HTML dashboard with:
 
 - Training & validation objective curves
 - Training & validation descriptor-loss curves
@@ -169,29 +169,6 @@ Note: the generated HTML references Chart.js from a CDN, so it is not fully offl
 To write the report to a custom path:
 
 ```bash
-golem report experiments/pretrain --output path/to/report.html
+golem report path/to/model --output path/to/report.html
 ```
 
-### Key module responsibilities
-
-| Module | What it does |
-|--------|-------------|
-| `cli.py` | Parses CLI args, merges config, calls `pretrain()` |
-| `config.py` | Defines `PretrainConfig` dataclass tree; merges defaults / YAML overrides / CLI |
-| `conformers.py` | Builds the lowest-energy RDKit conformer used for optional 3D descriptor targets |
-| `isoforms.py` | Enumerates tautomers, protonation states, and neutralized forms per molecule |
-| `descriptors.py` | Computes 2D/3D descriptor targets; provides `NaNAwareStandardScaler` |
-| `pretrain.py` | Orchestrates the full pipeline: load SMILES &rarr; deduplicate exact inputs &rarr; split shuffled neutralized core groups &rarr; optionally expand isoforms within each split &rarr; descriptors &rarr; scale &rarr; train &rarr; checkpoint |
-| `utils.py` | Shared utilities: seeding, train/val/test splitting helpers, PyG DataLoader creation, SMILES file loading |
-
-### Where things live
-
-| Looking for... | Go to |
-|----------------|-------|
-| How the model is constructed | `pretrain.py` model creation section |
-| The masked MSE pretraining loss | `pretrain.py:_run_epoch()` |
-| NaN handling / validity masking | `descriptors.py:compute_mordred_descriptors()` |
-| Scaler fit (train-only, no leakage) | `pretrain.py:pretrain()` step 5 |
-| Config defaults | `config.py` dataclass definitions |
-| Example config overrides | `configs/config.yaml` |
-| Pretraining pipeline flow | `pretrain.py` module docstring |
