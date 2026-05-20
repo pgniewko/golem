@@ -111,20 +111,39 @@ class _DescriptorLossWeightingConfig:
 
 @dataclass
 class _DescriptorLossStats:
-    pooled_squared_error: float = 0.0
-    pooled_count: int = 0
     two_d_squared_error: float = 0.0
     two_d_count: int = 0
     three_d_squared_error: float = 0.0
     three_d_count: int = 0
 
+    @property
+    def descriptor_squared_error(self) -> float:
+        return self.two_d_squared_error + self.three_d_squared_error
+
+    @property
+    def descriptor_count(self) -> int:
+        return self.two_d_count + self.three_d_count
+
     def add(self, other: "_DescriptorLossStats") -> None:
-        self.pooled_squared_error += other.pooled_squared_error
-        self.pooled_count += other.pooled_count
         self.two_d_squared_error += other.two_d_squared_error
         self.two_d_count += other.two_d_count
         self.three_d_squared_error += other.three_d_squared_error
         self.three_d_count += other.three_d_count
+
+
+def _add_descriptor_family_stats(
+    stats: _DescriptorLossStats,
+    family_name: str,
+    family_loss: torch.Tensor,
+    family_count: int,
+) -> None:
+    family_squared_error = family_loss.item() * family_count
+    if family_name == "2d":
+        stats.two_d_squared_error += family_squared_error
+        stats.two_d_count += family_count
+    else:
+        stats.three_d_squared_error += family_squared_error
+        stats.three_d_count += family_count
 
 
 def _checkpoint_library_versions() -> dict[str, str]:
@@ -219,8 +238,18 @@ def _compute_descriptor_loss(
 
     if not loss_weighting_config.uses_family_mean_loss:
         loss = F.mse_loss(pred[descriptor_mask], targets[descriptor_mask])
-        stats.pooled_count = int(descriptor_mask.sum().item())
-        stats.pooled_squared_error = loss.item() * stats.pooled_count
+        for family_name, family_slice, _ in loss_weighting_config.family_specs():
+            family_mask = descriptor_mask[:, family_slice]
+            if not bool(family_mask.any().item()):
+                continue
+            family_count = int(family_mask.sum().item())
+            family_pred = pred[:, family_slice]
+            family_targets = targets[:, family_slice]
+            family_loss = F.mse_loss(
+                family_pred[family_mask],
+                family_targets[family_mask],
+            )
+            _add_descriptor_family_stats(stats, family_name, family_loss, family_count)
         return loss, stats
 
     weighted_terms: list[torch.Tensor] = []
@@ -238,16 +267,8 @@ def _compute_descriptor_loss(
             active_weight_sum += family_weight
 
         family_count = int(family_mask.sum().item())
-        family_squared_error = family_loss.item() * family_count
-        if family_name == "2d":
-            stats.two_d_squared_error += family_squared_error
-            stats.two_d_count += family_count
-        else:
-            stats.three_d_squared_error += family_squared_error
-            stats.three_d_count += family_count
+        _add_descriptor_family_stats(stats, family_name, family_loss, family_count)
 
-    stats.pooled_squared_error = stats.two_d_squared_error + stats.three_d_squared_error
-    stats.pooled_count = stats.two_d_count + stats.three_d_count
     if not weighted_terms or active_weight_sum == 0.0:
         return _zero_loss_like(pred, targets), stats
     return sum(weighted_terms) / active_weight_sum, stats
@@ -258,8 +279,8 @@ def _descriptor_objective_loss_value(
     loss_weighting_config: _DescriptorLossWeightingConfig,
 ) -> float:
     if not loss_weighting_config.uses_family_mean_loss:
-        if stats.pooled_count:
-            return stats.pooled_squared_error / stats.pooled_count
+        if stats.descriptor_count:
+            return stats.descriptor_squared_error / stats.descriptor_count
         return math.nan
 
     weighted_terms: list[float] = []
@@ -368,7 +389,7 @@ def _run_epoch(
             optimizer.step()
 
     descriptor_loss_value = math.nan
-    if descriptor_stats.pooled_count:
+    if descriptor_stats.descriptor_count:
         descriptor_loss_value = _descriptor_objective_loss_value(
             descriptor_stats,
             loss_weighting_config,
