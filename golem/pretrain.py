@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import math
+import random
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
@@ -140,8 +141,8 @@ def _format_optional_metric(value: float) -> str:
     return f"{value:.6f}" if math.isfinite(value) else ""
 
 
-def _setup_logging(output_dir: Path, verbose: bool = False) -> None:
-    """Configure logging to both stdout and file."""
+def _setup_logging(output_dir: Path, verbose: bool = False, *, append: bool = False) -> None:
+    """Configure logging to both stdout and file (append=True for resume)."""
     golem_logger = logging.getLogger("golem")
     golem_logger.setLevel(logging.DEBUG)
     golem_logger.propagate = False
@@ -157,7 +158,7 @@ def _setup_logging(output_dir: Path, verbose: bool = False) -> None:
     console_handler.setFormatter(formatter)
     golem_logger.addHandler(console_handler)
 
-    file_handler = logging.FileHandler(output_dir / "pretrain.log", mode="w")
+    file_handler = logging.FileHandler(output_dir / "pretrain.log", mode="a" if append else "w")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     golem_logger.addHandler(file_handler)
@@ -744,8 +745,11 @@ def _checkpoint_extra(
     descriptor_names: list[str],
     num_descriptors: int,
     split_indices: SplitIndices,
+    *,
+    early_stop_state: dict | None = None,
+    rng_state: dict | None = None,
 ) -> dict[str, object]:
-    return {
+    extra: dict[str, object] = {
         "scaler_state": scaler.state_dict(),
         "descriptor_names": descriptor_names,
         "descriptor_count": num_descriptors,
@@ -756,6 +760,21 @@ def _checkpoint_extra(
             for name, indices in split_indices.items()
         },
     }
+    if early_stop_state is not None:
+        extra["early_stop_state"] = early_stop_state
+    if rng_state is not None:
+        extra["rng_state"] = rng_state
+    return extra
+
+
+# Config keys whose drift between save and resume would silently change the
+# training trajectory or model. Other keys (max_epochs, patience, num_workers,
+# device, subsample) may change on resume.
+_RESUME_STRICT_KEYS = (
+    "model", "descriptors", "isoforms", "ecfp_latent_alignment", "conformers",
+    "seed", "split_ratios", "batch_size", "winsorize_range",
+    "warmup_epochs", "lr", "weight_decay", "masking_ratio",
+)
 
 
 def pretrain(
@@ -764,8 +783,12 @@ def pretrain(
     output_dir: str,
     subsample: float | None = None,
     verbose: bool = False,
+    *,
+    resume: bool = False,
+    resume_from: str | Path | None = None,
+    force: bool = False,
 ) -> Path:
-    """Full pretraining pipeline."""
+    """Full pretraining pipeline. See ``--resume`` / ``--resume-from`` / ``--force`` for resume semantics."""
     effective_subsample = subsample if subsample is not None else config.subsample
     resolved_config = replace(config, subsample=effective_subsample)
     validate_pretrain_config(resolved_config)
@@ -773,16 +796,35 @@ def pretrain(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    for artifact_name in (
-        "best_checkpoint.pt",
-        "last_checkpoint.pt",
-        "metrics.csv",
-        "pretrain_report.html",
-    ):
-        artifact_path = output_dir / artifact_name
-        if artifact_path.exists():
-            artifact_path.unlink()
-    _setup_logging(output_dir, verbose=verbose)
+
+    # Resume / clobber gate (issue #28)
+    resume_ckpt_path: Path | None = Path(resume_from) if resume_from else (
+        output_dir / "last_checkpoint.pt" if resume else None
+    )
+    if resume_ckpt_path is not None and not resume_ckpt_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {resume_ckpt_path}")
+    artifacts = ("best_checkpoint.pt", "last_checkpoint.pt", "metrics.csv",
+                 "pretrain_report.html", "resolved_config.yaml")
+    if resume_ckpt_path is None:
+        existing = [n for n in artifacts if (output_dir / n).exists()]
+        if existing and not force:
+            raise FileExistsError(
+                f"{output_dir} contains run artifacts ({', '.join(existing)}); pass --resume or --force."
+            )
+        for n in artifacts:
+            (output_dir / n).unlink(missing_ok=True)
+    _setup_logging(output_dir, verbose=verbose, append=resume_ckpt_path is not None)
+    if resume_ckpt_path is not None:
+        # Carry the source's best_checkpoint.pt into --output when resuming from
+        # another directory, so the restored best_val_objective/best_epoch
+        # actually correspond to a checkpoint that lives here. Otherwise the
+        # post-loop fallback writes the final (worse) weights as "best".
+        src_best = resume_ckpt_path.parent / "best_checkpoint.pt"
+        tgt_best = output_dir / "best_checkpoint.pt"
+        if src_best.exists() and not tgt_best.exists() and src_best.resolve() != tgt_best.resolve():
+            import shutil
+            shutil.copy2(src_best, tgt_best)
+            logger.info("Resume: copied %s to preserve original best.", src_best)
 
     if verbose:
         try:
@@ -799,6 +841,21 @@ def pretrain(
     logger.info("Resolved device: %s", device)
 
     seed_everything(resolved_config.seed, enable_cuda=device.type == "cuda")
+
+    # Load + validate resume checkpoint up front
+    checkpoint_state: dict | None = None
+    if resume_ckpt_path is not None:
+        checkpoint_state = torch.load(resume_ckpt_path, map_location="cpu", weights_only=False)
+        missing = [k for k in ("model_state_dict", "optimizer_state_dict", "scheduler_state_dict", "epoch")
+                   if k not in checkpoint_state]
+        if missing:
+            raise RuntimeError(f"Resume checkpoint missing {missing}; produced before resume support.")
+        stored_cfg = (checkpoint_state.get("extra") or {}).get("config") or {}
+        current_cfg = asdict(resolved_config)
+        diffs = [k for k in _RESUME_STRICT_KEYS if stored_cfg.get(k) != current_cfg.get(k)]
+        if diffs:
+            raise RuntimeError(f"Resume aborted — config differs in {diffs}.")
+        logger.info("Resuming from %s at epoch %d", resume_ckpt_path, checkpoint_state["epoch"] + 1)
 
     if resolved_config.warmup_epochs >= resolved_config.max_epochs:
         logger.warning(
@@ -963,6 +1020,38 @@ def pretrain(
     last_val_loss = math.nan
     last_completed_epoch: int | None = None
     last_saved_epoch: int | None = None
+    start_epoch = 0
+
+    # Restore model / optimizer / scheduler / RNG / early-stop on resume
+    if checkpoint_state is not None:
+        model.load_state_dict(checkpoint_state["model_state_dict"])
+        optimizer.load_state_dict(checkpoint_state["optimizer_state_dict"])
+        for st in optimizer.state.values():
+            for k, v in st.items():
+                if isinstance(v, torch.Tensor):
+                    st[k] = v.to(device)
+        scheduler.load_state_dict(checkpoint_state["scheduler_state_dict"])
+        scheduler.step()  # checkpoints save before scheduler.step(); advance now
+        extra = checkpoint_state.get("extra") or {}
+        es = extra.get("early_stop_state") or {}
+        if es.get("best_val_objective") is not None:
+            best_val_objective = float(es["best_val_objective"])
+        best_epoch = es.get("best_epoch", best_epoch)
+        patience_counter = es.get("patience_counter", patience_counter)
+        # Offset start_time so the elapsed_seconds column in metrics.csv stays
+        # monotonic across the resume boundary (issue #28 review P2 #1).
+        start_time = time.time() - float(es.get("elapsed_seconds", 0.0))
+        rng = extra.get("rng_state") or {}
+        try:
+            if "python" in rng: random.setstate(rng["python"])
+            if "numpy" in rng: np.random.set_state(rng["numpy"])
+            if "torch_cpu" in rng: torch.set_rng_state(rng["torch_cpu"])
+            if "torch_cuda" in rng and device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng["torch_cuda"])
+        except Exception:
+            logger.warning("RNG state restore failed; resumed run may diverge.", exc_info=True)
+        start_epoch = int(checkpoint_state["epoch"]) + 1
+        last_completed_epoch = last_saved_epoch = start_epoch - 1
 
     def _save_checkpoint(
         path: Path,
@@ -970,18 +1059,30 @@ def pretrain(
         epoch: int,
         best_metric: float | None,
     ) -> None:
-        model.save_checkpoint(
-            path=path,
-            epoch=epoch,
-            best_metric=best_metric,
-            extra=_checkpoint_extra(
-                resolved_config,
-                scaler,
-                descriptor_names,
-                num_descriptors,
-                split_indices,
-            ),
+        rng_state: dict = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+        }
+        if device.type == "cuda" and torch.cuda.is_available():
+            rng_state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        extra = _checkpoint_extra(
+            resolved_config, scaler, descriptor_names, num_descriptors, split_indices,
+            early_stop_state={
+                "best_val_objective": best_val_objective if math.isfinite(best_val_objective) else None,
+                "best_epoch": best_epoch,
+                "patience_counter": patience_counter,
+                "elapsed_seconds": time.time() - start_time,
+            },
+            rng_state=rng_state,
         )
+        # Atomic save: write to ".tmp.pt" (still .pt so gt-pyg keeps the name) then rename.
+        tmp = path.with_suffix(".tmp" + path.suffix)
+        model.save_checkpoint(
+            path=tmp, optimizer=optimizer, scheduler=scheduler,
+            epoch=epoch, best_metric=best_metric, extra=extra,
+        )
+        tmp.replace(path)
 
     def _save_last_checkpoint(epoch_to_save: int) -> None:
         nonlocal last_saved_epoch
@@ -999,14 +1100,16 @@ def pretrain(
         config.masking_ratio,
     )
 
-    epoch = 0
+    epoch = max(start_epoch - 1, 0)
+    metrics_mode = "a" if start_epoch > 0 and metrics_path.exists() else "w"
     try:
-        with open(metrics_path, "w", newline="") as metrics_file:
+        with open(metrics_path, metrics_mode, newline="") as metrics_file:
             metrics_writer = csv.writer(metrics_file)
-            metrics_writer.writerow(METRICS_FIELDNAMES)
-            metrics_file.flush()
+            if metrics_mode == "w":
+                metrics_writer.writerow(METRICS_FIELDNAMES)
+                metrics_file.flush()
 
-            for epoch in range(config.max_epochs):
+            for epoch in range(start_epoch, config.max_epochs):
                 lr = scheduler.get_last_lr()[0]
                 train_metrics = _run_epoch(
                     model,
