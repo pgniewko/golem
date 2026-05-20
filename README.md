@@ -135,7 +135,7 @@ Set `descriptors.include_2d_targets: false` together with `descriptors.include_3
 | `--resume-from PATH` | Resume from an explicit checkpoint path | None |
 | `--force` | Overwrite an existing non-empty output directory | Disabled |
 
-### Resuming a terminated run (issue #28)
+### Resuming a terminated run
 
 `last_checkpoint.pt` captures optimizer, scheduler, RNG, and early-stop state
 each epoch, so a terminated job can resume in place: `golem pretrain ... --resume`.

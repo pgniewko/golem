@@ -798,7 +798,6 @@ def pretrain(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resume / clobber gate (issue #28)
     resume_ckpt_path: Path | None = Path(resume_from) if resume_from else (
         output_dir / "last_checkpoint.pt" if resume else None
     )
@@ -1069,8 +1068,7 @@ def pretrain(
             best_val_objective = float(es["best_val_objective"])
         best_epoch = es.get("best_epoch", best_epoch)
         patience_counter = es.get("patience_counter", patience_counter)
-        # Offset start_time so the elapsed_seconds column in metrics.csv stays
-        # monotonic across the resume boundary (issue #28 review P2 #1).
+        # Keep elapsed_seconds monotonic across the resume boundary.
         start_time = time.time() - float(es.get("elapsed_seconds", 0.0))
         rng = extra.get("rng_state") or {}
         try:
@@ -1110,8 +1108,12 @@ def pretrain(
         # Atomic save: write to ".tmp.pt" (still .pt so gt-pyg keeps the name) then rename.
         tmp = path.with_suffix(".tmp" + path.suffix)
         model.save_checkpoint(
-            path=tmp, optimizer=optimizer, scheduler=scheduler,
-            epoch=epoch, best_metric=best_metric, extra=extra,
+            path=tmp,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=epoch,
+            best_metric=best_metric,
+            extra=extra,
         )
         tmp.replace(path)
 
