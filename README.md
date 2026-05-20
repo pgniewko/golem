@@ -65,7 +65,7 @@ python -c "from golem.config import PretrainConfig; print('golem OK')"
 
 ```bash
 golem pretrain \
-  --smiles data/openadmet/expansion_rx/train_test_smiles.smi \
+  --smiles data/examples.smi \
   --output experiments/test_pretrain \
   --max-epochs 10 \
   --subsample 0.1 \
@@ -76,7 +76,7 @@ golem pretrain \
 
 ```bash
 golem pretrain \
-  --smiles data/openadmet/expansion_rx/train_test_smiles.smi \
+  --smiles data/examples.smi \
   --config configs/golem-2d.yaml \
   --output experiments/pretrain
 ```
@@ -89,8 +89,6 @@ otherwise `mps`, otherwise `cpu`. You can force a backend explicitly with
 `--device mps` or `device: mps` in YAML; explicit backend requests fail fast if
 that backend is unavailable.
 
-The tracked example dataset in this repo lives under
-`data/openadmet/expansion_rx/`.
 
 Input SMILES are exact-string deduplicated before splitting. Train/validation/test
 splits are then built on shuffled `core_smiles` groups, where each core is the
@@ -141,9 +139,9 @@ experiments/pretrain/
   best_checkpoint.pt        # Best model by validation objective
   last_checkpoint.pt        # Most recent completed-epoch weights
   resolved_config.yaml      # Full resolved config used for the run
-  pretrain_report.html      # HTML dashboard with training curves and metrics (not tracked)
-  metrics.csv               # Per-epoch objective, descriptor, RMSE, LR, and optional alignment metrics (not tracked)
-  pretrain.log              # Full log output (not tracked)
+  pretrain_report.html      # HTML dashboard with training curves and metrics
+  metrics.csv               # Per-epoch objective, descriptor, RMSE, LR, and optional alignment metrics
+  pretrain.log              # Full log output 
 ```
 
 ## Generating Reports
