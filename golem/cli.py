@@ -54,6 +54,13 @@ def main() -> None:
     "--verbose", is_flag=True, default=False,
     help="Show DEBUG-level logs on console.",
 )
+@click.option("--resume", is_flag=True, default=False,
+              help="Resume from <output>/last_checkpoint.pt if present.")
+@click.option("--resume-from", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Resume from an explicit checkpoint path (overrides --resume).")
+@click.option("--force", is_flag=True, default=False,
+              help="Overwrite an existing non-empty output directory.")
 def pretrain_cmd(
     smiles: str,
     config_path: str | None,
@@ -67,6 +74,9 @@ def pretrain_cmd(
     seed: int | None,
     isoforms_enabled: bool | None,
     verbose: bool,
+    resume: bool,
+    resume_from: str | None,
+    force: bool,
 ) -> None:
     """Run descriptor pretraining on molecular descriptors."""
     # Build CLI overrides dict (None values are ignored by load_config)
@@ -95,6 +105,9 @@ def pretrain_cmd(
         config=cfg,
         output_dir=output,
         verbose=verbose,
+        resume=resume,
+        resume_from=resume_from,
+        force=force,
     )
 
 

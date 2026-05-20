@@ -131,6 +131,17 @@ Set `descriptors.include_2d_targets: false` together with `descriptors.include_3
 | `--seed` | Override random seed | 42 |
 | `--isoforms` / `--no-isoforms` | Enable or disable isoform enumeration | Disabled |
 | `--verbose` | Show DEBUG-level logs on console | Disabled |
+| `--resume` | Resume from `<output>/last_checkpoint.pt` if present | Disabled |
+| `--resume-from PATH` | Resume from an explicit checkpoint path | None |
+| `--force` | Overwrite an existing non-empty output directory | Disabled |
+
+### Resuming a terminated run
+
+`last_checkpoint.pt` captures optimizer, scheduler, RNG, and early-stop state
+each epoch, so a terminated job can resume in place: `golem pretrain ... --resume`.
+By default a non-empty `--output` is refused — pass `--resume` to continue or
+`--force` to overwrite. Resume refuses on structural config drift (model,
+descriptors, splits, seed, optimizer hyperparameters).
 
 ### What pretraining produces
 
