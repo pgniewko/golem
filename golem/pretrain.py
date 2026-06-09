@@ -1087,14 +1087,17 @@ def pretrain(
         *,
         epoch: int,
         best_metric: float | None,
+        include_training_state: bool,
     ) -> None:
-        rng_state: dict = {
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-            "torch_cpu": torch.get_rng_state(),
-        }
-        if device.type == "cuda" and torch.cuda.is_available():
-            rng_state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        rng_state: dict | None = None
+        if include_training_state:
+            rng_state = {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch_cpu": torch.get_rng_state(),
+            }
+            if device.type == "cuda" and torch.cuda.is_available():
+                rng_state["torch_cuda"] = torch.cuda.get_rng_state_all()
         extra = _checkpoint_extra(
             resolved_config, scaler, descriptor_names, num_descriptors, split_indices,
             early_stop_state={
@@ -1109,8 +1112,8 @@ def pretrain(
         tmp = path.with_suffix(".tmp" + path.suffix)
         model.save_checkpoint(
             path=tmp,
-            optimizer=optimizer,
-            scheduler=scheduler,
+            optimizer=optimizer if include_training_state else None,
+            scheduler=scheduler if include_training_state else None,
             epoch=epoch,
             best_metric=best_metric,
             extra=extra,
@@ -1123,6 +1126,7 @@ def pretrain(
             last_ckpt_path,
             epoch=epoch_to_save,
             best_metric=best_val_objective if math.isfinite(best_val_objective) else None,
+            include_training_state=True,
         )
         last_saved_epoch = epoch_to_save
 
@@ -1218,6 +1222,7 @@ def pretrain(
                         best_ckpt_path,
                         epoch=epoch,
                         best_metric=best_val_objective,
+                        include_training_state=False,
                     )
                     logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
                 else:
@@ -1253,7 +1258,12 @@ def pretrain(
             if math.isfinite(last_val_loss)
             else math.nan
         )
-        _save_checkpoint(best_ckpt_path, epoch=epoch, best_metric=fallback_metric)
+        _save_checkpoint(
+            best_ckpt_path,
+            epoch=epoch,
+            best_metric=fallback_metric,
+            include_training_state=False,
+        )
 
     logger.info(
         "Training complete.  Best val_objective=%.4f at epoch %d",

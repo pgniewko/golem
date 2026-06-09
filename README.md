@@ -149,8 +149,8 @@ After a run completes, the output directory contains:
 
 ```
 path/to/model/
-  best_checkpoint.pt        # Best model by validation objective
-  last_checkpoint.pt        # Most recent completed-epoch weights
+  best_checkpoint.pt        # Best model by validation objective, without training state
+  last_checkpoint.pt        # Most recent completed-epoch resume checkpoint
   resolved_config.yaml      # Full resolved config used for the run
   pretrain_report.html      # HTML dashboard with training curves and metrics
   metrics.csv               # Per-epoch objective, descriptor, RMSE, LR, and optional alignment metrics
