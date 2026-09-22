@@ -49,7 +49,9 @@ def _optimize_conformers(mol: Chem.Mol, method: str) -> dict[int, float] | None:
         for conformer, (_, energy) in zip(mol.GetConformers(), results, strict=False)
         if np.isfinite(energy)
     }
-    return energies or None
+    if energies:
+        return energies
+    return None
 
 
 def generate_lowest_energy_conformer(
