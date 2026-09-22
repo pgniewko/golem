@@ -141,7 +141,7 @@ def compute_fingerprints(
     smiles_list: List[str],
     config: ECFPLatentAlignmentConfig,
 ) -> np.ndarray:
-    logger.info("Computing ECFP bits for %d molecules", len(smiles_list))
+    logger.info(f"Computing ECFP bits for {len(smiles_list)} molecules")
     fps = np.zeros((len(smiles_list), config.fp_bits), dtype=np.bool_)
     for idx, smiles in enumerate(smiles_list):
         mol = Chem.MolFromSmiles(smiles)

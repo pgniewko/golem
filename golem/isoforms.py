@@ -77,7 +77,7 @@ def _enumerate_tautomers(
                 "molvs not installed -- falling back to RDKit TautomerEnumerator"
             )
         except Exception as e:
-            logger.debug("MolVS tautomer failed: %s -- falling back to RDKit", e)
+            logger.debug(f"MolVS tautomer failed: {e} -- falling back to RDKit")
 
     try:
         enumerator = rdMolStandardize.TautomerEnumerator()
@@ -86,7 +86,7 @@ def _enumerate_tautomers(
         random.shuffle(results)
         return results
     except Exception as e:
-        logger.debug("RDKit tautomer failed for %s: %s", _canonical(mol), e)
+        logger.debug(f"RDKit tautomer failed for {_canonical(mol)}: {e}")
         return []
 
 
@@ -102,14 +102,14 @@ def _is_valid_protomer(protomer_mol: Chem.Mol) -> bool:
     try:
         Chem.SanitizeMol(protomer_mol)
     except Exception:
-        logger.debug("Protomer failed sanitization: %s", _canonical(protomer_mol))
+        logger.debug(f"Protomer failed sanitization: {_canonical(protomer_mol)}")
         return False
 
     # 2. Nitrogen with >= 4 hydrogens (invalid for organic N)
     for atom in protomer_mol.GetAtoms():
         if atom.GetAtomicNum() == 7 and atom.GetTotalNumHs() >= 4:
             logger.debug(
-                "Rejected protomer with N(4+H): %s", _canonical(protomer_mol)
+                f"Rejected protomer with N(4+H): {_canonical(protomer_mol)}"
             )
             return False
 
@@ -134,8 +134,7 @@ def _is_valid_protomer(protomer_mol: Chem.Mol) -> bool:
             )
             if has_carbonyl_oxygen:
                 logger.debug(
-                    "Rejected protomer with protonated tertiary amide N: %s",
-                    _canonical(protomer_mol),
+                    f"Rejected protomer with protonated tertiary amide N: {_canonical(protomer_mol)}"
                 )
                 return False
 
@@ -180,7 +179,7 @@ def _enumerate_protonation(
             "Install with: pip install gypsum-dl>=1.3.0"
         )
     except Exception as e:
-        logger.debug("Dimorphite-DL failed for %s: %s – falling back to Uncharger", smi, e)
+        logger.debug(f"Dimorphite-DL failed for {smi}: {e} – falling back to Uncharger")
 
     try:
         mol = Chem.MolFromSmiles(smi)
@@ -188,7 +187,7 @@ def _enumerate_protonation(
             return []
         return _neutralize(mol)
     except Exception as e:
-        logger.debug("Uncharger fallback failed for %s: %s", smi, e)
+        logger.debug(f"Uncharger fallback failed for {smi}: {e}")
 
     return []
 
@@ -201,7 +200,7 @@ def _neutralize(mol: Chem.Mol) -> List[Chem.Mol]:
         if neutralized is not None:
             return [neutralized]
     except Exception as e:
-        logger.debug("Neutralization failed for %s: %s", _canonical(mol), e)
+        logger.debug(f"Neutralization failed for {_canonical(mol)}: {e}")
     return []
 
 
@@ -220,7 +219,7 @@ def enumerate_isoforms(smiles: str, config: IsoformConfig) -> List[str]:
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        logger.warning("Cannot parse SMILES: %s", smiles)
+        logger.warning(f"Cannot parse SMILES: {smiles}")
         return [smiles]  # keep original even if unparseable
 
     original_can = _canonical(mol)
@@ -291,9 +290,7 @@ def enumerate_isoforms_batch(
         total_isoforms += len(isoforms)
 
     logger.info(
-        "Isoform enumeration complete: %d parents → %d total isoforms (%.1f× expansion)",
-        len(smiles_list),
-        total_isoforms,
-        total_isoforms / max(len(smiles_list), 1),
+        f"Isoform enumeration complete: {len(smiles_list)} parents -> "
+        f"{total_isoforms} total isoforms ({total_isoforms / max(len(smiles_list), 1):.1} expansion)",
     )
     return results
