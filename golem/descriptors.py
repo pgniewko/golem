@@ -191,10 +191,8 @@ def compute_3d_descriptors(
         ]
 
     logger.info(
-        "3D descriptors: %d molecules × %d descriptors (%.1f%% valid entries)",
-        values.shape[0],
-        values.shape[1],
-        validity_mask.mean() * 100 if validity_mask.size else 0.0,
+        f"3D descriptors: {values.shape[0]} molecules x {values.shape[1]} "
+        f"descriptors ({validity_mask.mean() * 100 if validity_mask.size else 0.0}% valid entries)"
     )
     if conformer_failures or descriptor_failures:
         logger.info(

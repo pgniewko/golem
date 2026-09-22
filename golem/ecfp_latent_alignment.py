@@ -26,18 +26,12 @@ def _sample_pairs(
     deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if batch_size < 2:
-        logger.warning(
-            "Skipping ECFP-latent alignment for batch_size=%d: need at least 2 samples.",
-            batch_size,
-        )
+        logger.warning(f"Skipping ECFP-latent alignment for batch_size={batch_size}: need at least 2 samples.")
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
 
     if num_pairs <= 0:
-        logger.warning(
-            "Skipping ECFP-latent alignment for num_pairs=%d: need a positive pair count.",
-            num_pairs,
-        )
+        logger.warning(f"Skipping ECFP-latent alignment for num_pairs={num_pairs}: need a positive pair count.")
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
 

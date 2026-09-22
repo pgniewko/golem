@@ -626,9 +626,7 @@ def _prepare_split_smiles(
     train_counts = core_counts["train"]
     val_counts = core_counts["val"]
     msg = f"test={core_counts['test']}" if has_test else "  (no test)"
-    logger.info(
-        "Core split: train={train_count}  val={val_count}  {msg}",
-    )
+    logger.info(f"Core split: train={train_count}  val={val_count}  {msg}",)
     _log_split_sizes("Original", split_originals, has_test=has_test)
 
     seen_smiles: set[str] = set()
@@ -861,7 +859,7 @@ def pretrain(
                 tmp_best = tgt_best.with_suffix(".tmp" + tgt_best.suffix)
                 shutil.copy2(src_best, tmp_best)
                 tmp_best.replace(tgt_best)
-                logger.info("Resume: copied %s to preserve original best.", src_best)
+                logger.info(f"Resume: copied {src_best} to preserve original best.")
             elif not tgt_best.exists():
                 raise RuntimeError(
                     "Resume checkpoint records a prior best model, but "
@@ -896,7 +894,7 @@ def pretrain(
         indices = rng.choice(len(smiles_list), size=n_subsampled, replace=False)
         smiles_list = [smiles_list[index] for index in sorted(indices)]
         logger.info(
-            f"Subsampled to {len(smiles_list)} SMILES ({effective_subsample * 100:.1})"
+            f"Subsampled to {len(smiles_list)} SMILES ({effective_subsample * 100:.1f})"
         )
 
     smiles_list, split_indices = _prepare_split_smiles(smiles_list, config)
@@ -1102,7 +1100,7 @@ def pretrain(
         last_saved_epoch = epoch_to_save
 
     logger.info(
-        "Starting training: max_epochs={config.max_epochs}  patience={config.patience}  masking_ratio={config.masking_ratio:.2}"
+        f"Starting training: max_epochs={config.max_epochs}  patience={config.patience}  masking_ratio={config.masking_ratio:.2f}"
     )
 
     epoch = max(start_epoch - 1, 0)
@@ -1228,7 +1226,7 @@ def pretrain(
         )
 
     logger.info(
-        f"Training complete.  Best val_objective={best_val_objective:.4} at epoch {best_epoch + 1 if best_epoch >= 0 else epoch + 1}"
+        f"Training complete.  Best val_objective={best_val_objective:.4f} at epoch {best_epoch + 1 if best_epoch >= 0 else epoch + 1}"
     )
 
     test_loader = loaders.get("test")
@@ -1242,15 +1240,15 @@ def pretrain(
             device,
         )
         logger.info(
-            f"Test objective loss={test_metrics.objective_loss:.4}  descriptor_loss={test_metrics.descriptor_loss:.4}  rmse={test_metrics.rmse:.4}"
+            f"Test objective loss={test_metrics.objective_loss:.4f}  descriptor_loss={test_metrics.descriptor_loss:.4f}  rmse={test_metrics.rmse:.4f}"
         )
         if alignment_cfg.enabled:
-            logger.info(f"Test alignment loss={test_metrics.alignment_loss:.4}")
+            logger.info(f"Test alignment loss={test_metrics.alignment_loss:.4f}")
             if math.isfinite(test_metrics.alignment_spearman) or math.isfinite(
                 test_metrics.alignment_kendall
             ):
                 logger.info(
-                    f"Test alignment rank metrics: spearman={test_metrics.alignment_spearman:.4}  kendall={test_metrics.alignment_kendall:.4}"
+                    f"Test alignment rank metrics: spearman={test_metrics.alignment_spearman:.4f}  kendall={test_metrics.alignment_kendall:.4f}"
                 )
 
     try:

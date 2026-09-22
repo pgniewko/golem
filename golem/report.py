@@ -520,7 +520,7 @@ new Chart(document.getElementById('alignmentChart'), {
 
     html_path.parent.mkdir(parents=True, exist_ok=True)
     html_path.write_text(html, encoding="utf-8")
-    logger.info("Report written to %s", html_path)
+    logger.info(f"Report written to {html_path}")
     return html_path
 
 

@@ -41,7 +41,7 @@ def _desalt(mol: Chem.Mol) -> Optional[Chem.Mol]:
         if stripped is not None and stripped.GetNumAtoms() > 0:
             return stripped
     except Exception as e:
-        logger.debug("Desalting failed for %s: %s", _canonical(mol), e)
+        logger.debug(f"Desalting failed for {_canonical(mol)}: {e}")
     return None
 
 
@@ -291,6 +291,6 @@ def enumerate_isoforms_batch(
 
     logger.info(
         f"Isoform enumeration complete: {len(smiles_list)} parents -> "
-        f"{total_isoforms} total isoforms ({total_isoforms / max(len(smiles_list), 1):.1} expansion)",
+        f"{total_isoforms} total isoforms ({total_isoforms / max(len(smiles_list), 1):.1f} expansion)",
     )
     return results
