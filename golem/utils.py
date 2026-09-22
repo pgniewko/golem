@@ -136,7 +136,8 @@ def load_smiles(path: str) -> List[str]:
         preserving first-seen order.
 
     Raises:
-        ValueError: For unsupported file extensions.
+        ValueError: For unsupported file extensions or missing SMILES
+        column in the .csv file.
     """
     path = Path(path)
     ext = path.suffix.lower()
