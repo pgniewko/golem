@@ -1,4 +1,4 @@
-"""Click CLI for Golem.  Commands: ``golem pretrain``, ``golem report``."""
+"""CLI for Golem.  Commands: ``golem pretrain``, ``golem report``."""
 
 from __future__ import annotations
 
@@ -114,7 +114,7 @@ def pretrain_cmd(
 @main.command()
 @click.argument("output_dir", type=click.Path(exists=True))
 @click.option(
-    "--output", "html_path", default=None, type=click.Path(),
+    "--output-file", "html_path", default=None, type=click.Path(dir_okay=False),
     help="Path for the HTML report (default: <output_dir>/pretrain_report.html).",
 )
 def report(output_dir: str, html_path: str | None) -> None:
