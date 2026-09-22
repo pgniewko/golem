@@ -1,6 +1,6 @@
 """Pretraining loop for Graph Transformers on Mordred descriptors.
 
-Uses ``GraphTransformerNet(num_tasks=num_descriptors)`` directly — no wrapper
+Uses ``GraphTransformerNet(num_tasks=num_descriptors)`` directly - no wrapper
 model. The built-in ``mu_mlp`` serves as the descriptor prediction head.
 """
 
@@ -406,7 +406,7 @@ def _build_pyg_dataset(
     """Build PyG Data objects with graph features + descriptor targets."""
     from gt_pyg import get_tensor_data
 
-    logger.info("Building PyG graph features for %d molecules …", len(smiles_list))
+    logger.info(f"Building PyG graph features for {len(smiles_list)} molecules ...")
     data_list = get_tensor_data(smiles_list, y=None)
     for index, data in enumerate(data_list):
         data.y = torch.tensor(descriptor_values[index], dtype=torch.float32).unsqueeze(0)
@@ -444,12 +444,9 @@ def _filter_valid_smiles(original_smiles: list[str]) -> list[str]:
     filtered_count = parse_failures + sanitize_failures
     if filtered_count:
         logger.info(
-            "Filtered %d invalid SMILES before splitting (%d parse failures, %d sanitize failures). "
-            "Examples: %s",
-            filtered_count,
-            parse_failures,
-            sanitize_failures,
-            invalid_examples,
+            f"Filtered {filtered_count} invalid SMILES before splitting "
+            f"({parse_failures} parse failures, {sanitize_failures} sanitize failures). "
+            f"Examples: {invalid_examples}"
         )
     return valid_smiles
 
@@ -459,8 +456,7 @@ def _derive_core_smiles(smiles: str) -> str:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         logger.warning(
-            "Could not parse SMILES for core grouping; using raw input as its own core: %s",
-            smiles,
+            f"Could not parse SMILES for core grouping; using raw input as its own core: {smiles}"
         )
         return smiles
 
@@ -468,8 +464,7 @@ def _derive_core_smiles(smiles: str) -> str:
         Chem.SanitizeMol(mol)
     except Exception:
         logger.warning(
-            "Could not sanitize SMILES for core grouping; using raw input as its own core: %s",
-            smiles,
+            f"Could not sanitize SMILES for core grouping; using raw input as its own core: {smiles}",
         )
         return smiles
 
@@ -481,9 +476,7 @@ def _derive_core_smiles(smiles: str) -> str:
         return Chem.MolToSmiles(uncharged, canonical=True, isomericSmiles=False)
     except Exception:
         logger.debug(
-            "Neutralization failed while deriving core SMILES; falling back to canonical sanitized SMILES for %s",
-            smiles,
-            exc_info=True,
+            f"Neutralization failed while deriving core SMILES; falling back to canonical sanitized SMILES for {smiles}"
         )
         return canonical_smiles
 
@@ -582,13 +575,10 @@ def _expand_smiles_within_split(
 
 
 def _log_split_sizes(label: str, splits: dict[str, list[str]], *, has_test: bool) -> None:
-    logger.info(
-        "%s split: train=%d  val=%d%s",
-        label,
-        len(splits["train"]),
-        len(splits["val"]),
-        f"  test={len(splits['test'])}" if has_test else "  (no test)",
-    )
+    train_len = len(splits["train"])
+    val_len = len(splits["val"])
+    msg = f"test={len(splits['test'])}" if has_test else "  (no test)"
+    logger.info(f"{label} split: train={train_len}  val={val_len}  {msg}")
 
 
 def _prepare_split_smiles(
@@ -633,11 +623,11 @@ def _prepare_split_smiles(
             offset += 1
 
     has_test = len(config.split_ratios) == 3
+    train_counts = core_counts["train"]
+    val_counts = core_counts["val"]
+    msg = f"test={core_counts['test']}" if has_test else "  (no test)"
     logger.info(
-        "Core split: train=%d  val=%d%s",
-        core_counts["train"],
-        core_counts["val"],
-        f"  test={core_counts['test']}" if has_test else "  (no test)",
+        "Core split: train={train_count}  val={val_count}  {msg}",
     )
     _log_split_sizes("Original", split_originals, has_test=has_test)
 
@@ -820,14 +810,12 @@ def pretrain(
             import gypsum_dl
             import rdkit
 
-            logger.debug(
-                "rdkit %s, gypsum_dl %s", rdkit.__version__, gypsum_dl.__version__
-            )
+            logger.debug(f"rdkit {rdkit.__version__}, gypsum_dl {gypsum_dl.__version__}")
         except Exception:
             pass
 
-    logger.info("Configured device: %s", resolved_config.device)
-    logger.info("Resolved device: %s", device)
+    logger.info(f"Configured device: {resolved_config.device}")
+    logger.info(f"Resolved device: {device}")
 
     seed_everything(resolved_config.seed, enable_cuda=device.type == "cuda")
 
@@ -881,17 +869,15 @@ def pretrain(
                 )
         elif external_best:
             tgt_best.unlink(missing_ok=True)
+        resume_epoch = checkpoint_state["epoch"] + 1
         logger.info(
-            "Resuming from %s at epoch %d",
-            resume_ckpt_path,
-            checkpoint_state["epoch"] + 1,
+            f"Resuming from {resume_ckpt_path} at epoch {resume_epoch}"
         )
 
     if resolved_config.warmup_epochs >= resolved_config.max_epochs:
         logger.warning(
-            "warmup_epochs (%d) >= max_epochs (%d): model will only warm up, never decay",
-            resolved_config.warmup_epochs,
-            resolved_config.max_epochs,
+            f"warmup_epochs ({resolved_config.warmup_epochs}) >= max_epochs "
+            f"({resolved_config.max_epochs}): model will only warm up, never decay"
         )
 
     with open(output_dir / "resolved_config.yaml", "w") as handle:
@@ -903,16 +889,14 @@ def pretrain(
         )
 
     smiles_list = load_smiles(smiles_path)
-    logger.info("Loaded %d SMILES from %s", len(smiles_list), smiles_path)
+    logger.info(f"Loaded {len(smiles_list)} SMILES from {smiles_path}")
     if effective_subsample is not None and 0 < effective_subsample < 1:
         rng = np.random.RandomState(config.seed)
         n_subsampled = max(1, int(len(smiles_list) * effective_subsample))
         indices = rng.choice(len(smiles_list), size=n_subsampled, replace=False)
         smiles_list = [smiles_list[index] for index in sorted(indices)]
         logger.info(
-            "Subsampled to %d SMILES (%.1f%%)",
-            len(smiles_list),
-            effective_subsample * 100,
+            f"Subsampled to {len(smiles_list)} SMILES ({effective_subsample * 100:.1})"
         )
 
     smiles_list, split_indices = _prepare_split_smiles(smiles_list, config)
@@ -921,9 +905,7 @@ def pretrain(
     assert train_idx is not None and val_idx is not None
 
     logger.info(
-        "Computing descriptor targets (2D=%s, 3D=%s) …",
-        config.descriptors.include_2d_targets,
-        config.descriptors.include_3d_targets,
+        f"Computing descriptor targets (2D={config.descriptors.include_2d_targets}, 3D={config.descriptors.include_3d_targets}) ..."
     )
     (
         descriptor_values,
@@ -938,9 +920,7 @@ def pretrain(
     )
     num_descriptors = descriptor_values.shape[1]
     logger.info(
-        "Descriptor matrix: %d molecules × %d descriptors",
-        descriptor_values.shape[0],
-        num_descriptors,
+        f"Descriptor matrix: {descriptor_values.shape[0]} molecules x {num_descriptors} descriptors"
     )
     loss_weighting_config = _DescriptorLossWeightingConfig(
         num_2d_descriptors=num_2d_descriptors,
@@ -949,15 +929,10 @@ def pretrain(
         three_d_loss_weight=config.descriptors.three_d_loss_weight,
     )
     if loss_weighting_config.uses_family_mean_loss:
-        logger.info(
-            "Descriptor family loss weights: 2D=%s 3D=%s",
-            loss_weighting_config.two_d_loss_weight
-            if loss_weighting_config.two_d_loss_weight is not None
-            else 1.0,
-            loss_weighting_config.three_d_loss_weight
-            if loss_weighting_config.three_d_loss_weight is not None
-            else 1.0,
-        )
+        loss_2d = loss_weighting_config.two_d_loss_weight if loss_weighting_config.two_d_loss_weight is not None else 1.0
+        loss_3d = loss_weighting_config.three_d_loss_weight if loss_weighting_config.three_d_loss_weight is not None else 1.0
+
+        logger.info(f"Descriptor family loss weights: 2D={loss_2d} 3D={loss_3d}")
     else:
         logger.info("Descriptor loss uses legacy elementwise pooled MSE")
 
@@ -966,14 +941,12 @@ def pretrain(
     if alignment_cfg.enabled:
         fingerprint_bits = compute_fingerprints(smiles_list, alignment_cfg)
         logger.info(
-            "Fingerprint matrix: %d molecules × %d bits",
-            fingerprint_bits.shape[0],
-            fingerprint_bits.shape[1],
+            f"Fingerprint matrix: {fingerprint_bits.shape[0]} molecules x {fingerprint_bits.shape[1]} bits"
         )
 
     scaler = NaNAwareStandardScaler(winsorize_range=config.winsorize_range)
     scaler.fit(descriptor_values[train_idx], descriptor_validity[train_idx])
-    logger.info("Scaler fit on train split (%d samples)", len(train_idx))
+    logger.info(f"Scaler fit on train split ({len(train_idx)} samples)")
     descriptor_values = scaler.transform(descriptor_values)
 
     datasets = _build_split_datasets(
@@ -1026,9 +999,7 @@ def pretrain(
             "GraphTransformerNet.forward(..., return_latent=True)."
         )
     logger.info(
-        "Model: %d trainable parameters, num_tasks=%d",
-        model.num_parameters(),
-        num_descriptors,
+        f"Model: {model.num_parameters()} trainable parameters, num_tasks={num_descriptors}"
     )
 
     optimizer = torch.optim.AdamW(
@@ -1131,10 +1102,7 @@ def pretrain(
         last_saved_epoch = epoch_to_save
 
     logger.info(
-        "Starting training: max_epochs=%d  patience=%d  masking_ratio=%.2f",
-        config.max_epochs,
-        config.patience,
-        config.masking_ratio,
+        "Starting training: max_epochs={config.max_epochs}  patience={config.patience}  masking_ratio={config.masking_ratio:.2}"
     )
 
     epoch = max(start_epoch - 1, 0)
@@ -1197,19 +1165,16 @@ def pretrain(
                     summary_parts.append(f"train_align={train_metrics.alignment_loss:.4f}")
                 if alignment_cfg.enabled and math.isfinite(val_metrics.alignment_loss):
                     summary_parts.append(f"val_align={val_metrics.alignment_loss:.4f}")
+
+                msg = "  ".join(summary_parts)
                 logger.info(
-                    "Epoch %3d/%d — %s",
-                    epoch + 1,
-                    config.max_epochs,
-                    "  ".join(summary_parts),
+                    f"Epoch {epoch + 1:3}/{config.max_epochs} - {msg}",
                 )
                 if math.isfinite(val_metrics.alignment_spearman) or math.isfinite(
                     val_metrics.alignment_kendall
                 ):
                     logger.info(
-                        "           val_alignment_spearman=%.4f  val_alignment_kendall=%.4f",
-                        val_metrics.alignment_spearman,
-                        val_metrics.alignment_kendall,
+                        f"           val_alignment_spearman={val_metrics.alignment_spearman}  val_alignment_kendall={val_metrics.alignment_kendall}"
                     )
 
                 if math.isfinite(val_metrics.objective_loss) and (
@@ -1224,21 +1189,18 @@ def pretrain(
                         best_metric=best_val_objective,
                         include_training_state=False,
                     )
-                    logger.info("  ↳ New best — saved %s", best_ckpt_path.name)
+                    logger.info(f"  ↳ New best — saved {best_ckpt_path.name}")
                 else:
                     if not math.isfinite(val_metrics.objective_loss):
                         logger.warning(
-                            "Validation objective is non-finite at epoch %d; skipping best-checkpoint update",
-                            epoch + 1,
+                            f"Validation objective is non-finite at epoch {epoch+1}; skipping best-checkpoint update"
                         )
                     patience_counter += 1
 
                 _save_last_checkpoint(epoch)
                 if patience_counter >= config.patience:
                     logger.info(
-                        "Early stopping at epoch %d (patience=%d)",
-                        epoch + 1,
-                        config.patience,
+                        f"Early stopping at epoch {epoch + 1} (patience={config.patience})"
                     )
                     break
                 scheduler.step()
@@ -1266,9 +1228,7 @@ def pretrain(
         )
 
     logger.info(
-        "Training complete.  Best val_objective=%.4f at epoch %d",
-        best_val_objective,
-        best_epoch + 1 if best_epoch >= 0 else epoch + 1,
+        f"Training complete.  Best val_objective={best_val_objective:.4} at epoch {best_epoch + 1 if best_epoch >= 0 else epoch + 1}"
     )
 
     test_loader = loaders.get("test")
@@ -1282,20 +1242,15 @@ def pretrain(
             device,
         )
         logger.info(
-            "Test objective loss=%.4f  descriptor_loss=%.4f  rmse=%.4f",
-            test_metrics.objective_loss,
-            test_metrics.descriptor_loss,
-            test_metrics.rmse,
+            f"Test objective loss={test_metrics.objective_loss:.4}  descriptor_loss={test_metrics.descriptor_loss:.4}  rmse={test_metrics.rmse:.4}"
         )
         if alignment_cfg.enabled:
-            logger.info("Test alignment loss=%.4f", test_metrics.alignment_loss)
+            logger.info(f"Test alignment loss={test_metrics.alignment_loss:.4}")
             if math.isfinite(test_metrics.alignment_spearman) or math.isfinite(
                 test_metrics.alignment_kendall
             ):
                 logger.info(
-                    "Test alignment rank metrics: spearman=%.4f  kendall=%.4f",
-                    test_metrics.alignment_spearman,
-                    test_metrics.alignment_kendall,
+                    f"Test alignment rank metrics: spearman={test_metrics.alignment_spearman:.4}  kendall={test_metrics.alignment_kendall:.4}"
                 )
 
     try:
@@ -1303,5 +1258,5 @@ def pretrain(
     except Exception:
         logger.warning("Could not generate HTML report", exc_info=True)
 
-    logger.info("Outputs saved to %s", output_dir)
+    logger.info(f"Outputs saved to {output_dir}")
     return best_ckpt_path
