@@ -1,8 +1,8 @@
 """Isoform enumeration: desalting, tautomers, protonation states, neutralization.
 
-Each enumeration function creates local RDKit/Gypsum-DL/MolVS instances (no
-global singletons) for thread safety.  All isoforms are deduplicated by
-canonical SMILES, with the original molecule always at index 0.
+Each enumeration function creates local RDKit/Gypsum-DL/MolVS instances.
+All isoforms are deduplicated by canonical SMILES, with the original 
+molecule always at index 0.
 """
 
 from __future__ import annotations
@@ -24,10 +24,6 @@ RDLogger.DisableLog('rdApp.*')
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _canonical(mol: Chem.Mol) -> Optional[str]:
     """Return canonical SMILES or None on failure."""
@@ -161,7 +157,6 @@ def _enumerate_protonation(
     Returns:
         List of valid protomer Mol objects.
     """
-    # --- Primary: Dimorphite-DL protonate_smiles (transitive dep of gypsum-dl) ---
     try:
         from dimorphite_dl import protonate_smiles
 
@@ -187,15 +182,11 @@ def _enumerate_protonation(
     except Exception as e:
         logger.debug("Dimorphite-DL failed for %s: %s – falling back to Uncharger", smi, e)
 
-    # --- Fallback: RDKit Uncharger ---
     try:
         mol = Chem.MolFromSmiles(smi)
         if mol is None:
             return []
-        uncharger = rdMolStandardize.Uncharger()
-        uncharged = uncharger.uncharge(mol)
-        if uncharged is not None:
-            return [uncharged]
+        return _neutralize(mol)
     except Exception as e:
         logger.debug("Uncharger fallback failed for %s: %s", smi, e)
 
@@ -213,10 +204,6 @@ def _neutralize(mol: Chem.Mol) -> List[Chem.Mol]:
         logger.debug("Neutralization failed for %s: %s", _canonical(mol), e)
     return []
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def enumerate_isoforms(smiles: str, config: IsoformConfig) -> List[str]:
     """Enumerate isoforms for a single SMILES string.
