@@ -626,7 +626,7 @@ def _prepare_split_smiles(
     train_counts = core_counts["train"]
     val_counts = core_counts["val"]
     msg = f"test={core_counts['test']}" if has_test else "  (no test)"
-    logger.info(f"Core split: train={train_count}  val={val_count}  {msg}",)
+    logger.info(f"Core split: train={train_counts}  val={val_counts}  {msg}",)
     _log_split_sizes("Original", split_originals, has_test=has_test)
 
     seen_smiles: set[str] = set()
