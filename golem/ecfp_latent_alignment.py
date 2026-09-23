@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
+from scipy.stats import spearmanr, kendalltau
 
 from golem.config import ECFPLatentAlignmentConfig
 
@@ -25,18 +26,12 @@ def _sample_pairs(
     deterministic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if batch_size < 2:
-        logger.warning(
-            "Skipping ECFP-latent alignment for batch_size=%d: need at least 2 samples.",
-            batch_size,
-        )
+        logger.warning(f"Skipping ECFP-latent alignment for batch_size={batch_size}: need at least 2 samples.")
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
 
     if num_pairs <= 0:
-        logger.warning(
-            "Skipping ECFP-latent alignment for num_pairs=%d: need a positive pair count.",
-            num_pairs,
-        )
+        logger.warning(f"Skipping ECFP-latent alignment for num_pairs={num_pairs}: need a positive pair count.")
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
 
@@ -99,57 +94,6 @@ def _pair_order_loss(
     return (F.softplus(-scaled_margin) * weights).sum() / weights.sum().clamp_min(1e-8)
 
 
-def _average_ranks(values: np.ndarray) -> np.ndarray:
-    order = np.argsort(values, kind="mergesort")
-    sorted_values = values[order]
-    ranks = np.empty(values.shape[0], dtype=np.float64)
-
-    start = 0
-    while start < len(sorted_values):
-        end = start + 1
-        while end < len(sorted_values) and sorted_values[end] == sorted_values[start]:
-            end += 1
-        ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
-        start = end
-
-    return ranks
-
-
-def _kendall_tau(x: np.ndarray, y: np.ndarray) -> float:
-    n = x.size
-    if n < 2:
-        return math.nan
-
-    concordant = 0
-    discordant = 0
-    ties_x = 0
-    ties_y = 0
-
-    for i in range(n - 1):
-        dx = x[i] - x[i + 1 :]
-        dy = y[i] - y[i + 1 :]
-        for dx_ij, dy_ij in zip(dx, dy, strict=False):
-            sign_x = 0 if dx_ij == 0 else (1 if dx_ij > 0 else -1)
-            sign_y = 0 if dy_ij == 0 else (1 if dy_ij > 0 else -1)
-            if sign_x == 0 and sign_y == 0:
-                continue
-            if sign_x == 0:
-                ties_x += 1
-            elif sign_y == 0:
-                ties_y += 1
-            elif sign_x == sign_y:
-                concordant += 1
-            else:
-                discordant += 1
-
-    denom = math.sqrt(
-        (concordant + discordant + ties_x) * (concordant + discordant + ties_y)
-    )
-    if denom == 0.0:
-        return math.nan
-    return (concordant - discordant) / denom
-
-
 def compute_alignment_batch(
     batch,
     z: torch.Tensor,
@@ -181,19 +125,17 @@ def compute_alignment_metrics(
 
     fp_np = d_fp.detach().cpu().numpy().astype(np.float64, copy=False)
     z_np = d_z.detach().cpu().numpy().astype(np.float64, copy=False)
-    fp_ranks = _average_ranks(fp_np)
-    z_ranks = _average_ranks(z_np)
-    spearman = float(np.corrcoef(fp_ranks, z_ranks)[0, 1])
-    if not math.isfinite(spearman):
-        spearman = math.nan
-    return spearman, _kendall_tau(fp_np, z_np)
+
+    spearman = spearmanr(fp_np, z_np)[0]
+    kendall_tau = kendalltau(fp_np, z_np)[0]
+    return spearman, kendall_tau
 
 
 def compute_fingerprints(
     smiles_list: List[str],
     config: ECFPLatentAlignmentConfig,
 ) -> np.ndarray:
-    logger.info("Computing ECFP bits for %d molecules", len(smiles_list))
+    logger.info(f"Computing ECFP bits for {len(smiles_list)} molecules")
     fps = np.zeros((len(smiles_list), config.fp_bits), dtype=np.bool_)
     for idx, smiles in enumerate(smiles_list):
         mol = Chem.MolFromSmiles(smiles)

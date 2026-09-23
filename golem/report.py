@@ -36,10 +36,6 @@ OPTIONAL_ALIGNMENT_FIELDS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Data loading helpers
-# ---------------------------------------------------------------------------
-
 def _load_metrics(metrics_path: Path) -> List[Dict[str, Any]]:
     """Load metrics.csv into a list of dicts with typed values."""
     rows: List[Dict[str, Any]] = []
@@ -102,10 +98,6 @@ def _fmt_optional(value: float, precision: int = 6) -> str:
     return f"{value:.{precision}f}"
 
 
-# ---------------------------------------------------------------------------
-# Summary extraction
-# ---------------------------------------------------------------------------
-
 def _compute_summary(
     metrics: List[Dict[str, Any]],
     config: Dict[str, Any],
@@ -150,10 +142,6 @@ def _compute_summary(
         "num_heads": config.get("model", {}).get("num_heads", "?"),
     }
 
-
-# ---------------------------------------------------------------------------
-# HTML template
-# ---------------------------------------------------------------------------
 
 _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -373,10 +361,6 @@ new Chart(document.getElementById('descriptorChart'), {
 """
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def generate_report(
     output_dir: str | Path,
     html_path: Optional[str | Path] = None,
@@ -536,7 +520,7 @@ new Chart(document.getElementById('alignmentChart'), {
 
     html_path.parent.mkdir(parents=True, exist_ok=True)
     html_path.write_text(html, encoding="utf-8")
-    logger.info("Report written to %s", html_path)
+    logger.info(f"Report written to {html_path}")
     return html_path
 
 

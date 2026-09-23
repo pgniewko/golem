@@ -136,7 +136,8 @@ def load_smiles(path: str) -> List[str]:
         preserving first-seen order.
 
     Raises:
-        ValueError: For unsupported file extensions.
+        ValueError: For unsupported file extensions or missing SMILES
+        column in the .csv file.
     """
     path = Path(path)
     ext = path.suffix.lower()
@@ -170,8 +171,6 @@ def load_smiles(path: str) -> List[str]:
     removed_duplicates = len(smiles) - len(deduped_smiles)
     if removed_duplicates:
         logger.info(
-            "Removed %d exact duplicate input SMILES while loading %s",
-            removed_duplicates,
-            path,
+            f"Removed {removed_duplicates} exact duplicate input SMILES while loading {path}"
         )
     return deduped_smiles

@@ -180,6 +180,6 @@ Note: the generated HTML references Chart.js from a CDN, so it is not fully offl
 To write the report to a custom path:
 
 ```bash
-golem report path/to/model --output path/to/report.html
+golem report path/to/model --output-file path/to/report.html
 ```
 

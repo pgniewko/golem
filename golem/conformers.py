@@ -49,7 +49,9 @@ def _optimize_conformers(mol: Chem.Mol, method: str) -> dict[int, float] | None:
         for conformer, (_, energy) in zip(mol.GetConformers(), results, strict=False)
         if np.isfinite(energy)
     }
-    return energies or None
+    if energies:
+        return energies
+    return None
 
 
 def generate_lowest_energy_conformer(
@@ -73,7 +75,7 @@ def generate_lowest_energy_conformer(
             AllChem.EmbedMultipleConfs(mol, numConfs=config.n_generate, params=params)
         )
     except Exception:
-        logger.debug("Conformer embedding failed for %s", smiles, exc_info=True)
+        logger.debug(f"Conformer embedding failed for {smiles}", exc_info=True)
         return None
 
     if not conf_ids:

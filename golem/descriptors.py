@@ -30,10 +30,6 @@ logger = logging.getLogger(__name__)
 _THREE_D_FAMILIES = ("rdkit3d", "usrcat", "electroshape")
 
 
-# ---------------------------------------------------------------------------
-# Mordred descriptor computation
-# ---------------------------------------------------------------------------
-
 def compute_mordred_descriptors(
     smiles_list: List[str],
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
@@ -59,7 +55,7 @@ def compute_mordred_descriptors(
             Chem.SanitizeMol(mol)
         mols.append(mol)
 
-    logger.info("Computing Mordred 2D descriptors for %d molecules …", len(mols))
+    logger.info(f"Computing Mordred 2D descriptors for {len(mols)} molecules ...")
     try:
         df = calc.pandas(mols, quiet=False)
     except (EOFError, OSError, PermissionError):
@@ -76,7 +72,7 @@ def compute_mordred_descriptors(
     # Drop descriptors that are all-NaN
     all_nan_cols = df.columns[df.isna().all()]
     if len(all_nan_cols) > 0:
-        logger.info("Dropping %d all-NaN descriptor columns", len(all_nan_cols))
+        logger.info(f"Dropping {len(all_nan_cols)} all-NaN descriptor columns")
         df = df.drop(columns=all_nan_cols)
 
     descriptor_names = df.columns.tolist()
@@ -89,10 +85,7 @@ def compute_mordred_descriptors(
     values = np.where(validity_mask, raw, 0.0).astype(np.float32)
 
     logger.info(
-        "Mordred descriptors: %d molecules × %d descriptors (%.1f%% valid entries)",
-        values.shape[0],
-        values.shape[1],
-        validity_mask.mean() * 100,
+        f"Mordred descriptors: {values.shape[0]} molecules x {values.shape[1]} descriptors ({validity_mask.mean() * 100:.1f}% valid entries)",
     )
 
     return values, validity_mask.astype(np.bool_), descriptor_names
@@ -176,7 +169,7 @@ def compute_3d_descriptors(
                 family_mask = np.isfinite(row)
                 family_values = np.where(family_mask, row, 0.0).astype(np.float32)
             except Exception:
-                logger.debug("3D descriptor family %s failed for %s", family, smiles, exc_info=True)
+                logger.debug(f"3D descriptor family {family} failed for {smiles}", exc_info=True)
                 family_values = np.zeros(width, dtype=np.float32)
                 family_mask = np.zeros(width, dtype=np.bool_)
                 descriptor_failures += 1
@@ -187,7 +180,7 @@ def compute_3d_descriptors(
 
     all_invalid = ~validity_mask.any(axis=0)
     if all_invalid.any():
-        logger.info("Dropping %d all-invalid 3D descriptor columns", int(all_invalid.sum()))
+        logger.info(f"Dropping {int(all_invalid.sum())} all-invalid 3D descriptor columns")
         keep_columns = ~all_invalid
         values = values[:, keep_columns]
         validity_mask = validity_mask[:, keep_columns]
@@ -198,17 +191,15 @@ def compute_3d_descriptors(
         ]
 
     logger.info(
-        "3D descriptors: %d molecules × %d descriptors (%.1f%% valid entries)",
-        values.shape[0],
-        values.shape[1],
-        validity_mask.mean() * 100 if validity_mask.size else 0.0,
+        f"3D descriptors: {values.shape[0]} molecules x {values.shape[1]} "
+        f"descriptors ({validity_mask.mean() * 100 if validity_mask.size else 0.0}% valid entries)"
     )
     if conformer_failures or descriptor_failures:
         logger.info(
-            "3D target generation kept all molecules in-place "
-            "(%d conformer failures, %d descriptor-family failures; invalid entries were masked)",
-            conformer_failures,
-            descriptor_failures,
+            f"3D target generation kept all molecules in-place "
+            f"({conformer_failures} conformer failures, "
+            f"{descriptor_failures} descriptor-family failures; "
+            "invalid entries were masked)"
         )
     return values, validity_mask, descriptor_names
 
@@ -246,6 +237,8 @@ def prepare_descriptor_targets(
         values = np.concatenate([block[0] for block in blocks], axis=1)
         masks = np.concatenate([block[1] for block in blocks], axis=1)
         names = [name for _, _, block_names in blocks for name in block_names]
+        assert values.shape[0] == masks.shape[0] and values.shape[1] == masks.shape[1]
+        assert len(names) == values.shape[1]
 
     if values.shape[1] == 0:
         raise ValueError(
@@ -254,22 +247,18 @@ def prepare_descriptor_targets(
     return values, masks, names, num_2d_descriptors
 
 
-# ---------------------------------------------------------------------------
-# NaN-aware standard scaler
-# ---------------------------------------------------------------------------
-
 class NaNAwareStandardScaler:
     """Per-feature zero-mean / unit-variance scaler that ignores NaN/invalid
     positions when computing statistics.
 
-    Typical workflow::
+    Usage:
 
-        scaler = NaNAwareStandardScaler(winsorize_range=(-6.0, 6.0))
-        scaler.fit(X_train, validity_mask_train)
-        X_train_scaled = scaler.transform(X_train)
-        X_val_scaled   = scaler.transform(X_val)
+        >>> scaler = NaNAwareStandardScaler(winsorize_range=(-6.0, 6.0))
+        >>> scaler.fit(X_train, validity_mask_train)
+        >>> X_train_scaled = scaler.transform(X_train)
+        >>> X_val_scaled   = scaler.transform(X_val)
 
-    The scaler is fully serialisable via ``state_dict()`` / ``from_state_dict()``.
+    The scaler is serialisable via ``state_dict()`` / ``from_state_dict()``.
     """
 
     def __init__(self, winsorize_range: Tuple[float, float] = (-6.0, 6.0)) -> None:
@@ -277,66 +266,29 @@ class NaNAwareStandardScaler:
         self.mean_: np.ndarray | None = None
         self.std_: np.ndarray | None = None
 
-    # ------------------------------------------------------------------
     def fit(
         self,
         X: np.ndarray,
         validity_mask: np.ndarray,
     ) -> "NaNAwareStandardScaler":
-        """Compute per-feature mean and std from **valid** entries only.
-
-        Args:
-            X: Values array ``[N, D]`` (NaN positions may contain 0.0).
-            validity_mask: Boolean array ``[N, D]`` — True = valid.
-
-        Returns:
-            self (for chaining).
-        """
-        # Work with float64 for numerical stability and compute statistics
-        # only over valid entries to avoid expected RuntimeWarnings for
-        # all-invalid columns.
-        X64 = X.astype(np.float64, copy=False)
+        """Compute per-feature mean and std from **valid** entries only."""
         valid = validity_mask.astype(bool, copy=False)
-        valid_count = valid.sum(axis=0)
-        masked_values = np.where(valid, X64, 0.0)
+        Xm = np.ma.masked_array(X.astype(np.float64, copy=False), mask=~valid)
 
-        self.mean_ = np.divide(
-            masked_values.sum(axis=0),
-            valid_count,
-            out=np.zeros(X64.shape[1], dtype=np.float64),
-            where=valid_count > 0,
-        )
-        centered = np.where(valid, X64 - self.mean_, 0.0)
-        self.std_ = np.sqrt(
-            np.divide(
-                np.square(centered).sum(axis=0),
-                valid_count,
-                out=np.ones(X64.shape[1], dtype=np.float64),
-                where=valid_count > 0,
-            )
-        )
+        self.mean_ = Xm.mean(axis=0).filled(0.0)
+        self.std_ = Xm.std(axis=0).filled(1.0)
 
-        all_invalid = valid_count == 0
+        all_invalid = ~valid.any(axis=0)
         if all_invalid.any():
-            logger.info(
-                "Setting mean=0.0, std=1.0 for %d all-NaN descriptors in train",
-                all_invalid.sum(),
-            )
-            self.mean_[all_invalid] = 0.0
-            self.std_[all_invalid] = 1.0
-
-        # Guard against zero-std (constant columns): replace with 1.0
+            logger.info(f"Setting mean=0.0, std=1.0 for {all_invalid.sum()} all-NaN descriptors in train.")
+        
         zero_std = self.std_ < 1e-12
         if zero_std.any():
-            logger.info(
-                "Setting std=1.0 for %d constant/near-constant descriptors",
-                zero_std.sum(),
-            )
+            logger.info(f"Setting std=1.0 for {zero_std.sum()} constant/near-constant descriptors")
             self.std_[zero_std] = 1.0
 
         return self
 
-    # ------------------------------------------------------------------
     def transform(self, X: np.ndarray) -> np.ndarray:
         """Scale *X* and winsorise.
 
@@ -358,7 +310,6 @@ class NaNAwareStandardScaler:
         scaled = np.clip(scaled, lo, hi)
         return scaled.astype(np.float32)
 
-    # ------------------------------------------------------------------
     def state_dict(self) -> Dict[str, object]:
         """Serialise scaler parameters to a plain dict (for checkpoint)."""
         return {
