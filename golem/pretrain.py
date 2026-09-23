@@ -943,7 +943,7 @@ def pretrain(
         )
 
     scaler = NaNAwareStandardScaler(winsorize_range=config.winsorize_range)
-    scaler.fit(descriptor_values[train_idx], descriptor_validity[train_idx])
+    scaler.fit(descriptor_values[train_idx], descriptor_validity[train_idx], names=descriptor_names)
     logger.info(f"Scaler fit on train split ({len(train_idx)} samples)")
     descriptor_values = scaler.transform(descriptor_values)
 

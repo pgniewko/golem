@@ -58,6 +58,12 @@ golem --help
 python -c "from gt_pyg import GraphTransformerNet; print('gt-pyg OK')"
 python -c "from golem.config import PretrainConfig; print('golem OK')"
 ```
+### Running tests:
+    
+```
+pytest tests/ -v # For all tests
+pytets tests/test_descriptors.py
+```
 
 ## Running Pretraining
 
