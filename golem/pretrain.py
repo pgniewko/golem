@@ -942,9 +942,19 @@ def pretrain(
             f"Fingerprint matrix: {fingerprint_bits.shape[0]} molecules x {fingerprint_bits.shape[1]} bits"
         )
 
-    scaler = NaNAwareStandardScaler(winsorize_range=config.winsorize_range)
-    scaler.fit(descriptor_values[train_idx], descriptor_validity[train_idx], names=descriptor_names)
-    logger.info(f"Scaler fit on train split ({len(train_idx)} samples)")
+    if checkpoint_state is not None:
+        extra = checkpoint_state.get("extra") or {}
+        if "scaler_state" not in extra:
+            raise RuntimeError("Resume checkpoint missing scaler_state.")
+        scaler = NaNAwareStandardScaler.from_state_dict(extra["scaler_state"])
+        if scaler.names != descriptor_names:
+            raise RuntimeError("Resume: descriptor names differ from checkpoint scaler (data or Mordred drift).")
+        logger.info("Scaler resotred from resumed checkpoint.")
+    else:
+        scaler = NaNAwareStandardScaler(winsorize_range=config.winsorize_range)
+        scaler.fit(descriptor_values[train_idx], descriptor_validity[train_idx], names=descriptor_names)
+        logger.info(f"Scaler fit on train split ({len(train_idx)} samples)")
+
     descriptor_values = scaler.transform(descriptor_values)
     descriptor_validity[:, ~scaler.keep_mask] = False
 
