@@ -29,7 +29,7 @@ from golem.conformers import generate_lowest_energy_conformer
 logger = logging.getLogger(__name__)
 
 _THREE_D_FAMILIES = ("rdkit3d", "usrcat", "electroshape")
-
+_VERSION_TRACKED_PACKAGES = ("rdkit", "mordred", "molfeat")
 
 def compute_mordred_descriptors(
     smiles_list: List[str],
@@ -253,12 +253,12 @@ def _get_3rd_party_versions() -> Dict[str, str | None]:
     pkg_to_dist = packages_distributions()
     out: Dict[str, str | None] = {}
 
-    for name in ("rdkit", "mordred", "molfeat"):
-        dist = (pkg_to_dist.get(name) or name)[0] # we need is cause 'mordred' -> 'mordredcommunity'
+    for name in _VERSION_TRACKED_PACKAGES:
+        dist = pkg_to_dist.get(name) or [name]  # list fallback; 'mordred' -> 'mordredcommunity'
         try:
-            out[name] = version(dist)
+            out[name] = version(dist[0])        # installed -> must have a version
         except PackageNotFoundError:
-            out[name] = None
+            out[name] = None                    # not installed -> buf if required it'd alredy raise
     return out
 
 
