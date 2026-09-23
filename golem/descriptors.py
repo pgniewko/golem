@@ -288,6 +288,8 @@ class NaNAwareStandardScaler:
         if zero_std.any():
             logger.info(f"Setting std=1.0 for {zero_std.sum()} constant/near-constant descriptors")
             self.std_[zero_std] = 1.0
+ 
+        self.keep_mask = ~(all_invalid | zero_std) & self.keep_mask
 
         return self
 
