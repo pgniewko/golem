@@ -1,17 +1,4 @@
-"""Mordred 2D descriptor computation and NaN-aware standardisation.
-
-The pipeline:
-1. Compute all Mordred 2D descriptors for a list of SMILES.
-2. Drop descriptors that are all-NaN or non-numeric.
-3. Build a boolean *validity_mask* (True = valid, False = was-NaN).
-4. Replace NaN with 0.0 in the values array (NaN positions tracked by mask).
-
-Scaling:
-- ``NaNAwareStandardScaler`` fits mean/std on the **training split only**,
-  using ``np.nanmean`` / ``np.nanstd`` so that NaN positions are ignored.
-- ``transform()`` scales and then winsorises to a configurable range
-  (default ``[-6, 6]``).
-"""
+"""Mordred 2D descriptor computation and NaN-aware standardisation."""
 
 from __future__ import annotations
 
