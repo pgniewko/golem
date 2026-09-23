@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from typing import Dict, List, Tuple
+from importlib.metadata import version, packages_distributions, PackageNotFoundError
 
 import numpy as np
 from rdkit import Chem
@@ -246,6 +247,20 @@ def prepare_descriptor_targets(
         )
     return values, masks, names, num_2d_descriptors
 
+def _get_3rd_party_versions() -> Dict[str, str | None]:
+    """Get the versions of the 3rd party libraries"""
+
+    pkg_to_dist = packages_distributions()
+    out: Dict[str, str | None] = {}
+
+    for name in ("rdkit", "mordred", "molfeat"):
+        dist = (pkg_to_dist.get(name) or name)[0] # we need is cause 'mordred' -> 'mordredcommunity'
+        try:
+            out[name] = version(dist)
+        except PackageNotFoundError:
+            out[name] = None
+    return out
+
 
 class NaNAwareStandardScaler:
     """Per-feature zero-mean / unit-variance scaler that ignores NaN/invalid
@@ -265,13 +280,23 @@ class NaNAwareStandardScaler:
         self.winsorize_range = winsorize_range
         self.mean_: np.ndarray | None = None
         self.std_: np.ndarray | None = None
+        self.names: list[str] | None = None
+        self.keep_mask: list[bool] | np.ndarray | None = None
+        self.versions: dict[str, str] | None = None
 
     def fit(
         self,
         X: np.ndarray,
         validity_mask: np.ndarray,
+        names: List[str], 
     ) -> "NaNAwareStandardScaler":
         """Compute per-feature mean and std from **valid** entries only."""
+        self.versions = _get_3rd_party_versions()
+
+        self.names = list(names)
+        self.keep_mask = np.ones(X.shape[1], dtype=bool)
+        assert len(self.names) == X.shape[1]
+
         valid = validity_mask.astype(bool, copy=False)
         Xm = np.ma.masked_array(X.astype(np.float64, copy=False), mask=~valid)
 
@@ -316,6 +341,9 @@ class NaNAwareStandardScaler:
             "mean": self.mean_.tolist() if self.mean_ is not None else None,
             "std": self.std_.tolist() if self.std_ is not None else None,
             "winsorize_range": list(self.winsorize_range),
+            "names": list(self.names) if self.names is not None else None,
+            "keep_mask": self.keep_mask.tolist() if self.keep_mask is not None else None,
+            "versions": self.versions if self.versions is not None else None,
         }
 
     @classmethod
@@ -326,4 +354,11 @@ class NaNAwareStandardScaler:
             scaler.mean_ = np.array(d["mean"], dtype=np.float64)
         if d["std"] is not None:
             scaler.std_ = np.array(d["std"], dtype=np.float64)
+        if d["names"] is not None:
+            scaler.names = list(d["names"])
+        if d["keep_mask"] is not None:
+            scaler.keep_mask = np.array(d["keep_mask"], dtype=bool)
+        if d["versions"] is not None:
+            scaler.versions = d["versions"]
+
         return scaler
