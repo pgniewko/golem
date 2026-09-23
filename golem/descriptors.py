@@ -57,11 +57,9 @@ def compute_mordred_descriptors(
     # Force numeric — non-numeric entries become NaN
     df = df.apply(lambda col: col.map(lambda v: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else np.nan))
 
-    # Drop descriptors that are all-NaN
     all_nan_cols = df.columns[df.isna().all()]
     if len(all_nan_cols) > 0:
-        logger.info(f"Dropping {len(all_nan_cols)} all-NaN descriptor columns")
-        df = df.drop(columns=all_nan_cols)
+        logger.info(f"Found {len(all_nan_cols)} all-NaN 2D descriptor columns")
 
     descriptor_names = df.columns.tolist()
     raw = df.values.astype(np.float64)
@@ -166,17 +164,9 @@ def compute_3d_descriptors(
             validity_mask[row_idx, offset : offset + width] = family_mask
             offset += width
 
-    all_invalid = ~validity_mask.any(axis=0)
-    if all_invalid.any():
-        logger.info(f"Dropping {int(all_invalid.sum())} all-invalid 3D descriptor columns")
-        keep_columns = ~all_invalid
-        values = values[:, keep_columns]
-        validity_mask = validity_mask[:, keep_columns]
-        descriptor_names = [
-            name
-            for name, keep in zip(descriptor_names, keep_columns, strict=False)
-            if keep
-        ]
+    all_nan_cols = ~validity_mask.any(axis=0)
+    if all_nan_cols.any():
+        logger.info(f"Found {int(all_nan_cols.sum())} all-invalid 3D descriptor columns")
 
     logger.info(
         f"3D descriptors: {values.shape[0]} molecules x {values.shape[1]} "
