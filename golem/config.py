@@ -115,8 +115,9 @@ class PretrainConfig:
     device: str = "auto"
     subsample: float | None = None
     winsorize_range: Tuple[float, float] = (-6.0, 6.0)
+    filter_low_variance: bool = True
     split_ratios: List[float] = field(default_factory=lambda: [0.7, 0.2, 0.1])
-    seed: int = 42  # pretrain seed (finetune notebooks use 1928374650)
+    seed: int = 42
 
     def __post_init__(self) -> None:
         if isinstance(self.device, str):

@@ -763,6 +763,7 @@ _RESUME_STRICT_KEYS = (
     "model", "descriptors", "isoforms", "ecfp_latent_alignment", "conformers",
     "seed", "split_ratios", "batch_size", "winsorize_range",
     "warmup_epochs", "lr", "weight_decay", "masking_ratio",
+    "filter_low_variance",
 )
 
 
@@ -949,10 +950,13 @@ def pretrain(
         scaler = NaNAwareStandardScaler.from_state_dict(extra["scaler_state"])
         if scaler.names != descriptor_names:
             raise RuntimeError("Resume: descriptor names differ from checkpoint scaler (data or Mordred drift).")
-        logger.info("Scaler resotred from resumed checkpoint.")
+        logger.info("Scaler restored from resumed checkpoint.")
     else:
         scaler = NaNAwareStandardScaler(winsorize_range=config.winsorize_range)
-        scaler.fit(descriptor_values[train_idx], descriptor_validity[train_idx], names=descriptor_names)
+        scaler.fit(descriptor_values[train_idx],
+                   descriptor_validity[train_idx],
+                   names=descriptor_names,
+                   filter_low_variance=config.filter_low_variance)
         logger.info(f"Scaler fit on train split ({len(train_idx)} samples)")
 
     descriptor_values = scaler.transform(descriptor_values)
