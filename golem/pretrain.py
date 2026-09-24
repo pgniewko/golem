@@ -946,6 +946,7 @@ def pretrain(
     scaler.fit(descriptor_values[train_idx], descriptor_validity[train_idx], names=descriptor_names)
     logger.info(f"Scaler fit on train split ({len(train_idx)} samples)")
     descriptor_values = scaler.transform(descriptor_values)
+    descriptor_validity[:, ~scaler.keep_mask] = False
 
     datasets = _build_split_datasets(
         smiles_list,
