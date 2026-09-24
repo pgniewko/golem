@@ -763,7 +763,7 @@ _RESUME_STRICT_KEYS = (
     "model", "descriptors", "isoforms", "ecfp_latent_alignment", "conformers",
     "seed", "split_ratios", "batch_size", "winsorize_range",
     "warmup_epochs", "lr", "weight_decay", "masking_ratio",
-    "filter_low_variance",
+    "filter_low_variance", "filter_correlated", "correlation_threshold",
 )
 
 
@@ -956,7 +956,10 @@ def pretrain(
         scaler.fit(descriptor_values[train_idx],
                    descriptor_validity[train_idx],
                    names=descriptor_names,
-                   filter_low_variance=config.filter_low_variance)
+                   filter_low_variance=config.filter_low_variance,
+                   filter_correlated=config.filter_correlated,
+                   correlation_threshold=config.correlation_threshold,
+                   )
         logger.info(f"Scaler fit on train split ({len(train_idx)} samples)")
 
     descriptor_values = scaler.transform(descriptor_values)

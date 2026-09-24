@@ -267,6 +267,8 @@ class NaNAwareStandardScaler:
         validity_mask: np.ndarray,
         names: List[str],
         filter_low_variance: bool = False,
+        filter_correlated: bool = False,
+        correlation_threshold: float = 0.9,
     ) -> "NaNAwareStandardScaler":
         """Compute per-feature mean and std from **valid** entries only."""
         self.versions = _get_3rd_party_versions()
@@ -293,6 +295,19 @@ class NaNAwareStandardScaler:
 
         if filter_low_variance:
             self.keep_mask = ~zero_std & self.keep_mask
+
+        if filter_correlated:
+            before = int(self.keep_mask.sum())
+            self.keep_mask = _prune_correlated_columns(
+                X,
+                validity_mask, 
+                self.keep_mask, 
+                threshold=correlation_threshold,
+            )
+            logger.info(
+                f"Correlation filter: dropped {before - int(self.keep_mask.sum())} "
+                f"columns (|rho| > {correlation_threshold})"
+            )
 
         return self
 
@@ -344,3 +359,43 @@ class NaNAwareStandardScaler:
             scaler.versions = d["versions"]
 
         return scaler
+
+def _prune_correlated_columns(
+    X: np.ndarray,
+    validity_mask: np.ndarray,
+    keep_mask: np.ndarray, 
+    threshold: float = 0.9
+    ) -> np.ndarray:
+    """ Greedily drop high-correlated columns."""
+    import pandas as pd
+
+    kept_idx = np.flatnonzero(keep_mask)
+
+    if kept_idx.size < 2:
+        return keep_mask.copy()
+
+    data = X[:, kept_idx].astype(np.float64, copy=True)
+    valid = validity_mask[:, kept_idx].astype(bool, copy=False)
+    data[~valid] = np.nan
+
+    corr = pd.DataFrame(data).corr(method="spearman", min_periods=50).to_numpy()
+    corr = np.abs(corr)
+    np.fill_diagonal(corr, 0.0)
+    corr = np.nan_to_num(corr, nan=0.0) # too-few overlaps return nan, we treat them as uncorrelated (never prune)
+
+    # Sort by the number of valid entries, deterministic order.
+    valid_counts = valid.sum(axis=0)
+    order = sorted(range(kept_idx.size), key=lambda j: (-int(valid_counts[j]), int(kept_idx[j])))
+
+    kept_positions: list[int] = []
+    drop_original_idx: list[int] = []
+    for j in order:
+        if kept_positions and corr[j, kept_positions].max() > threshold:
+            drop_original_idx.append(int(kept_idx[j]))
+        else:
+            kept_positions.append(j)
+
+    new_mask = keep_mask.copy()
+    new_mask[drop_original_idx] = False
+    return new_mask
+
