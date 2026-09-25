@@ -265,7 +265,8 @@ class NaNAwareStandardScaler:
         self,
         X: np.ndarray,
         validity_mask: np.ndarray,
-        names: List[str], 
+        names: List[str],
+        filter_low_variance: bool = False,
     ) -> "NaNAwareStandardScaler":
         """Compute per-feature mean and std from **valid** entries only."""
         self.versions = _get_3rd_party_versions()
@@ -283,11 +284,15 @@ class NaNAwareStandardScaler:
         all_invalid = ~valid.any(axis=0)
         if all_invalid.any():
             logger.info(f"Setting mean=0.0, std=1.0 for {all_invalid.sum()} all-NaN descriptors in train.")
+        self.keep_mask = ~all_invalid & self.keep_mask
         
         zero_std = self.std_ < 1e-12
         if zero_std.any():
             logger.info(f"Setting std=1.0 for {zero_std.sum()} constant/near-constant descriptors")
             self.std_[zero_std] = 1.0
+
+        if filter_low_variance:
+            self.keep_mask = ~zero_std & self.keep_mask
 
         return self
 
