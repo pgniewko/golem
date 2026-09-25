@@ -230,8 +230,9 @@ def prepare_descriptor_targets(
         )
     return values, masks, names, num_2d_descriptors
 
+
 def _get_3rd_party_versions() -> Dict[str, str | None]:
-    """Get the versions of the 3rd party libraries"""
+    """Get the versions of the 3rd party libraries."""
 
     pkg_to_dist = packages_distributions()
     out: Dict[str, str | None] = {}
@@ -241,7 +242,7 @@ def _get_3rd_party_versions() -> Dict[str, str | None]:
         try:
             out[name] = version(dist[0])        # installed -> must have a version
         except PackageNotFoundError:
-            out[name] = None                    # not installed -> buf if required it'd alredy raise
+            out[name] = None                    # not installed -> but if required it'd already raise
     return out
 
 
@@ -250,7 +251,7 @@ class DescriptorTransformer:
 
     The transform for each column is chosen in ``fit`` from its valid train entries.
     Statistics ignore invalid positions.
-   
+
     Usage:
 
         >>> scaler = DescriptorTransformer(winsorize_range=(-6.0, 6.0))
@@ -302,7 +303,7 @@ class DescriptorTransformer:
         counts = {k: self.kinds.count(k) for k in ("none", "log", "quantile")}
         logger.info(f"Descriptor transforms: {counts}")
 
-        Xm = np.ma.masked_array(X.astype(np.float64, copy=False), mask=~valid)
+        Xm = np.ma.masked_array(X, mask=~valid)
 
         self.mean_ = Xm.mean(axis=0).filled(0.0)
         self.std_ = Xm.std(axis=0).filled(1.0)
@@ -311,7 +312,7 @@ class DescriptorTransformer:
         if all_invalid.any():
             logger.info(f"Setting mean=0.0, std=1.0 for {all_invalid.sum()} all-NaN descriptors in train.")
         self.keep_mask = ~all_invalid & self.keep_mask
-        
+
         zero_std = self.std_ < 1e-12
         if zero_std.any():
             logger.info(f"Setting std=1.0 for {zero_std.sum()} constant/near-constant descriptors")
@@ -324,8 +325,8 @@ class DescriptorTransformer:
             before = int(self.keep_mask.sum())
             self.keep_mask = _prune_correlated_columns(
                 X,
-                validity_mask, 
-                self.keep_mask, 
+                validity_mask,
+                self.keep_mask,
                 threshold=correlation_threshold,
             )
             logger.info(
@@ -355,7 +356,7 @@ class DescriptorTransformer:
         for j, (kind, params_) in enumerate(zip(self.kinds, self.params)):
             X[:, j] = _forward(X[:, j], kind, params_)
 
-        scaled = (X.astype(np.float64) - self.mean_) / self.std_
+        scaled = (X - self.mean_) / self.std_
         lo, hi = self.winsorize_range
         scaled = np.clip(scaled, lo, hi)
         return scaled.astype(np.float64)
@@ -401,13 +402,14 @@ class DescriptorTransformer:
 
         return scaler
 
+
 def _prune_correlated_columns(
     X: np.ndarray,
     validity_mask: np.ndarray,
-    keep_mask: np.ndarray, 
-    threshold: float = 0.95
-    ) -> np.ndarray:
-    """ Greedily drop high-correlated columns."""
+    keep_mask: np.ndarray,
+    threshold: float = 0.95,
+) -> np.ndarray:
+    """Greedily drop highly correlated columns."""
     import pandas as pd
 
     kept_idx = np.flatnonzero(keep_mask)
@@ -422,7 +424,7 @@ def _prune_correlated_columns(
     corr = pd.DataFrame(data).corr(method="spearman", min_periods=50).to_numpy()
     corr = np.abs(corr)
     np.fill_diagonal(corr, 0.0)
-    corr = np.nan_to_num(corr, nan=0.0) # too-few overlaps return nan, we treat them as uncorrelated (never prune)
+    corr = np.nan_to_num(corr, nan=0.0)  # too-few overlaps return nan, we treat them as uncorrelated (never prune)
 
     # Sort by the number of valid entries, deterministic order.
     valid_counts = valid.sum(axis=0)
@@ -442,36 +444,40 @@ def _prune_correlated_columns(
 
 
 def _signed_log(x: np.ndarray, c: float) -> np.ndarray:
-    """Signed log: ``sign(x) * log1p(|x|/c)```"""
+    """Signed log: ``sign(x) * log1p(|x| / c)``."""
     return np.sign(x) * np.log1p(np.abs(x) / c)
 
 
 def _signed_log_inv(y: np.ndarray, c: float) -> np.ndarray:
-    """Inverse of ``_signed_log``"""
+    """Inverse of ``_signed_log``."""
     return np.sign(y) * c * np.expm1(np.abs(y))
 
 
 def _quantile_fwd(x: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Map to N(0, 1) via train quantiles ``q``; ties map to the middle of their block."""
     probs = np.linspace(0.0, 1.0, len(q))
     p = 0.5 * (np.interp(x, q, probs) - np.interp(-x, -q[::-1], -probs[::-1]))
     return ndtri(np.clip(p, _P_EPS, 1.0 - _P_EPS))
 
 
 def _quantile_inv(y: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Inverse of ``_quantile_fwd``; saturates outside the train range."""
     probs = np.linspace(0.0, 1.0, len(q))
     return np.interp(ndtr(y), probs, q)
 
 
 def _is_ok(x: np.ndarray, lo: float, hi: float) -> bool:
+    """True if z-score alone suffices: |skew| < 1 and < 1% outside the winsorize range."""
     std = x.std()
     if std < 1e-12:
         return True
     z = (x - x.mean()) / std
 
-    return abs(skew(x)) < 1.0 and np.mean((z< lo) | (z > hi)) < 0.01 # 1% outside the winsorization range
+    return abs(skew(x)) < 1.0 and np.mean((z < lo) | (z > hi)) < 0.01  # 1% outside the winsorization range
 
 
 def _choose_transform(x: np.ndarray, lo: float, hi: float) -> Tuple[str, Dict[str, object]]:
+    """Pick 'none', 'log' or 'quantile' for one column of valid values, plus its params."""
     assert np.isfinite(x).all()
 
     if x.size < _MIN_VALID or _is_ok(x, lo, hi) or np.unique(x).size < 10:
