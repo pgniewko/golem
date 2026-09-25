@@ -1,8 +1,8 @@
-"""Test NaNAwareStandardScaler functionalities"""
+"""Test DescriptorTransformer functionalities"""
 
 import numpy as np
 
-from golem.descriptors import NaNAwareStandardScaler
+from golem.descriptors import DescriptorTransformer
 
 def test_state_dict_roundtrip():
     rng = np.random.RandomState(0)
@@ -13,10 +13,10 @@ def test_state_dict_roundtrip():
 
     names = ["a", "b", "c", "d"]
 
-    scaler = NaNAwareStandardScaler(winsorize_range=(-6.0, 6.0))
+    scaler = DescriptorTransformer(winsorize_range=(-6.0, 6.0))
     scaler.fit(X, validity, names=names)
 
-    restored = NaNAwareStandardScaler.from_state_dict(scaler.state_dict())
+    restored = DescriptorTransformer.from_state_dict(scaler.state_dict())
 
     assert restored.names == scaler.names
     assert restored.versions == scaler.versions
