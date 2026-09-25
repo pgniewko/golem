@@ -346,7 +346,7 @@ class DescriptorTransformer:
             X: Values array ``[N, D]``.
 
         Returns:
-            Scaled ``np.float32`` array ``[N, D]``.
+            Scaled ``np.float64`` array ``[N, D]``.
         """
         if self.mean_ is None or self.std_ is None:
             raise RuntimeError("Scaler has not been fit yet")
@@ -358,7 +358,7 @@ class DescriptorTransformer:
         scaled = (X.astype(np.float64) - self.mean_) / self.std_
         lo, hi = self.winsorize_range
         scaled = np.clip(scaled, lo, hi)
-        return scaled.astype(np.float32)
+        return scaled.astype(np.float64)
 
     def inverse_transform(self, Z: np.ndarray) -> np.ndarray:
         """Undo ``transform``. Not exact for winsorised values or quantile columns."""
