@@ -268,7 +268,7 @@ class NaNAwareStandardScaler:
         names: List[str],
         filter_low_variance: bool = False,
         filter_correlated: bool = False,
-        correlation_threshold: float = 0.9,
+        correlation_threshold: float = 0.95,
     ) -> "NaNAwareStandardScaler":
         """Compute per-feature mean and std from **valid** entries only."""
         self.versions = _get_3rd_party_versions()
@@ -364,7 +364,7 @@ def _prune_correlated_columns(
     X: np.ndarray,
     validity_mask: np.ndarray,
     keep_mask: np.ndarray, 
-    threshold: float = 0.9
+    threshold: float = 0.95
     ) -> np.ndarray:
     """ Greedily drop high-correlated columns."""
     import pandas as pd
