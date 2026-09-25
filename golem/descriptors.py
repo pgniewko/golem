@@ -246,9 +246,11 @@ def _get_3rd_party_versions() -> Dict[str, str | None]:
 
 
 class DescriptorTransformer:
-    """Per-feature zero-mean / unit-variance scaler that ignores NaN/invalid
-    positions when computing statistics.
+    """Per-column transform (none/log/quantile) followed by z-score and winsorisation.
 
+    The transform for each column is chosen in ``fit`` from its valid train entries.
+    Statistics ignore invalid positions.
+   
     Usage:
 
         >>> scaler = DescriptorTransformer(winsorize_range=(-6.0, 6.0))
@@ -278,7 +280,7 @@ class DescriptorTransformer:
         filter_correlated: bool = False,
         correlation_threshold: float = 0.9,
     ) -> "DescriptorTransformer":
-        """Compute per-feature mean and std from **valid** entries only."""
+        """Choose a transform for each column, then compute mean and std of the transformed *valid* entries."""
         self.versions = _get_3rd_party_versions()
 
         self.names = list(names)
@@ -297,7 +299,7 @@ class DescriptorTransformer:
             self.params.append(params_)
             X[:, j] = _forward(X[:, j], kind, params_)
 
-        counts = {k : self.kinds.count(k) for k in ("none", "log", "quantile")}
+        counts = {k: self.kinds.count(k) for k in ("none", "log", "quantile")}
         logger.info(f"Descriptor transforms: {counts}")
 
         Xm = np.ma.masked_array(X.astype(np.float64, copy=False), mask=~valid)
@@ -334,7 +336,7 @@ class DescriptorTransformer:
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
-        """Scale *X* and winsorise.
+        """Apply the per-column transform, z-score, and winsorise.
 
         Invalid positions (which should be 0.0 in *X*) will be
         transformed to ``(0 - mean) / std`` and then clipped.  This is
@@ -359,6 +361,7 @@ class DescriptorTransformer:
         return scaled.astype(np.float32)
 
     def inverse_transform(self, Z: np.ndarray) -> np.ndarray:
+        """Undo ``transform``. Not exact for winsorised values or quantile columns."""
         Y = Z.astype(np.float64) * self.std_ + self.mean_
         for j, (kind, params_) in enumerate(zip(self.kinds, self.params)):
             Y[:, j] = _inverse(Y[:, j], kind, params_)
@@ -439,10 +442,12 @@ def _prune_correlated_columns(
 
 
 def _signed_log(x: np.ndarray, c: float) -> np.ndarray:
+    """Signed log: ``sign(x) * log1p(|x|/c)```"""
     return np.sign(x) * np.log1p(np.abs(x) / c)
 
 
 def _signed_log_inv(y: np.ndarray, c: float) -> np.ndarray:
+    """Inverse of ``_signed_log``"""
     return np.sign(y) * c * np.expm1(np.abs(y))
 
 
@@ -463,11 +468,11 @@ def _is_ok(x: np.ndarray, lo: float, hi: float) -> bool:
         return True
     z = (x - x.mean()) / std
 
-    return abs(skew(x)) < 1.0 and np.mean((z< lo) | (z  >hi)) < 0.01 # 1% outside the winsorization range
+    return abs(skew(x)) < 1.0 and np.mean((z< lo) | (z > hi)) < 0.01 # 1% outside the winsorization range
 
 
 def _choose_transform(x: np.ndarray, lo: float, hi: float) -> Tuple[str, Dict[str, object]]:
-    assert np.isfinite(x).all() 
+    assert np.isfinite(x).all()
 
     if x.size < _MIN_VALID or _is_ok(x, lo, hi) or np.unique(x).size < 10:
         return "none", {}
@@ -481,17 +486,20 @@ def _choose_transform(x: np.ndarray, lo: float, hi: float) -> Tuple[str, Dict[st
     q = np.quantile(x, np.linspace(0.0, 1.0, _N_QUANTILES))
     return "quantile", {"q": q.tolist()}
 
+
 def _forward(x: np.ndarray, kind: str, params: Dict[str, object]) -> np.ndarray:
+    """Apply the pre-transform for one column."""
     if kind == "log":
         return _signed_log(x, params["c"])
     if kind == "quantile":
         return _quantile_fwd(x, np.asarray(params["q"]))
     return x
 
+
 def _inverse(y: np.ndarray, kind: str, params: Dict[str, object]) -> np.ndarray:
+    """Undo the pre-transform for one column."""
     if kind == "log":
         return _signed_log_inv(y, params["c"])
     if kind == "quantile":
         return _quantile_inv(y, np.asarray(params["q"]))
     return y
-
