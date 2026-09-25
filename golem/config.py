@@ -175,7 +175,7 @@ _REAL_RULES = {
     "ecfp_latent_alignment.weight": (0.0, None, True, True),
     "ecfp_latent_alignment.temperature": (0.0, None, False, True),
     "ecfp_latent_alignment.tie_epsilon": (0.0, None, True, True),
-    "correlation_threshold": (0.0, 1.0, False, True)
+    "correlation_threshold": (0.0, 1.0, False, True),
 }
 _RANGE_RULES = {
     "winsorize_range": False,

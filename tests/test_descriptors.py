@@ -90,4 +90,3 @@ def test_state_dict_roundtrip_with_kinds(heavy_tailed_data):
     assert restored_scaler.params == scaler.params
 
     np.testing.assert_array_equal(restored_scaler.transform(X), scaler.transform(X))
-
