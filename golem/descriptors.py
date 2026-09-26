@@ -10,6 +10,8 @@ import pandas as pd
 import numpy as np
 from rdkit import Chem
 from tqdm import tqdm
+from scipy.special import ndtr, ndtri
+from scipy.stats import skew
 
 from golem.config import ConformerConfig, DescriptorConfig, Descriptor3DSettings
 from golem.conformers import generate_lowest_energy_conformer
@@ -18,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 _THREE_D_FAMILIES = ("rdkit3d", "usrcat", "electroshape")
 _VERSION_TRACKED_PACKAGES = ("rdkit", "mordred", "molfeat")
+_MIN_VALID = 30
+_N_QUANTILES = 101
+_P_EPS = 1e-7
+
 
 def compute_mordred_descriptors(
     smiles_list: List[str],
@@ -28,7 +34,7 @@ def compute_mordred_descriptors(
         smiles_list: List of SMILES strings.
 
     Returns:
-        values:        ``np.float32`` array ``[N, D]`` — NaN stored as 0.0.
+        values:        ``np.float64`` array ``[N, D]`` — NaN stored as 0.0.
         validity_mask: ``np.bool_``  array ``[N, D]`` — True where original
                        value was numeric and finite.
         descriptor_names: list of ``D`` descriptor name strings.
@@ -69,7 +75,7 @@ def compute_mordred_descriptors(
     validity_mask = np.isfinite(raw)
 
     # Replace NaN/inf with 0.0 for storage
-    values = np.where(validity_mask, raw, 0.0).astype(np.float32)
+    values = np.where(validity_mask, raw, 0.0).astype(np.float64)
 
     logger.info(
         f"Mordred descriptors: {values.shape[0]} molecules x {values.shape[1]} descriptors ({validity_mask.mean() * 100:.1f}% valid entries)",
@@ -124,7 +130,7 @@ def compute_3d_descriptors(
         for family in _THREE_D_FAMILIES
         for column in columns_by_family[family]
     ]
-    values = np.zeros((len(smiles_list), len(descriptor_names)), dtype=np.float32)
+    values = np.zeros((len(smiles_list), len(descriptor_names)), dtype=np.float64)
     validity_mask = np.zeros((len(smiles_list), len(descriptor_names)), dtype=np.bool_)
     conformer_failures = 0
     descriptor_failures = 0
@@ -154,10 +160,10 @@ def compute_3d_descriptors(
                         f"{family} returned shape {row.shape}, expected {(width,)}"
                     )
                 family_mask = np.isfinite(row)
-                family_values = np.where(family_mask, row, 0.0).astype(np.float32)
+                family_values = np.where(family_mask, row, 0.0).astype(np.float64)
             except Exception:
                 logger.debug(f"3D descriptor family {family} failed for {smiles}", exc_info=True)
-                family_values = np.zeros(width, dtype=np.float32)
+                family_values = np.zeros(width, dtype=np.float64)
                 family_mask = np.zeros(width, dtype=np.bool_)
                 descriptor_failures += 1
 
@@ -240,13 +246,15 @@ def _get_3rd_party_versions() -> Dict[str, str | None]:
     return out
 
 
-class NaNAwareStandardScaler:
-    """Per-feature zero-mean / unit-variance scaler that ignores NaN/invalid
-    positions when computing statistics.
+class DescriptorTransformer:
+    """Per-column transform (none/log/quantile) followed by z-score and winsorisation.
 
+    The transform for each column is chosen in ``fit`` from its valid train entries.
+    Statistics ignore invalid positions.
+   
     Usage:
 
-        >>> scaler = NaNAwareStandardScaler(winsorize_range=(-6.0, 6.0))
+        >>> scaler = DescriptorTransformer(winsorize_range=(-6.0, 6.0))
         >>> scaler.fit(X_train, validity_mask_train)
         >>> X_train_scaled = scaler.transform(X_train)
         >>> X_val_scaled   = scaler.transform(X_val)
@@ -261,6 +269,8 @@ class NaNAwareStandardScaler:
         self.names: list[str] | None = None
         self.keep_mask: list[bool] | np.ndarray | None = None
         self.versions: dict[str, str] | None = None
+        self.kinds: list[str] | None = None
+        self.params: list[Dict[str, object]] | None = None
 
     def fit(
         self,
@@ -270,8 +280,8 @@ class NaNAwareStandardScaler:
         filter_low_variance: bool = False,
         filter_correlated: bool = False,
         correlation_threshold: float = 0.95,
-    ) -> "NaNAwareStandardScaler":
-        """Compute per-feature mean and std from **valid** entries only."""
+    ) -> "DescriptorTransformer":
+        """Choose a transform for each column, then compute mean and std of the transformed *valid* entries."""
         self.versions = _get_3rd_party_versions()
 
         self.names = list(names)
@@ -279,6 +289,20 @@ class NaNAwareStandardScaler:
         assert len(self.names) == X.shape[1]
 
         valid = validity_mask.astype(bool, copy=False)
+
+        lo, hi = self.winsorize_range
+        X = X.astype(np.float64, copy=True)
+        self.kinds = []
+        self.params = []
+        for j in range(X.shape[1]):
+            kind, params_ = _choose_transform(X[valid[:, j], j], lo, hi)
+            self.kinds.append(kind)
+            self.params.append(params_)
+            X[:, j] = _forward(X[:, j], kind, params_)
+
+        counts = {k: self.kinds.count(k) for k in ("none", "log", "quantile")}
+        logger.info(f"Descriptor transforms: {counts}")
+
         Xm = np.ma.masked_array(X.astype(np.float64, copy=False), mask=~valid)
 
         self.mean_ = Xm.mean(axis=0).filled(0.0)
@@ -313,7 +337,7 @@ class NaNAwareStandardScaler:
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
-        """Scale *X* and winsorise.
+        """Apply the per-column transform, z-score, and winsorise.
 
         Invalid positions (which should be 0.0 in *X*) will be
         transformed to ``(0 - mean) / std`` and then clipped.  This is
@@ -323,15 +347,26 @@ class NaNAwareStandardScaler:
             X: Values array ``[N, D]``.
 
         Returns:
-            Scaled ``np.float32`` array ``[N, D]``.
+            Scaled ``np.float64`` array ``[N, D]``.
         """
         if self.mean_ is None or self.std_ is None:
             raise RuntimeError("Scaler has not been fit yet")
 
+        X = X.astype(np.float64, copy=True)
+        for j, (kind, params_) in enumerate(zip(self.kinds, self.params)):
+            X[:, j] = _forward(X[:, j], kind, params_)
+
         scaled = (X.astype(np.float64) - self.mean_) / self.std_
         lo, hi = self.winsorize_range
         scaled = np.clip(scaled, lo, hi)
-        return scaled.astype(np.float32)
+        return scaled.astype(np.float64)
+
+    def inverse_transform(self, Z: np.ndarray) -> np.ndarray:
+        """Undo ``transform``. Not exact for winsorised values or quantile columns."""
+        Y = Z.astype(np.float64) * self.std_ + self.mean_
+        for j, (kind, params_) in enumerate(zip(self.kinds, self.params)):
+            Y[:, j] = _inverse(Y[:, j], kind, params_)
+        return Y
 
     def state_dict(self) -> Dict[str, object]:
         """Serialise scaler parameters to a plain dict (for checkpoint)."""
@@ -342,10 +377,12 @@ class NaNAwareStandardScaler:
             "names": list(self.names) if self.names is not None else None,
             "keep_mask": self.keep_mask.tolist() if self.keep_mask is not None else None,
             "versions": self.versions if self.versions is not None else None,
+            "kinds": self.kinds if self.kinds is not None else None,
+            "params": self.params if self.params is not None else None,
         }
 
     @classmethod
-    def from_state_dict(cls, d: Dict[str, object]) -> "NaNAwareStandardScaler":
+    def from_state_dict(cls, d: Dict[str, object]) -> "DescriptorTransformer":
         """Reconstruct a scaler from a serialised ``state_dict``."""
         scaler = cls(winsorize_range=tuple(d["winsorize_range"]))
         if d["mean"] is not None:
@@ -358,6 +395,10 @@ class NaNAwareStandardScaler:
             scaler.keep_mask = np.array(d["keep_mask"], dtype=bool)
         if d["versions"] is not None:
             scaler.versions = d["versions"]
+        if d["kinds"] is not None:
+            scaler.kinds = d["kinds"]
+        if d["params"] is not None:
+            scaler.params = d["params"]
 
         return scaler
 
@@ -399,3 +440,66 @@ def _prune_correlated_columns(
     new_mask[drop_original_idx] = False
     return new_mask
 
+
+def _signed_log(x: np.ndarray, c: float) -> np.ndarray:
+    """Signed log: ``sign(x) * log1p(|x|/c)```"""
+    return np.sign(x) * np.log1p(np.abs(x) / c)
+
+
+def _signed_log_inv(y: np.ndarray, c: float) -> np.ndarray:
+    """Inverse of ``_signed_log``"""
+    return np.sign(y) * c * np.expm1(np.abs(y))
+
+
+def _quantile_fwd(x: np.ndarray, q: np.ndarray) -> np.ndarray:
+    probs = np.linspace(0.0, 1.0, len(q))
+    p = 0.5 * (np.interp(x, q, probs) - np.interp(-x, -q[::-1], -probs[::-1]))
+    return ndtri(np.clip(p, _P_EPS, 1.0 - _P_EPS))
+
+
+def _quantile_inv(y: np.ndarray, q: np.ndarray) -> np.ndarray:
+    probs = np.linspace(0.0, 1.0, len(q))
+    return np.interp(ndtr(y), probs, q)
+
+
+def _is_ok(x: np.ndarray, lo: float, hi: float) -> bool:
+    std = x.std()
+    if std < 1e-12:
+        return True
+    z = (x - x.mean()) / std
+
+    return abs(skew(x)) < 1.0 and np.mean((z< lo) | (z > hi)) < 0.01 # 1% outside the winsorization range
+
+
+def _choose_transform(x: np.ndarray, lo: float, hi: float) -> Tuple[str, Dict[str, object]]:
+    assert np.isfinite(x).all()
+
+    if x.size < _MIN_VALID or _is_ok(x, lo, hi) or np.unique(x).size < 10:
+        return "none", {}
+
+    nz = np.abs(x[x != 0])
+    c = float(np.percentile(nz, 5)) if nz.size else 1.0
+    c = c or 1.0
+    if _is_ok(_signed_log(x, c), lo, hi):
+        return "log", {"c": c}
+
+    q = np.quantile(x, np.linspace(0.0, 1.0, _N_QUANTILES))
+    return "quantile", {"q": q.tolist()}
+
+
+def _forward(x: np.ndarray, kind: str, params: Dict[str, object]) -> np.ndarray:
+    """Apply the pre-transform for one column."""
+    if kind == "log":
+        return _signed_log(x, params["c"])
+    if kind == "quantile":
+        return _quantile_fwd(x, np.asarray(params["q"]))
+    return x
+
+
+def _inverse(y: np.ndarray, kind: str, params: Dict[str, object]) -> np.ndarray:
+    """Undo the pre-transform for one column."""
+    if kind == "log":
+        return _signed_log_inv(y, params["c"])
+    if kind == "quantile":
+        return _quantile_inv(y, np.asarray(params["q"]))
+    return y
