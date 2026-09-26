@@ -6,6 +6,7 @@ import logging
 from typing import Dict, List, Tuple
 from importlib.metadata import version, packages_distributions, PackageNotFoundError
 
+import pandas as pd
 import numpy as np
 from rdkit import Chem
 from tqdm import tqdm
@@ -367,7 +368,6 @@ def _prune_correlated_columns(
     threshold: float = 0.95
     ) -> np.ndarray:
     """ Greedily drop high-correlated columns."""
-    import pandas as pd
 
     kept_idx = np.flatnonzero(keep_mask)
 
