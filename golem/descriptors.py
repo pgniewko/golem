@@ -6,6 +6,7 @@ import logging
 from typing import Dict, List, Tuple
 from importlib.metadata import version, packages_distributions, PackageNotFoundError
 
+import pandas as pd
 import numpy as np
 from rdkit import Chem
 from tqdm import tqdm
