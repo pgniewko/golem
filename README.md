@@ -39,7 +39,7 @@ python -m pip install -e ".[dev]"
 If you are working in this sibling-checkout layout:
 
 ```bash
-cd /Users/pawelgniewek/projects/golem
+cd /path/to/golem
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -58,11 +58,12 @@ golem --help
 python -c "from gt_pyg import GraphTransformerNet; print('gt-pyg OK')"
 python -c "from golem.config import PretrainConfig; print('golem OK')"
 ```
-### Running tests:
-    
-```
+
+## Running tests
+
+```bash
 pytest tests/ -v # For all tests
-pytets tests/test_descriptors.py
+pytest tests/test_descriptors.py
 ```
 
 ## Running Pretraining
@@ -93,7 +94,6 @@ Device selection defaults to `auto`, which resolves to `cuda` when available,
 otherwise `mps`, otherwise `cpu`. You can force a backend explicitly with
 `--device mps` or `device: mps` in YAML; explicit backend requests fail fast if
 that backend is unavailable.
-
 
 Input SMILES are exact-string deduplicated before splitting. Train/validation/test
 splits are then built on shuffled `core_smiles` groups, where each core is the
@@ -154,13 +154,13 @@ descriptors, splits, seed, optimizer hyperparameters).
 After a run completes, the output directory contains:
 
 ```
-path/to/model/
+<output>/
   best_checkpoint.pt        # Best model by validation objective, without training state
   last_checkpoint.pt        # Most recent completed-epoch resume checkpoint
   resolved_config.yaml      # Full resolved config used for the run
   pretrain_report.html      # HTML dashboard with training curves and metrics
   metrics.csv               # Per-epoch objective, descriptor, RMSE, LR, and optional alignment metrics
-  pretrain.log              # Full log output 
+  pretrain.log              # Full log output
 ```
 
 ## Generating Reports
