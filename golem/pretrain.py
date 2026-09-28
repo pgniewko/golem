@@ -30,7 +30,7 @@ from golem.config import (
     PretrainConfig,
     validate_pretrain_config,
 )
-from golem.descriptors import NaNAwareStandardScaler, prepare_descriptor_targets
+from golem.descriptors import DescriptorTransformer, prepare_descriptor_targets
 from golem.ecfp_latent_alignment import (
     compute_alignment_batch,
     compute_alignment_metrics,
@@ -730,7 +730,7 @@ def _validate_training_batch_configuration(
 
 def _checkpoint_extra(
     config: PretrainConfig,
-    scaler: NaNAwareStandardScaler,
+    scaler: DescriptorTransformer,
     descriptor_names: list[str],
     num_descriptors: int,
     split_indices: SplitIndices,
@@ -947,12 +947,12 @@ def pretrain(
         extra = checkpoint_state.get("extra") or {}
         if "scaler_state" not in extra:
             raise RuntimeError("Resume checkpoint missing scaler_state.")
-        scaler = NaNAwareStandardScaler.from_state_dict(extra["scaler_state"])
+        scaler = DescriptorTransformer.from_state_dict(extra["scaler_state"])
         if scaler.names != descriptor_names:
             raise RuntimeError("Resume: descriptor names differ from checkpoint scaler (data or Mordred drift).")
         logger.info("Scaler restored from resumed checkpoint.")
     else:
-        scaler = NaNAwareStandardScaler(winsorize_range=config.winsorize_range)
+        scaler = DescriptorTransformer(winsorize_range=config.winsorize_range)
         scaler.fit(descriptor_values[train_idx],
                    descriptor_validity[train_idx],
                    names=descriptor_names,
