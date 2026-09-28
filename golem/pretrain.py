@@ -63,6 +63,8 @@ SplitIndices = dict[str, np.ndarray | None]
 
 @dataclass
 class EpochMetrics:
+    """Per-epoch training/validation metrics."""
+
     objective_loss: float = math.nan
     descriptor_loss: float = math.nan
     rmse: float = math.nan
@@ -959,7 +961,7 @@ def pretrain(
                    filter_low_variance=config.filter_low_variance,
                    filter_correlated=config.filter_correlated,
                    correlation_threshold=config.correlation_threshold,
-                   )
+        )
         logger.info(f"Scaler fit on train split ({len(train_idx)} samples)")
 
     descriptor_values = scaler.transform(descriptor_values)
@@ -1059,9 +1061,12 @@ def pretrain(
         start_time = time.time() - float(es.get("elapsed_seconds", 0.0))
         rng = extra.get("rng_state") or {}
         try:
-            if "python" in rng: random.setstate(rng["python"])
-            if "numpy" in rng: np.random.set_state(rng["numpy"])
-            if "torch_cpu" in rng: torch.set_rng_state(rng["torch_cpu"])
+            if "python" in rng:
+                random.setstate(rng["python"])
+            if "numpy" in rng:
+                np.random.set_state(rng["numpy"])
+            if "torch_cpu" in rng:
+                torch.set_rng_state(rng["torch_cpu"])
             if "torch_cuda" in rng and device.type == "cuda" and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(rng["torch_cuda"])
         except Exception:
@@ -1209,7 +1214,7 @@ def pretrain(
                 else:
                     if not math.isfinite(val_metrics.objective_loss):
                         logger.warning(
-                            f"Validation objective is non-finite at epoch {epoch+1}; skipping best-checkpoint update"
+                            f"Validation objective is non-finite at epoch {epoch + 1}; skipping best-checkpoint update"
                         )
                     patience_counter += 1
 

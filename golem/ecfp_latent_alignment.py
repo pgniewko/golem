@@ -101,6 +101,7 @@ def compute_alignment_batch(
     *,
     deterministic_pairs: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pair-order loss between Tanimoto and latent cosine distances for sampled pairs."""
     pair_i, pair_j = _sample_pairs(
         z.size(0),
         config.num_pairs,
@@ -120,6 +121,7 @@ def compute_alignment_metrics(
     d_fp: torch.Tensor,
     d_z: torch.Tensor,
 ) -> tuple[float, float]:
+    """Spearman and Kendall tau between fingerprint and latent distances."""
     if d_fp.numel() < 2 or d_z.numel() < 2:
         return math.nan, math.nan
 
@@ -135,6 +137,7 @@ def compute_fingerprints(
     smiles_list: List[str],
     config: ECFPLatentAlignmentConfig,
 ) -> np.ndarray:
+    """Compute ECFP bit vectors for a list of SMILES."""
     logger.info(f"Computing ECFP bits for {len(smiles_list)} molecules")
     fps = np.zeros((len(smiles_list), config.fp_bits), dtype=np.bool_)
     for idx, smiles in enumerate(smiles_list):

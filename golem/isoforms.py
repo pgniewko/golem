@@ -1,7 +1,7 @@
 """Isoform enumeration: desalting, tautomers, protonation states, neutralization.
 
 Each enumeration function creates local RDKit/Gypsum-DL/MolVS instances.
-All isoforms are deduplicated by canonical SMILES, with the original 
+All isoforms are deduplicated by canonical SMILES, with the original
 molecule always at index 0.
 """
 
@@ -220,7 +220,7 @@ def enumerate_isoforms(smiles: str, config: IsoformConfig) -> List[str]:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         logger.warning(f"Cannot parse SMILES: {smiles}")
-        return [smiles]  # keep original even if unparseable
+        return [smiles]  # keep original even if unparsable
 
     original_can = _canonical(mol)
     if original_can is None:
